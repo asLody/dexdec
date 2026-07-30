@@ -1,0 +1,61 @@
+.method syncMethod
+.registers 2
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB3..BB7} -> BB9
+# .catch Ljava/lang/Throwable; {BB10..BB11} -> BB9
+
+BBB0:  # entry
+    const-class v0 = LSynchronized;
+    monitor-enter v0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0
+    LSynchronized;->counter:I = v1  # 0003:
+    # -> BBB2, BBB7
+    # throws -> BB9
+
+BBB2:
+    # preds: BBB1
+    v1 = LSynchronized;->counter:I  # 0005:
+    # -> BBB3, BBB8
+    # throws -> BB9
+
+BBB3:
+    # preds: BBB2
+    monitor-exit v0  # 0007:
+    return v1  # 0008:
+
+BBB4:
+    # preds: BBB7, BBB8, BBB9
+    move-exception v1  # 0009:
+    # -> BBB5
+
+BBB5:
+    # preds: BBB4
+    monitor-exit v0  # 000a:
+    # -> BBB6, BBB9
+    # throws -> BB9
+
+BBB6:
+    # preds: BBB5
+    throw v1  # 000b:
+
+BBB7:
+    # preds: BBB1
+    goto BB0
+    # -> BBB4
+
+BBB8:
+    # preds: BBB2
+    goto BB0
+    # -> BBB4
+
+BBB9:
+    # preds: BBB5
+    goto BB0
+    # -> BBB4
+

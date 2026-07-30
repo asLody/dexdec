@@ -1,0 +1,48 @@
+{
+  "name": "dexdec",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Fast, accurate Android decompilation for humans and AI agents",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "npm@11.16.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "desktop": "tauri dev",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "version:check": "node ../scripts/version.mjs check",
+    "version:commit": "node ../scripts/version.mjs sync --channel commit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@codemirror/lang-java": "^6.0.2",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/legacy-modes": "^6.5.3",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.6",
+    "@lezer/common": "^1.5.2",
+    "@tanstack/react-virtual": "^3.14.8",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@uiw/react-codemirror": "^4.25.11",
+    "lucide-react": "^1.25.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
+  }
+}

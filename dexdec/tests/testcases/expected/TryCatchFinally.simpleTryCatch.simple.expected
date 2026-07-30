@@ -1,0 +1,51 @@
+.method simpleTryCatch
+.registers 1
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/RuntimeException; {BB4..BB10} -> BB10
+
+BBB0:  # entry
+    if v0 == 0 goto BB4
+    # -> BBB2, BBB1
+
+BBB1:
+    # preds: BBB0
+    return 1  # 0003:
+
+BBB2:
+    # preds: BBB0
+    nop
+    # -> BBB3, BBB6
+    # throws -> BB10
+
+BBB3:
+    # preds: BBB2
+    v0 = new Ljava/lang/RuntimeException;()  # 0006:
+    # -> BBB4, BBB7
+    # throws -> BB10
+
+BBB4:
+    # preds: BBB3
+    throw v0  # 0009:
+    # -> BBB5
+    # throws -> BB10
+
+BBB5:
+    # preds: BBB4, BBB6, BBB7
+    move-exception v0  # 000a:
+    return -1  # 000c:
+
+BBB6:
+    # preds: BBB2
+    goto BB0
+    # -> BBB5
+    # throws -> BB10
+
+BBB7:
+    # preds: BBB3
+    goto BB0
+    # -> BBB5
+    # throws -> BB10
+

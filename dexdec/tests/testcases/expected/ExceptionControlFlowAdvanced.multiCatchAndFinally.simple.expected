@@ -1,0 +1,261 @@
+.method multiCatchAndFinally
+.registers 5
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/IllegalArgumentException; {BB3..BB25} -> BB35
+# .catch Ljava/lang/ArithmeticException; {BB3..BB25} -> BB30
+# .catch Ljava/lang/Throwable; {BB3..BB25} -> BB28
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB33
+    v2 = v4.length  # 0003:
+    # -> BBB2, BBB18, BBB19, BBB20
+    # throws -> BB35, BB30, BB28
+
+BBB2:
+    # preds: BBB1
+    if v0 >= v2 goto BB25  # 0004:
+    # -> BBB13, BBB3
+    # throws -> BB35, BB30, BB28
+
+BBB3:
+    # preds: BBB2
+    v2 = v4[v0]  # 0006:
+    # -> BBB4, BBB21, BBB22, BBB23
+    # throws -> BB35, BB30, BB28
+
+BBB4:
+    # preds: BBB3
+    if v2 < 0 goto BB19  # 0008:
+    # -> BBB10, BBB5
+    # throws -> BB35, BB30, BB28
+
+BBB5:
+    # preds: BBB4
+    v2 = v4[v0]  # 000a:
+    # -> BBB6, BBB24, BBB25, BBB26
+    # throws -> BB35, BB30, BB28
+
+BBB6:
+    # preds: BBB5
+    v3 = 10 / v2  # 000e:
+    # -> BBB7, BBB27, BBB28, BBB29
+    # throws -> BB35, BB30, BB28
+
+BBB7:
+    # preds: BBB6
+    v1 = v1 + v3  # 000f:
+    # -> BBB8, BBB30, BBB31, BBB32
+    # throws -> BB35, BB30, BB28
+
+BBB8:
+    # preds: BBB7
+    v0 = v0 + 1  # 0010:
+    # -> BBB33, BBB34, BBB35, BBB36
+    # throws -> BB35, BB30, BB28
+
+BBB10:
+    # preds: BBB4
+    nop
+    # -> BBB11, BBB37, BBB38, BBB39
+    # throws -> BB35, BB30, BB28
+
+BBB11:
+    # preds: BBB10
+    v4 = new Ljava/lang/IllegalArgumentException;()  # 0015:
+    # -> BBB12, BBB40, BBB41, BBB42
+    # throws -> BB35, BB30, BB28
+
+BBB12:
+    # preds: BBB11
+    throw v4  # 0018:
+    # -> BBB43, BBB44, BBB45
+    # throws -> BB35, BB30, BB28
+
+BBB13:
+    # preds: BBB2
+    v1 = v1 + 3  # 0019:
+    goto BB39  # 001b:
+    # -> BBB17
+
+BBB14:
+    # preds: BBB20, BBB23, BBB26, BBB29, BBB32, BBB36, BBB39, BBB42, BBB45
+    move-exception v4  # 001c:
+    throw v4  # 001d:
+
+BBB15:
+    # preds: BBB19, BBB22, BBB25, BBB28, BBB31, BBB35, BBB38, BBB41, BBB44
+    move-exception v4  # 001e:
+    nop  # 001f:
+    nop  # 0020:
+    const v1 = 2  # 0021:
+    goto BB39  # 0022:
+    # -> BBB17
+
+BBB16:
+    # preds: BBB18, BBB21, BBB24, BBB27, BBB30, BBB34, BBB37, BBB40, BBB43
+    move-exception v4  # 0023:
+    nop  # 0024:
+    nop  # 0025:
+    const v1 = 1  # 0026:
+    # -> BBB17
+
+BBB17:
+    # preds: BBB13, BBB15, BBB16
+    return v1  # 0027:
+
+BBB18:
+    # preds: BBB1
+    goto BB0
+    # -> BBB16
+    # throws -> BB35, BB30, BB28
+
+BBB19:
+    # preds: BBB1
+    goto BB0
+    # -> BBB15
+    # throws -> BB35, BB30, BB28
+
+BBB20:
+    # preds: BBB1
+    goto BB0
+    # -> BBB14
+    # throws -> BB35, BB30, BB28
+
+BBB21:
+    # preds: BBB3
+    goto BB0
+    # -> BBB16
+    # throws -> BB35, BB30, BB28
+
+BBB22:
+    # preds: BBB3
+    goto BB0
+    # -> BBB15
+    # throws -> BB35, BB30, BB28
+
+BBB23:
+    # preds: BBB3
+    goto BB0
+    # -> BBB14
+    # throws -> BB35, BB30, BB28
+
+BBB24:
+    # preds: BBB5
+    goto BB0
+    # -> BBB16
+    # throws -> BB35, BB30, BB28
+
+BBB25:
+    # preds: BBB5
+    goto BB0
+    # -> BBB15
+
+BBB26:
+    # preds: BBB5
+    goto BB0
+    # -> BBB14
+
+BBB27:
+    # preds: BBB6
+    goto BB0
+    # -> BBB16
+
+BBB28:
+    # preds: BBB6
+    goto BB0
+    # -> BBB15
+
+BBB29:
+    # preds: BBB6
+    goto BB0
+    # -> BBB14
+
+BBB30:
+    # preds: BBB7
+    goto BB0
+    # -> BBB16
+
+BBB31:
+    # preds: BBB7
+    goto BB0
+    # -> BBB15
+
+BBB32:
+    # preds: BBB7
+    goto BB0
+    # -> BBB14
+
+BBB33:
+    # preds: BBB8
+    goto BB0
+    # -> BBB1
+
+BBB34:
+    # preds: BBB8
+    goto BB0
+    # -> BBB16
+
+BBB35:
+    # preds: BBB8
+    goto BB0
+    # -> BBB15
+
+BBB36:
+    # preds: BBB8
+    goto BB0
+    # -> BBB14
+
+BBB37:
+    # preds: BBB10
+    goto BB0
+    # -> BBB16
+
+BBB38:
+    # preds: BBB10
+    goto BB0
+    # -> BBB15
+
+BBB39:
+    # preds: BBB10
+    goto BB0
+    # -> BBB14
+
+BBB40:
+    # preds: BBB11
+    goto BB0
+    # -> BBB16
+
+BBB41:
+    # preds: BBB11
+    goto BB0
+    # -> BBB15
+
+BBB42:
+    # preds: BBB11
+    goto BB0
+    # -> BBB14
+
+BBB43:
+    # preds: BBB12
+    goto BB0
+    # -> BBB16
+
+BBB44:
+    # preds: BBB12
+    goto BB0
+    # -> BBB15
+
+BBB45:
+    # preds: BBB12
+    goto BB0
+    # -> BBB14
+

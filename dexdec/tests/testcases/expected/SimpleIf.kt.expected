@@ -1,0 +1,10 @@
+public open class SimpleIf {
+    companion object {
+        public fun test(p0: Int): Int {
+            if (p0 <= 0) {
+                return -1
+            }
+            return 1
+        }
+    }
+}

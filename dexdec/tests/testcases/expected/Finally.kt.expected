@@ -1,0 +1,27 @@
+public open class Finally {
+    companion object {
+        private var counter: Int = 0
+
+        public fun test(p0: Int): Int {
+            var counter: Int
+            if (p0 == 0) {
+                try {
+                    throw RuntimeException("zero")
+                } catch (exception: RuntimeException) {
+                    return -1
+                } finally {
+                    counter = Finally.counter
+                    Finally.counter = counter + 1
+                }
+            }
+            try {
+                return 100 / p0
+            } catch (exception: RuntimeException) {
+                return -1
+            } finally {
+                counter = Finally.counter
+                Finally.counter = counter + 1
+            }
+        }
+    }
+}

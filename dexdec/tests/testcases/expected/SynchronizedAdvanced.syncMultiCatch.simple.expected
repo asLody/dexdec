@@ -1,0 +1,201 @@
+.method syncMultiCatch
+.registers 3
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/ArithmeticException; {BB7..BB8} -> BB14
+# .catch Ljava/lang/IllegalArgumentException; {BB7..BB8} -> BB12
+# .catch Ljava/lang/Throwable; {BB7..BB8} -> BB10
+# .catch Ljava/lang/Throwable; {BB8..BB9} -> BB10
+# .catch Ljava/lang/ArithmeticException; {BB16..BB22} -> BB14
+# .catch Ljava/lang/IllegalArgumentException; {BB16..BB22} -> BB12
+# .catch Ljava/lang/Throwable; {BB16..BB22} -> BB10
+# .catch Ljava/lang/Throwable; {BB22..BB29} -> BB10
+
+BBB0:  # entry
+    v0 = LSynchronizedAdvanced;->lock1:Ljava/lang/Object;
+    monitor-enter v0  # 0002:
+    if v2 < 0 goto BB16  # 0003:
+    # -> BBB8, BBB1
+
+BBB1:
+    # preds: BBB0
+    # -> BBB2
+
+BBB2:
+    # preds: BBB1
+    v1 = 100 / v2  # 0007:
+    # -> BBB3, BBB17, BBB18, BBB19
+    # throws -> BB14, BB12, BB10
+
+BBB3:
+    # preds: BBB2
+    monitor-exit v0  # 0008:
+    # -> BBB4, BBB20
+    # throws -> BB10
+
+BBB4:
+    # preds: BBB3
+    return v1  # 0009:
+
+BBB5:
+    # preds: BBB19, BBB20, BBB23, BBB26, BBB29, BBB30, BBB31, BBB32
+    move-exception v2  # 000a:
+    goto BB28  # 000b:
+    # -> BBB15
+
+BBB6:
+    # preds: BBB18, BBB22, BBB25, BBB28
+    move-exception v2  # 000c:
+    goto BB22  # 000d:
+    # -> BBB11
+
+BBB7:
+    # preds: BBB17, BBB21, BBB24, BBB27
+    move-exception v2  # 000e:
+    goto BB25  # 000f:
+    # -> BBB13
+
+BBB8:
+    # preds: BBB0
+    nop
+    # -> BBB9, BBB21, BBB22, BBB23
+    # throws -> BB14, BB12, BB10
+
+BBB9:
+    # preds: BBB8
+    v2 = new Ljava/lang/IllegalArgumentException;()  # 0012:
+    # -> BBB10, BBB24, BBB25, BBB26
+    # throws -> BB14, BB12, BB10
+
+BBB10:
+    # preds: BBB9
+    throw v2  # 0015:
+    # -> BBB27, BBB28, BBB29
+    # throws -> BB14, BB12, BB10
+
+BBB11:
+    # preds: BBB6
+    monitor-exit v0  # 0016:
+    # -> BBB12, BBB30
+    # throws -> BB10
+
+BBB12:
+    # preds: BBB11
+    return -2  # 0018:
+    # throws -> BB10
+
+BBB13:
+    # preds: BBB7
+    monitor-exit v0  # 0019:
+    # -> BBB14, BBB31
+    # throws -> BB10
+
+BBB14:
+    # preds: BBB13
+    return -1  # 001b:
+    # throws -> BB10
+
+BBB15:
+    # preds: BBB5
+    monitor-exit v0  # 001c:
+    # -> BBB16, BBB32
+    # throws -> BB10
+
+BBB16:
+    # preds: BBB15
+    throw v2  # 001d:
+
+BBB17:
+    # preds: BBB2
+    goto BB0
+    # -> BBB7
+    # throws -> BB14, BB12, BB10
+
+BBB18:
+    # preds: BBB2
+    goto BB0
+    # -> BBB6
+    # throws -> BB14, BB12, BB10
+
+BBB19:
+    # preds: BBB2
+    goto BB0
+    # -> BBB5
+    # throws -> BB14, BB12, BB10
+
+BBB20:
+    # preds: BBB3
+    goto BB0
+    # -> BBB5
+    # throws -> BB14, BB12, BB10
+
+BBB21:
+    # preds: BBB8
+    goto BB0
+    # -> BBB7
+    # throws -> BB14, BB12, BB10
+
+BBB22:
+    # preds: BBB8
+    goto BB0
+    # -> BBB6
+    # throws -> BB10
+
+BBB23:
+    # preds: BBB8
+    goto BB0
+    # -> BBB5
+    # throws -> BB10
+
+BBB24:
+    # preds: BBB9
+    goto BB0
+    # -> BBB7
+    # throws -> BB10
+
+BBB25:
+    # preds: BBB9
+    goto BB0
+    # -> BBB6
+    # throws -> BB10
+
+BBB26:
+    # preds: BBB9
+    goto BB0
+    # -> BBB5
+    # throws -> BB10
+
+BBB27:
+    # preds: BBB10
+    goto BB0
+    # -> BBB7
+    # throws -> BB10
+
+BBB28:
+    # preds: BBB10
+    goto BB0
+    # -> BBB6
+    # throws -> BB10
+
+BBB29:
+    # preds: BBB10
+    goto BB0
+    # -> BBB5
+
+BBB30:
+    # preds: BBB11
+    goto BB0
+    # -> BBB5
+
+BBB31:
+    # preds: BBB13
+    goto BB0
+    # -> BBB5
+
+BBB32:
+    # preds: BBB15
+    goto BB0
+    # -> BBB5
+

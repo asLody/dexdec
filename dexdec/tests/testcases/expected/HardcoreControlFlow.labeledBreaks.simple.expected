@@ -1,0 +1,143 @@
+.method labeledBreaks
+.registers 10
+.ins 2
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    const v2 = 0  # 0003:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB19
+    v3 = v9.length  # 0004:
+    if v1 >= v3 goto BB59  # 0005:
+    # -> BBB21, BBB2
+
+BBB2:
+    # preds: BBB1
+    v3 = v9[v1]  # 0007:
+    if v3 != 0 goto BB12  # 0009:
+    # -> BBB4, BBB22
+
+BBB4:
+    # preds: BBB2
+    const v3 = 0  # 000c:
+    # -> BBB5
+
+BBB5:
+    # preds: BBB4, BBB18
+    v4 = v9[v1]  # 000d:
+    v4 = v4.length  # 000f:
+    if v3 >= v4 goto BB56  # 0010:
+    # -> BBB23, BBB6
+
+BBB6:
+    # preds: BBB5
+    v4 = v9[v1]  # 0012:
+    v4 = v4[v3]  # 0014:
+    if v4 != -1 goto BB26  # 0017:
+    # -> BBB8, BBB24
+
+BBB8:
+    # preds: BBB6
+    if v4 != -2 goto BB30  # 001b:
+    # -> BBB10, BBB25
+
+BBB10:
+    # preds: BBB8
+    if v4 != -3 goto BB34  # 001f:
+    # -> BBB12, BBB26
+
+BBB12:
+    # preds: BBB10
+    if v4 <= 100 goto BB52  # 0024:
+    # -> BBB27, BBB13
+
+BBB13:
+    # preds: BBB12
+    const v5 = 0  # 0026:
+    # -> BBB14
+
+BBB14:
+    # preds: BBB13, BBB17
+    if v5 >= v4 goto BB52  # 0027:
+    # -> BBB28, BBB15
+
+BBB15:
+    # preds: BBB14
+    v6 = v5 * v3  # 0029:
+    if v6 <= 1000 goto BB49  # 002d:
+    # -> BBB17, BBB16
+
+BBB16:
+    # preds: BBB15
+    v2 = v2 + v5  # 002f:
+    goto BB56  # 0030:
+    # -> BBB19
+
+BBB17:
+    # preds: BBB15
+    v5 = v5 + 1  # 0031:
+    goto BB39  # 0033:
+    # -> BBB14
+
+BBB18:
+    # preds: BBB27, BBB28
+    v2 = v2 + v4  # 0034:
+    v3 = v3 + 1  # 0035:
+    goto BB13  # 0037:
+    # -> BBB5
+
+BBB19:
+    # preds: BBB16, BBB22, BBB23, BBB25, BBB26
+    v1 = v1 + 1  # 0038:
+    goto BB4  # 003a:
+    # -> BBB1
+
+BBB20:
+    # preds: BBB21, BBB24
+    return v2  # 003b:
+
+BBB21:
+    # preds: BBB1
+    goto BB0
+    # -> BBB20
+
+BBB22:
+    # preds: BBB2
+    goto BB0
+    # -> BBB19
+
+BBB23:
+    # preds: BBB5
+    goto BB0
+    # -> BBB19
+
+BBB24:
+    # preds: BBB6
+    goto BB0
+    # -> BBB20
+
+BBB25:
+    # preds: BBB8
+    goto BB0
+    # -> BBB19
+
+BBB26:
+    # preds: BBB10
+    goto BB0
+    # -> BBB19
+
+BBB27:
+    # preds: BBB12
+    goto BB0
+    # -> BBB18
+
+BBB28:
+    # preds: BBB14
+    goto BB0
+    # -> BBB18
+

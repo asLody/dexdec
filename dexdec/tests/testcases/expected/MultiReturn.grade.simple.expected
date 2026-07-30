@@ -1,0 +1,49 @@
+.method grade
+.registers 2
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    if v1 < 90 goto BB7  # 0002:
+    # -> BBB2, BBB1
+
+BBB1:
+    # preds: BBB0
+    const-string v1 = "A"  # 0004:
+    return v1  # 0006:
+
+BBB2:
+    # preds: BBB0
+    if v1 < 80 goto BB14  # 0009:
+    # -> BBB4, BBB3
+
+BBB3:
+    # preds: BBB2
+    const-string v1 = "B"  # 000b:
+    return v1  # 000d:
+
+BBB4:
+    # preds: BBB2
+    if v1 < 70 goto BB21  # 0010:
+    # -> BBB6, BBB5
+
+BBB5:
+    # preds: BBB4
+    const-string v1 = "C"  # 0012:
+    return v1  # 0014:
+
+BBB6:
+    # preds: BBB4
+    if v1 < 60 goto BB28  # 0017:
+    # -> BBB8, BBB7
+
+BBB7:
+    # preds: BBB6
+    const-string v1 = "D"  # 0019:
+    return v1  # 001b:
+
+BBB8:
+    # preds: BBB6
+    const-string v1 = "F"  # 001c:
+    return v1  # 001e:
+

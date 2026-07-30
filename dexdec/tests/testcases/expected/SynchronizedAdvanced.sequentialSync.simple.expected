@@ -1,0 +1,90 @@
+.method sequentialSync
+.registers 4
+.ins 2
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB5..BB6} -> BB15
+# .catch Ljava/lang/Throwable; {BB10..BB14} -> BB12
+# .catch Ljava/lang/Throwable; {BB16..BB17} -> BB15
+
+BBB0:  # entry
+    v0 = LSynchronizedAdvanced;->lock1:Ljava/lang/Object;
+    monitor-enter v0  # 0002:
+    v2 = v2 + 1  # 0003:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0
+    monitor-exit v0  # 0005:
+    # -> BBB2, BBB10
+    # throws -> BB15
+
+BBB2:
+    # preds: BBB1
+    v1 = LSynchronizedAdvanced;->lock2:Ljava/lang/Object;  # 0006:
+    monitor-enter v1  # 0008:
+    v2 = v2 + v3  # 0009:
+    # -> BBB3
+
+BBB3:
+    # preds: BBB2
+    monitor-exit v1  # 000a:
+    # -> BBB4, BBB11
+    # throws -> BB12
+
+BBB4:
+    # preds: BBB3
+    return v2  # 000b:
+    # throws -> BB12
+
+BBB5:
+    # preds: BBB11, BBB12
+    move-exception v2  # 000c:
+    monitor-exit v1  # 000d:
+    # -> BBB6, BBB12
+    # throws -> BB12
+
+BBB6:
+    # preds: BBB5
+    throw v2  # 000e:
+
+BBB7:
+    # preds: BBB10, BBB13
+    move-exception v2  # 000f:
+    # -> BBB8
+
+BBB8:
+    # preds: BBB7
+    monitor-exit v0  # 0010:
+    # -> BBB9, BBB13
+    # throws -> BB15
+
+BBB9:
+    # preds: BBB8
+    throw v2  # 0011:
+
+BBB10:
+    # preds: BBB1
+    goto BB0
+    # -> BBB7
+    # throws -> BB12
+
+BBB11:
+    # preds: BBB3
+    goto BB0
+    # -> BBB5
+    # throws -> BB12
+
+BBB12:
+    # preds: BBB5
+    goto BB0
+    # -> BBB5
+    # throws -> BB12
+
+BBB13:
+    # preds: BBB8
+    goto BB0
+    # -> BBB7
+    # throws -> BB12
+

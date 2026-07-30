@@ -1,0 +1,33 @@
+[package]
+name = "dexdec-app"
+version.workspace = true
+description = "Interactive desktop frontend for DexDec"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+autobins = false
+default-run = "DexDec"
+
+[[bin]]
+name = "DexDec"
+path = "src/main.rs"
+
+[lib]
+name = "dexdec_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dexdec-mcp = { path = "../../dexdec-mcp" }
+dexdec-workbench = { path = "../../dexdec-workbench" }
+directories = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+thiserror = "2"
+toml_edit = "0.23"

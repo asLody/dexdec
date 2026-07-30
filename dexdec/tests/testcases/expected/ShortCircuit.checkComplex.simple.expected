@@ -1,0 +1,62 @@
+.method checkComplex
+.registers 4
+.ins 4
+.entry BBB0
+
+BBB0:  # entry
+    if v0 <= 0 goto BB4
+    # -> BBB6, BBB1
+
+BBB1:
+    # preds: BBB0
+    if v1 > 0 goto BB8  # 0002:
+    # -> BBB7, BBB8
+
+BBB2:
+    # preds: BBB6, BBB8
+    if v2 <= 0 goto BB10  # 0004:
+    # -> BBB9, BBB3
+
+BBB3:
+    # preds: BBB2
+    if v3 <= 0 goto BB10  # 0006:
+    # -> BBB10, BBB11
+
+BBB4:
+    # preds: BBB7, BBB11
+    return 1  # 0009:
+
+BBB5:
+    # preds: BBB9, BBB10
+    return 0  # 000b:
+
+BBB6:
+    # preds: BBB0
+    goto BB0
+    # -> BBB2
+
+BBB7:
+    # preds: BBB1
+    goto BB0
+    # -> BBB4
+
+BBB8:
+    # preds: BBB1
+    goto BB0
+    # -> BBB2
+
+BBB9:
+    # preds: BBB2
+    goto BB0
+    # -> BBB5
+
+BBB10:
+    # preds: BBB3
+    goto BB0
+    # -> BBB5
+
+BBB11:
+    # preds: BBB3
+    goto BB0
+    # -> BBB4
+

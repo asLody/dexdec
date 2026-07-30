@@ -1,0 +1,135 @@
+.method classify
+.registers 5
+.ins 3
+.entry BBB0
+
+BBB0:  # entry
+    if v2 <= 0 goto BB9  # 0001:
+    # -> BBB15, BBB1
+
+BBB1:
+    # preds: BBB0
+    if v3 < 0 goto BB7  # 0003:
+    # -> BBB16, BBB2
+
+BBB2:
+    # preds: BBB1
+    if v4 != 0 goto BB9  # 0005:
+    # -> BBB17, BBB18
+
+BBB3:
+    # preds: BBB16, BBB18
+    const v1 = 1  # 0007:
+    goto BB19  # 0008:
+    # -> BBB10
+
+BBB4:
+    # preds: BBB15, BBB17
+    if v2 == 0 goto BB18  # 0009:
+    # -> BBB19, BBB5
+
+BBB5:
+    # preds: BBB4
+    if v3 <= 0 goto BB16  # 000b:
+    # -> BBB20, BBB6
+
+BBB6:
+    # preds: BBB5
+    if v4 <= 0 goto BB16  # 000d:
+    # -> BBB21, BBB22
+
+BBB8:
+    # preds: BBB20, BBB21
+    const v1 = 3  # 0010:
+    goto BB19  # 0011:
+    # -> BBB10
+
+BBB9:
+    # preds: BBB19, BBB22
+    const v1 = 2  # 0012:
+    # -> BBB10
+
+BBB10:
+    # preds: BBB3, BBB8, BBB9
+    if v1 != 2 goto BB27  # 0013:
+    # -> BBB23, BBB11
+
+BBB11:
+    # preds: BBB10
+    if v2 < v3 goto BB25  # 0015:
+    # -> BBB24, BBB12
+
+BBB12:
+    # preds: BBB11
+    if v4 >= 0 goto BB27  # 0017:
+    # -> BBB25, BBB26
+
+BBB13:
+    # preds: BBB24, BBB26
+    v1 = v1 + 10  # 0019:
+    # -> BBB14
+
+BBB14:
+    # preds: BBB13, BBB23, BBB25
+    return v1  # 001b:
+
+BBB15:
+    # preds: BBB0
+    goto BB0
+    # -> BBB4
+
+BBB16:
+    # preds: BBB1
+    goto BB0
+    # -> BBB3
+
+BBB17:
+    # preds: BBB2
+    goto BB0
+    # -> BBB4
+
+BBB18:
+    # preds: BBB2
+    goto BB0
+    # -> BBB3
+
+BBB19:
+    # preds: BBB4
+    goto BB0
+    # -> BBB9
+
+BBB20:
+    # preds: BBB5
+    goto BB0
+    # -> BBB8
+
+BBB21:
+    # preds: BBB6
+    goto BB0
+    # -> BBB8
+
+BBB22:
+    # preds: BBB6
+    goto BB0
+    # -> BBB9
+
+BBB23:
+    # preds: BBB10
+    goto BB0
+    # -> BBB14
+
+BBB24:
+    # preds: BBB11
+    goto BB0
+    # -> BBB13
+
+BBB25:
+    # preds: BBB12
+    goto BB0
+    # -> BBB14
+
+BBB26:
+    # preds: BBB12
+    goto BB0
+    # -> BBB13
+

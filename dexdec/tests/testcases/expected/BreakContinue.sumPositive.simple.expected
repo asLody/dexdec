@@ -1,0 +1,41 @@
+.method sumPositive
+.registers 4
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB3, BBB4
+    v2 = v3.length  # 0003:
+    if v0 >= v2 goto BB19  # 0004:
+    # -> BBB5, BBB2
+
+BBB2:
+    # preds: BBB1
+    v2 = v3[v0]  # 0006:
+    if v2 > 0 goto BB13  # 0008:
+    # -> BBB4, BBB3
+
+BBB3:
+    # preds: BBB2
+    v0 = v0 + 1  # 000a:
+    goto BB3  # 000c:
+    # -> BBB1
+
+BBB4:
+    # preds: BBB2
+    v2 = v3[v0]  # 000d:
+    v1 = v1 + v2  # 000f:
+    v0 = v0 + 1  # 0010:
+    goto BB3  # 0012:
+    # -> BBB1
+
+BBB5:
+    # preds: BBB1
+    return v1  # 0013:
+

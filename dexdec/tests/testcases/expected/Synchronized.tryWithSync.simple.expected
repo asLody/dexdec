@@ -1,0 +1,128 @@
+.method tryWithSync
+.registers 3
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/RuntimeException; {BB0..BB3} -> BB24
+# .catch Ljava/lang/Throwable; {BB5..BB8} -> BB12
+# .catch Ljava/lang/Throwable; {BB14..BB23} -> BB12
+# .catch Ljava/lang/RuntimeException; {BB23..BB24} -> BB24
+
+BBB0:  # entry
+    v0 = LSynchronized;->lock:Ljava/lang/Object;
+    # -> BBB1, BBB13
+    # throws -> BB24
+
+BBB1:
+    # preds: BBB0
+    monitor-enter v0  # 0002:
+    # -> BBB2, BBB14
+    # throws -> BB24
+
+BBB2:
+    # preds: BBB1
+    if v2 == 0 goto BB14  # 0003:
+    # -> BBB7, BBB3
+
+BBB3:
+    # preds: BBB2
+    LSynchronized;->counter:I = v2  # 0005:
+    # -> BBB4, BBB15
+    # throws -> BB12
+
+BBB4:
+    # preds: BBB3
+    monitor-exit v0  # 0007:
+    # -> BBB5, BBB16
+    # throws -> BB12
+
+BBB5:
+    # preds: BBB4
+    nop  # 0008:
+    v2 = LSynchronized;->counter:I  # 0009:
+    return v2  # 000b:
+
+BBB6:
+    # preds: BBB9, BBB15, BBB16, BBB17, BBB18, BBB19
+    move-exception v2  # 000c:
+    goto BB22  # 000d:
+    # -> BBB10
+
+BBB7:
+    # preds: BBB2
+    nop
+    # -> BBB8, BBB17
+    # throws -> BB12
+
+BBB8:
+    # preds: BBB7
+    const-string v1 = "zero"  # 0010:
+    v2 = new Ljava/lang/RuntimeException;(v1)  # 0012:
+    # -> BBB9, BBB18
+    # throws -> BB12
+
+BBB9:
+    # preds: BBB8
+    throw v2  # 0015:
+    # -> BBB6
+    # throws -> BB12
+
+BBB10:
+    # preds: BBB6
+    monitor-exit v0  # 0016:
+    # -> BBB11, BBB19
+    # throws -> BB12
+
+BBB11:
+    # preds: BBB10
+    throw v2  # 0017:
+    # -> BBB12
+    # throws -> BB24
+
+BBB12:
+    # preds: BBB11, BBB13, BBB14
+    move-exception v2  # 0018:
+    return -1  # 001a:
+
+BBB13:
+    # preds: BBB0
+    goto BB0
+    # -> BBB12
+
+BBB14:
+    # preds: BBB1
+    goto BB0
+    # -> BBB12
+    # throws -> BB12
+
+BBB15:
+    # preds: BBB3
+    goto BB0
+    # -> BBB6
+    # throws -> BB12
+
+BBB16:
+    # preds: BBB4
+    goto BB0
+    # -> BBB6
+    # throws -> BB12
+
+BBB17:
+    # preds: BBB7
+    goto BB0
+    # -> BBB6
+    # throws -> BB12
+
+BBB18:
+    # preds: BBB8
+    goto BB0
+    # -> BBB6
+    # throws -> BB12
+
+BBB19:
+    # preds: BBB10
+    goto BB0
+    # -> BBB6
+    # throws -> BB12
+

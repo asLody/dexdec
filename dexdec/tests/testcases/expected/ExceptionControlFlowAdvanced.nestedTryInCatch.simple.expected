@@ -1,0 +1,100 @@
+.method nestedTryInCatch
+.registers 2
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/RuntimeException; {BB6..BB12} -> BB12
+# .catch Ljava/lang/IllegalStateException; {BB18..BB24} -> BB24
+
+BBB0:  # entry
+    nop
+    if v1 == 0 goto BB6  # 0001:
+    # -> BBB2, BBB1
+
+BBB1:
+    # preds: BBB0
+    nop  # 0003:
+    const v1 = 1  # 0004:
+    goto BB26  # 0005:
+    # -> BBB11
+
+BBB2:
+    # preds: BBB0
+    nop
+    # -> BBB3, BBB12
+    # throws -> BB12
+
+BBB3:
+    # preds: BBB2
+    v0 = new Ljava/lang/RuntimeException;()  # 0008:
+    # -> BBB4, BBB13
+    # throws -> BB12
+
+BBB4:
+    # preds: BBB3
+    throw v0  # 000b:
+    # -> BBB5
+    # throws -> BB12
+
+BBB5:
+    # preds: BBB4, BBB12, BBB13
+    move-exception v0  # 000c:
+    if v1 < 0 goto BB18  # 000d:
+    # -> BBB7, BBB6
+
+BBB6:
+    # preds: BBB5
+    nop  # 000f:
+    const v1 = 2  # 0010:
+    goto BB26  # 0011:
+    # -> BBB11
+
+BBB7:
+    # preds: BBB5
+    nop
+    # -> BBB8, BBB14
+    # throws -> BB24
+
+BBB8:
+    # preds: BBB7
+    v1 = new Ljava/lang/IllegalStateException;()  # 0014:
+    # -> BBB9, BBB15
+    # throws -> BB24
+
+BBB9:
+    # preds: BBB8
+    throw v1  # 0017:
+    # -> BBB10
+    # throws -> BB24
+
+BBB10:
+    # preds: BBB9, BBB14, BBB15
+    move-exception v1  # 0018:
+    const v1 = 3  # 0019:
+    # -> BBB11
+
+BBB11:
+    # preds: BBB1, BBB6, BBB10
+    return v1  # 001a:
+
+BBB12:
+    # preds: BBB2
+    goto BB0
+    # -> BBB5
+
+BBB13:
+    # preds: BBB3
+    goto BB0
+    # -> BBB5
+
+BBB14:
+    # preds: BBB7
+    goto BB0
+    # -> BBB10
+
+BBB15:
+    # preds: BBB8
+    goto BB0
+    # -> BBB10
+

@@ -1,0 +1,119 @@
+.method multiExit
+.registers 3
+.ins 2
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB5..BB19} -> BB8
+# .catch Ljava/lang/Throwable; {BB22..BB23} -> BB8
+
+BBB0:  # entry
+    v0 = LSynchronized;->lock:Ljava/lang/Object;
+    monitor-enter v0  # 0002:
+    if v1 >= 0 goto BB10  # 0003:
+    # -> BBB4, BBB1
+
+BBB1:
+    # preds: BBB0
+    monitor-exit v0  # 0005:
+    # -> BBB2, BBB13
+    # throws -> BB8
+
+BBB2:
+    # preds: BBB1
+    return -1  # 0007:
+    # throws -> BB8
+
+BBB3:
+    # preds: BBB13, BBB14, BBB15, BBB16, BBB17, BBB18
+    move-exception v1  # 0008:
+    goto BB22  # 0009:
+    # -> BBB11
+    # throws -> BB8
+
+BBB4:
+    # preds: BBB0
+    if v2 >= 0 goto BB15  # 000a:
+    # -> BBB7, BBB5
+    # throws -> BB8
+
+BBB5:
+    # preds: BBB4
+    monitor-exit v0  # 000c:
+    # -> BBB6, BBB14
+    # throws -> BB8
+
+BBB6:
+    # preds: BBB5
+    return -2  # 000e:
+    # throws -> BB8
+
+BBB7:
+    # preds: BBB4
+    v1 = v1 + v2  # 000f:
+    # -> BBB8, BBB15
+    # throws -> BB8
+
+BBB8:
+    # preds: BBB7
+    LSynchronized;->counter:I = v1  # 0010:
+    # -> BBB9, BBB16
+    # throws -> BB8
+
+BBB9:
+    # preds: BBB8
+    monitor-exit v0  # 0012:
+    # -> BBB10, BBB17
+    # throws -> BB8
+
+BBB10:
+    # preds: BBB9
+    v1 = LSynchronized;->counter:I  # 0013:
+    return v1  # 0015:
+
+BBB11:
+    # preds: BBB3
+    monitor-exit v0  # 0016:
+    # -> BBB12, BBB18
+    # throws -> BB8
+
+BBB12:
+    # preds: BBB11
+    throw v1  # 0017:
+
+BBB13:
+    # preds: BBB1
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+
+BBB14:
+    # preds: BBB5
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+
+BBB15:
+    # preds: BBB7
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+
+BBB16:
+    # preds: BBB8
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+
+BBB17:
+    # preds: BBB9
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+
+BBB18:
+    # preds: BBB11
+    goto BB0
+    # -> BBB3
+    # throws -> BB8
+

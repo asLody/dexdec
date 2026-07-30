@@ -1,0 +1,60 @@
+.method syncWithCall
+.registers 2
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB3..BB11} -> BB9
+
+BBB0:  # entry
+    v0 = LSynchronizedAdvanced;->lock1:Ljava/lang/Object;
+    monitor-enter v0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0
+    invoke-static LSynchronizedAdvanced;->helper(I)I(v1)  # 0003:
+    # -> BBB2, BBB6
+    # throws -> BB9
+
+BBB2:
+    # preds: BBB1
+    move-result v1  # 0006:
+    monitor-exit v0  # 0007:
+    # -> BBB3, BBB7
+    # throws -> BB9
+
+BBB3:
+    # preds: BBB2
+    return v1  # 0008:
+    # throws -> BB9
+
+BBB4:
+    # preds: BBB6, BBB7, BBB8
+    move-exception v1  # 0009:
+    monitor-exit v0  # 000a:
+    # -> BBB5, BBB8
+    # throws -> BB9
+
+BBB5:
+    # preds: BBB4
+    throw v1  # 000b:
+
+BBB6:
+    # preds: BBB1
+    goto BB0
+    # -> BBB4
+    # throws -> BB9
+
+BBB7:
+    # preds: BBB2
+    goto BB0
+    # -> BBB4
+    # throws -> BB9
+
+BBB8:
+    # preds: BBB4
+    goto BB0
+    # -> BBB4
+    # throws -> BB9
+

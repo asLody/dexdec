@@ -1,0 +1,56 @@
+.method doWhileClamp
+.registers 2
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB9
+    if v1 >= 0 goto BB4  # 0001:
+    # -> BBB8, BBB2
+
+BBB2:
+    # preds: BBB1
+    v1 = -v1  # 0003:
+    # -> BBB3
+
+BBB3:
+    # preds: BBB2, BBB8
+    const v0 = 10  # 0004:
+    if v1 <= v0 goto BB10  # 0006:
+    # -> BBB5, BBB4
+
+BBB4:
+    # preds: BBB3
+    nop  # 0008:
+    goto BB16  # 0009:
+    # -> BBB7
+
+BBB5:
+    # preds: BBB3
+    v1 = v1 + 1  # 000a:
+    if v1 < 5 goto BB1  # 000d:
+    # -> BBB9, BBB6
+
+BBB6:
+    # preds: BBB5
+    move v0 = v1  # 000f:
+    # -> BBB7
+
+BBB7:
+    # preds: BBB4, BBB6
+    return v0  # 0010:
+
+BBB8:
+    # preds: BBB1
+    goto BB0
+    # -> BBB3
+
+BBB9:
+    # preds: BBB5
+    goto BB0
+    # -> BBB1
+

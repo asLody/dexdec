@@ -1,0 +1,27 @@
+public open class Main {
+    companion object {
+        public fun main(strings: Array<String?>?) {
+            System.`out`!!.println("pick 1")
+            Main.pickOne(1)!!.run()
+            System.`out`!!.println((Main.pickOne(1) as CommonInterface?)!!.doStuff())
+            System.`out`!!.println("pick 2")
+            Main.pickOne(2)!!.run()
+            System.`out`!!.println((Main.pickOne(2) as CommonInterface?)!!.doStuff())
+            System.`out`!!.println("pick 3")
+            Main.pickOne(3)!!.run()
+        }
+
+        public fun pickOne(p0: Int): Runnable? {
+            if (p0 == 1) {
+                return ClassOne()
+            }
+            if (p0 == 2) {
+                return ClassTwo()
+            }
+            if (p0 != 3) {
+                return null
+            }
+            return ClassThree()
+        }
+    }
+}

@@ -1,0 +1,131 @@
+.method finallyWithBreakContinue
+.registers 4
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB6..BB22} -> BB29
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB12
+    v2 = v3.length  # 0003:
+    if v0 >= v2 goto BB31  # 0004:
+    # -> BBB15, BBB2
+
+BBB2:
+    # preds: BBB1
+    v2 = v3[v0]  # 0006:
+    # -> BBB3, BBB16
+    # throws -> BB29
+
+BBB3:
+    # preds: BBB2
+    if v2 != 0 goto BB13  # 0008:
+    # -> BBB6, BBB4
+    # throws -> BB29
+
+BBB4:
+    # preds: BBB3
+    v1 = v1 + 1  # 000a:
+    # -> BBB17, BBB18
+    # throws -> BB29
+
+BBB6:
+    # preds: BBB3
+    v2 = v3[v0]  # 000d:
+    # -> BBB7, BBB19
+    # throws -> BB29
+
+BBB7:
+    # preds: BBB6
+    if v2 >= 0 goto BB20  # 000f:
+    # -> BBB10, BBB8
+    # throws -> BB29
+
+BBB8:
+    # preds: BBB7
+    v1 = v1 + 1  # 0011:
+    # -> BBB20, BBB21
+    # throws -> BB29
+
+BBB10:
+    # preds: BBB7
+    v2 = v3[v0]  # 0014:
+    # -> BBB11, BBB22
+    # throws -> BB29
+
+BBB11:
+    # preds: BBB10
+    v1 = v1 + v2  # 0016:
+    v1 = v1 + 1  # 0017:
+    nop  # 0019:
+    # -> BBB12
+
+BBB12:
+    # preds: BBB11, BBB17
+    v0 = v0 + 1  # 001a:
+    goto BB3  # 001c:
+    # -> BBB1
+
+BBB13:
+    # preds: BBB16, BBB18, BBB19, BBB21, BBB22
+    move-exception v3  # 001d:
+    throw v3  # 001e:
+
+BBB14:
+    # preds: BBB15, BBB20
+    return v1  # 001f:
+
+BBB15:
+    # preds: BBB1
+    goto BB0
+    # -> BBB14
+    # throws -> BB29
+
+BBB16:
+    # preds: BBB2
+    goto BB0
+    # -> BBB13
+    # throws -> BB29
+
+BBB17:
+    # preds: BBB4
+    goto BB0
+    # -> BBB12
+    # throws -> BB29
+
+BBB18:
+    # preds: BBB4
+    goto BB0
+    # -> BBB13
+    # throws -> BB29
+
+BBB19:
+    # preds: BBB6
+    goto BB0
+    # -> BBB13
+    # throws -> BB29
+
+BBB20:
+    # preds: BBB8
+    goto BB0
+    # -> BBB14
+    # throws -> BB29
+
+BBB21:
+    # preds: BBB8
+    goto BB0
+    # -> BBB13
+    # throws -> BB29
+
+BBB22:
+    # preds: BBB10
+    goto BB0
+    # -> BBB13
+

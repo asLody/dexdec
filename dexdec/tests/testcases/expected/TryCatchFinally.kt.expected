@@ -1,0 +1,14 @@
+public open class TryCatchFinally {
+    companion object {
+        public fun simpleTryCatch(p0: Int): Int {
+            if (p0 != 0) {
+                return 1
+            }
+            try {
+                throw RuntimeException()
+            } catch (exception: RuntimeException) {
+                return -1
+            }
+        }
+    }
+}

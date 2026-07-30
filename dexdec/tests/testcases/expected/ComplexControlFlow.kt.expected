@@ -1,0 +1,86 @@
+public open class ComplexControlFlow {
+    companion object {
+        public fun doWhileClamp(p0: Int): Int {
+            var p0: Int = p0
+            while (true) {
+                if (p0 < 0) {
+                    p0 = -p0
+                }
+                if (p0 > 10) {
+                    return 10
+                }
+                val v2: Int = p0 + 1
+                p0 = v2
+                if (v2 >= 5) {
+                    return v2
+                }
+            }
+        }
+
+        public fun findInMatrix(valueses: Array<IntArray?>, p1: Int): Int {
+            var index2: Int = 0
+            while (index2 < valueses.size) {
+                val values: IntArray? = valueses[index2]
+                var index: Int = 0
+                while (index < values!!.size) {
+                    if (values[index] == p1) {
+                        return index2 * 1000 + index
+                    }
+                    if (values[index] != -1) {
+                        index++
+                        continue
+                    }
+                    break
+                }
+                index2++
+            }
+            return -1
+        }
+
+        public fun sumUntil(values: IntArray, p1: Int): Int {
+            var index: Int = 0
+            var total: Int = 0
+            while (index < values.size) {
+                val step: Int = values[index]
+                if (step >= 0) {
+                    total += step
+                    if (total > p1) {
+                        return total
+                    }
+                }
+                index++
+            }
+            return total
+        }
+
+        public fun whileSwitch(p0: Int): Int {
+            var v1: Int = 0
+            var total: Int = 0
+            while (v1 < 5) {
+                when (p0 + v1) {
+                    0 -> {
+                        total++
+                    }
+                    1 -> {
+                        total += 2
+                    }
+                    2 -> {
+                        total += 3
+                    }
+                    else -> {
+                        total += 4
+                    }
+                }
+                if (total <= 6) {
+                    if (total > 10) {
+                        return total
+                    }
+                    v1++
+                } else {
+                    v1++
+                }
+            }
+            return total
+        }
+    }
+}

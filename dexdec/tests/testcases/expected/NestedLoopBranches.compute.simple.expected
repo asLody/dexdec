@@ -1,0 +1,120 @@
+.method compute
+.registers 11
+.ins 3
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    const v2 = 0  # 0003:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB15
+    v3 = v8.length  # 0004:
+    if v1 >= v3 goto BB44  # 0005:
+    # -> BBB17, BBB2
+
+BBB2:
+    # preds: BBB1
+    v3 = v8[v1]  # 0007:
+    if v3 >= 0 goto BB12  # 0009:
+    # -> BBB4, BBB18
+
+BBB4:
+    # preds: BBB2
+    v3 = v9[v1]  # 000c:
+    const v4 = 0  # 000e:
+    # -> BBB5
+
+BBB5:
+    # preds: BBB4, BBB12
+    v5 = v3.length  # 000f:
+    if v4 >= v5 goto BB38  # 0012:
+    # -> BBB19, BBB6
+
+BBB6:
+    # preds: BBB5
+    v5 = v3[v4]  # 0014:
+    if v5 != v10 goto BB26  # 0016:
+    # -> BBB8, BBB7
+
+BBB7:
+    # preds: BBB6
+    v2 = v2 + v5  # 0018:
+    return v2  # 0019:
+
+BBB8:
+    # preds: BBB6
+    v7 = v5 % 2  # 001a:
+    if v7 != 0 goto BB31  # 001c:
+    # -> BBB10, BBB20
+
+BBB10:
+    # preds: BBB8
+    v2 = v2 + v5  # 001f:
+    if v2 <= 1000 goto BB35  # 0020:
+    # -> BBB21, BBB22
+
+BBB12:
+    # preds: BBB20, BBB21
+    v4 = v4 + 1  # 0023:
+    goto BB15  # 0025:
+    # -> BBB5
+
+BBB13:
+    # preds: BBB19, BBB22
+    if v2 <= 1000 goto BB41  # 0026:
+    # -> BBB23, BBB24
+
+BBB15:
+    # preds: BBB18, BBB23
+    v1 = v1 + 1  # 0029:
+    goto BB4  # 002b:
+    # -> BBB1
+
+BBB16:
+    # preds: BBB17, BBB24
+    return v2  # 002c:
+
+BBB17:
+    # preds: BBB1
+    goto BB0
+    # -> BBB16
+
+BBB18:
+    # preds: BBB2
+    goto BB0
+    # -> BBB15
+
+BBB19:
+    # preds: BBB5
+    goto BB0
+    # -> BBB13
+
+BBB20:
+    # preds: BBB8
+    goto BB0
+    # -> BBB12
+
+BBB21:
+    # preds: BBB10
+    goto BB0
+    # -> BBB12
+
+BBB22:
+    # preds: BBB10
+    goto BB0
+    # -> BBB13
+
+BBB23:
+    # preds: BBB13
+    goto BB0
+    # -> BBB15
+
+BBB24:
+    # preds: BBB13
+    goto BB0
+    # -> BBB16
+

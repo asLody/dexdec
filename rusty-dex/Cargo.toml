@@ -1,0 +1,17 @@
+[package]
+name = "rusty-dex"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "`rusty-dex` is a parser for DEX files"
+homepage = "https://github.com/rusty-rs/rusty-dex"
+repository = "https://github.com/rusty-rs/rusty-dex"
+readme = "README.md"
+
+[dependencies]
+byteorder = "1.4.3"
+zip = { version = "0.6.4", default-features = false, features = ["deflate-zlib", "bzip2", "zstd"] }
+lazy_static = "1.4.0"
+regex = "1.7.3"
+log = "0.4.21"
+thiserror = "2.0.12"

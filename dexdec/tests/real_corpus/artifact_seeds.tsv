@@ -1,0 +1,13 @@
+# artifact_id	source_kind	source	packaging	repo	android_api	note
+jackson-databind-2.16.1	maven	com.fasterxml.jackson.core:jackson-databind:2.16.1	jar	-	-	polymorphic dispatch, reflection, nested exceptions, large methods
+guava-33.2.1-android	maven	com.google.guava:guava:33.2.1-android	jar	-	-	nested classes, generics, cache/state machines, rich control flow
+commons-compress-1.27.1	maven	org.apache.commons:commons-compress:1.27.1	jar	-	-	streaming state machines, bit logic, exceptions, switch-heavy codecs
+commons-collections4-4.4	maven	org.apache.commons:commons-collections4:4.4	jar	-	-	iterators, decorators, nested control flow, anonymous helpers
+commons-io-2.16.1	maven	commons-io:commons-io:2.16.1	jar	-	-	io state machines, try/finally, branching utilities
+okhttp-3.14.9	maven	com.squareup.okhttp3:okhttp:3.14.9	jar	-	-	anonymous classes, interceptors, synchronization, exception flow
+retrofit-2.11.0	maven	com.squareup.retrofit2:retrofit:2.11.0	jar	-	-	reflection, adapters, nested generics, anonymous implementations
+asm-util-9.7	maven	org.ow2.asm:asm-util:9.7	jar	-	-	bytecode visitors, switches, nested classes, label-heavy code
+javassist-3.30.2-GA	maven	org.javassist:javassist:3.30.2-GA	jar	-	-	bytecode manipulation, exception-heavy control flow, deep nesting
+byte-buddy-1.14.18	maven	net.bytebuddy:byte-buddy:1.14.18	jar	-	-	code generation, visitor graphs, anonymous types, complex dispatch
+rxjava-3.1.8	maven	io.reactivex.rxjava3:rxjava:3.1.8	jar	-	-	concurrency, schedulers, atomic state machines, nested anonymous classes
+snakeyaml-2.2	maven	org.yaml:snakeyaml:2.2	jar	-	-	parser state machines, switches, exceptions, recursive descent

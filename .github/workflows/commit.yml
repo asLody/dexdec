@@ -1,0 +1,61 @@
+name: Commit build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dexdec-gui/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt
+
+      - name: Resolve commit version
+        id: version
+        run: |
+          version="$(node scripts/version.mjs sync --channel commit)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "### DexDec $version" >> "$GITHUB_STEP_SUMMARY"
+          cargo metadata --no-deps --format-version 1 >/dev/null
+
+      - name: Verify version policy
+        run: |
+          node --test scripts/version.test.mjs
+          node scripts/version.mjs check
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust workspace
+        run: cargo check -p dexdec -p dexdec-workbench -p dexdec-mcp
+
+      - name: Build desktop frontend
+        working-directory: dexdec-gui
+        run: |
+          npm ci
+          npm run build

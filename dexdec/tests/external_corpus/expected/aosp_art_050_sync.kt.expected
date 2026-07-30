@@ -1,0 +1,55 @@
+public open class Main {
+    companion object {
+        fun countTest() {
+            val lock: CpuThread = CpuThread(1)
+            val cpuThread: CpuThread = CpuThread(2)
+            synchronized(lock!!) {
+                lock.start()
+                try {
+                    lock.wait()
+                } catch (exception2: InterruptedException) {
+                    System.`out`!!.println("INTERRUPT!")
+                    exception2.printStackTrace(System.`out`!!)
+                }
+            }
+            cpuThread.start()
+            try {
+                lock.join()
+                cpuThread.join()
+            } catch (exception: InterruptedException) {
+                System.`out`!!.println("INTERRUPT!")
+                exception.printStackTrace(System.`out`!!)
+            }
+            System.`out`!!.println("main: all done")
+        }
+
+        fun interruptTest() {
+            val sleepyThread: SleepyThread = SleepyThread(null as SleepyThread?)
+            val sleepyThread2: SleepyThread = SleepyThread(sleepyThread)
+            sleepyThread.setPriority(4)
+            sleepyThread.start()
+            sleepyThread2.start()
+            sleepyThread2.setPriority(3)
+        }
+
+        public fun main(strings: Array<String?>?) {
+            System.`out`!!.println("Sleep Test")
+            Main.sleepTest()
+            System.`out`!!.println("\nCount Test")
+            Main.countTest()
+            System.`out`!!.println("\nInterrupt Test")
+            Main.interruptTest()
+        }
+
+        fun sleepTest() {
+            System.`out`!!.println("GOING")
+            try {
+                Thread.sleep(1000L)
+            } catch (exception: InterruptedException) {
+                System.`out`!!.println("INTERRUPT!")
+                exception.printStackTrace(System.`out`!!)
+            }
+            System.`out`!!.println("GONE")
+        }
+    }
+}

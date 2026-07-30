@@ -1,0 +1,25 @@
+[package]
+name = "dexdec-mcp"
+version.workspace = true
+description = "Model Context Protocol server for DexDec"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[[bin]]
+name = "dexdec-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+dexdec-workbench = { path = "../dexdec-workbench" }
+directories = "6"
+getrandom = "0.3"
+rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+thiserror = "2"
+url = "2"

@@ -1,0 +1,41 @@
+[package]
+name = "dexdec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+description = "Next-gen Dex decompiler core library"
+documentation = "https://docs.rs/dexdec"
+keywords = ["android", "dex", "decompiler", "reverse-engineering"]
+categories = ["development-tools"]
+
+[dependencies]
+rusty-dex = { path = "../rusty-dex", version = "0.2.0" }
+clap = { version = "4.5", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+bitflags = "2"
+rayon = "1"
+hotpath = { version = "0.17.0", default-features = false, features = ["hotpath"], optional = true }
+crc32fast = "1"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.41", optional = true }
+abxml = { version = "0.8.2", default-features = false, optional = true }
+zstd = "0.11"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3.24.0"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:abxml", "symbol-builder"]
+debug-switch = []
+profiling = ["dep:hotpath"]
+symbol-builder = ["dep:zip", "dep:quick-xml"]
+
+[[bin]]
+name = "dexdec"
+path = "src/bin/dexdec.rs"
+required-features = ["cli"]

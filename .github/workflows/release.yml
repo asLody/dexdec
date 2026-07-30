@@ -1,0 +1,205 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            arch: x86_64
+            runner: ubuntu-24.04
+            rust_host: x86_64-unknown-linux-gnu
+            artifact: dexdec-linux-x86_64
+            bundles: deb,appimage
+          - platform: Windows
+            arch: x86_64
+            runner: windows-2025
+            rust_host: x86_64-pc-windows-msvc
+            artifact: dexdec-windows-x86_64
+            bundles: nsis
+          - platform: macOS
+            arch: arm64
+            runner: macos-latest
+            rust_host: aarch64-apple-darwin
+            artifact: dexdec-macos-arm64
+            bundles: dmg
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dexdec-gui/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Verify native runner architecture
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "Rust host: $host"
+          test "$host" = "${{ matrix.rust_host }}"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Verify release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version="$(node scripts/version.mjs sync --release "$RELEASE_TAG")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "### DexDec $version" >> "$GITHUB_STEP_SUMMARY"
+          cargo metadata --no-deps --format-version 1 >/dev/null
+          node --test scripts/version.test.mjs
+          node scripts/version.mjs check
+
+      - name: Install frontend dependencies
+        working-directory: dexdec-gui
+        run: npm ci
+
+      - name: Build desktop application
+        working-directory: dexdec-gui
+        run: npm run tauri -- build --bundles "${{ matrix.bundles }}"
+
+      - name: Build command-line tools
+        run: cargo build --release -p dexdec -p dexdec-mcp
+
+      - name: Assemble Linux assets
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/deb/*.deb dist/
+          cp target/release/bundle/appimage/*.AppImage dist/
+          bundle="DexDec-${VERSION}-cli-linux-x86_64"
+          mkdir -p "dist/${bundle}"
+          install -m 755 target/release/dexdec target/release/dexdec-mcp "dist/${bundle}/"
+          install -m 644 LICENSE README.md "dist/${bundle}/"
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          rm -rf "dist/${bundle}"
+
+      - name: Assemble macOS assets
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/dmg/*.dmg dist/
+          bundle="DexDec-${VERSION}-cli-macos-arm64"
+          mkdir -p "dist/${bundle}"
+          install -m 755 target/release/dexdec target/release/dexdec-mcp "dist/${bundle}/"
+          install -m 644 LICENSE README.md "dist/${bundle}/"
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          rm -rf "dist/${bundle}"
+
+      - name: Assemble Windows assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe dist/
+          $bundle = "DexDec-$env:VERSION-cli-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
+          Copy-Item target/release/dexdec.exe "dist/$bundle/"
+          Copy-Item target/release/dexdec-mcp.exe "dist/$bundle/"
+          Copy-Item LICENSE, README.md "dist/$bundle/"
+          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$bundle.zip"
+          Remove-Item -Recurse -Force "dist/$bundle"
+
+      - name: Upload platform assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download platform assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "DexDec ${RELEASE_TAG#v}" \
+              --generate-notes
+          fi

@@ -1,0 +1,49 @@
+.method finallySideEffect
+.registers 5
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB2..BB6} -> BB12
+
+BBB0:  # entry
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0
+    v4[0] = 1  # 0002:
+    # -> BBB2, BBB5
+    # throws -> BB12
+
+BBB2:
+    # preds: BBB1
+    v2 = v4[0]  # 0004:
+    # -> BBB3, BBB6
+    # throws -> BB12
+
+BBB3:
+    # preds: BBB2
+    v3 = v4[0]  # 0006:
+    v3 = v3 + 1  # 0008:
+    v4[0] = v3  # 0009:
+    return v2  # 000b:
+
+BBB4:
+    # preds: BBB5, BBB6
+    move-exception v2  # 000c:
+    v3 = v4[0]  # 000d:
+    v3 = v3 + 1  # 000f:
+    v4[0] = v3  # 0010:
+    throw v2  # 0012:
+
+BBB5:
+    # preds: BBB1
+    goto BB0
+    # -> BBB4
+    # throws -> BB12
+
+BBB6:
+    # preds: BBB2
+    goto BB0
+    # -> BBB4
+

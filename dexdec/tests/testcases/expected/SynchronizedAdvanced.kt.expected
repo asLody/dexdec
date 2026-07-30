@@ -1,0 +1,157 @@
+public open class SynchronizedAdvanced {
+    public open fun syncOnThis(p0: Int): Int {
+        synchronized(this) {
+            SynchronizedAdvanced.value = p0
+        }
+        return SynchronizedAdvanced.value
+    }
+
+    companion object {
+        private var lock1: Any? = Any()
+
+        private var lock2: Any? = Any()
+
+        private var value: Int = 0
+
+        public fun deepNesting(values: IntArray?): Int {
+            var index: Int = 0
+            var remaining: Int = 0
+            while (index < values!!.size) {
+                var v2: Int = 0
+                synchronized(SynchronizedAdvanced.lock1!!) {
+                    try {
+                        remaining += 10 / values[index]
+                    } catch (exception: ArithmeticException) {
+                        remaining--
+                    }
+                    index = v2
+                }
+                v2 = index + 1
+                index = v2
+            }
+            return remaining
+        }
+
+        private fun helper(p0: Int): Int {
+            return p0 * 2
+        }
+
+        public fun sequentialSync(p0: Int, p1: Int): Int {
+            var v3: Int
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                v3 = p0 + 1
+            }
+            synchronized(SynchronizedAdvanced.lock2!!) {
+                return v3 + p1
+            }
+        }
+
+        public fun syncMultiCatch(p0: Int): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                if (p0 < 0) {
+                    try {
+                        throw IllegalArgumentException()
+                    } catch (exception2: ArithmeticException) {
+                        return -1
+                    } catch (exception: IllegalArgumentException) {
+                        return -2
+                    }
+                }
+                try {
+                    return 100 / p0
+                } catch (exception2: ArithmeticException) {
+                    return -1
+                } catch (exception: IllegalArgumentException) {
+                    return -2
+                }
+            }
+        }
+
+        public fun syncOnClass(p0: Int): Int {
+            synchronized(SynchronizedAdvanced::class.java!!) {
+                SynchronizedAdvanced.value = p0
+            }
+            return SynchronizedAdvanced.value
+        }
+
+        public fun syncWhileLoop(p0: Int): Int {
+            var p0: Int = p0
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                var result: Int = 0
+                while (p0 > 0) {
+                    val v5: Int = p0 / 2
+                    result++
+                    p0 = v5
+                }
+                return result
+            }
+        }
+
+        public fun syncWithBreak(values: IntArray?): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                var index: Int = 0
+                var result: Int = 0
+                while (index < values!!.size && values[index] >= 0) {
+                    val v6: Int = result + values[index]
+                    index++
+                    result = v6
+                }
+                return result
+            }
+        }
+
+        public fun syncWithCall(p0: Int): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                return SynchronizedAdvanced.helper(p0)
+            }
+        }
+
+        public fun syncWithContinue(values: IntArray?): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                var index: Int = 0
+                var total: Int = 0
+                while (index < values!!.size) {
+                    if (values[index] != 0) {
+                        total += values[index]
+                    }
+                    index++
+                }
+                return total
+            }
+        }
+
+        public fun syncWithFinally(p0: Int): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                var result: Int
+                try {
+                    result = 100 / p0
+                } catch (exception: ArithmeticException) {
+                    result = -1
+                } finally {
+                    SynchronizedAdvanced.value = 0
+                }
+                return result
+            }
+        }
+
+        public fun syncWithSwitch(p0: Int): Int {
+            synchronized(SynchronizedAdvanced.lock1!!) {
+                var result: Int = 0
+                when (p0) {
+                    1 -> {
+                        result = 10
+                    }
+                    2 -> {
+                        result = 20
+                    }
+                    3 -> {
+                        result = 30
+                    }
+                    else -> {
+                    }
+                }
+                return result
+            }
+        }
+    }
+}

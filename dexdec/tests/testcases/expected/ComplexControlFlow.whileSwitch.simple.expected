@@ -1,0 +1,117 @@
+.method whileSwitch
+.registers 4
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB8, BBB11
+    if v0 >= 5 goto BB37  # 0004:
+    # -> BBB17, BBB2
+
+BBB2:
+    # preds: BBB1
+    v2 = v3 + v0  # 0006:
+    if v2 < 1 goto BB0  # 0006:
+    # -> BBB13, BBB14
+
+BBB3:
+    # preds: BBB19, BBB20, BBB21
+    v1 = v1 + 4  # 000b:
+    goto BB23  # 000d:
+    # -> BBB7
+
+BBB4:
+    # preds: BBB16
+    v1 = v1 + 3  # 000e:
+    goto BB23  # 0010:
+    # -> BBB7
+
+BBB5:
+    # preds: BBB15
+    v1 = v1 + 2  # 0011:
+    goto BB23  # 0013:
+    # -> BBB7
+
+BBB6:
+    # preds: BBB13
+    v1 = v1 + 1  # 0014:
+    nop  # 0016:
+    # -> BBB7
+
+BBB7:
+    # preds: BBB3, BBB4, BBB5, BBB6
+    if v1 <= 6 goto BB29  # 0018:
+    # -> BBB9, BBB8
+
+BBB8:
+    # preds: BBB7
+    v0 = v0 + 1  # 001a:
+    goto BB3  # 001c:
+    # -> BBB1
+
+BBB9:
+    # preds: BBB7
+    if v1 <= 10 goto BB34  # 001f:
+    # -> BBB11, BBB18
+
+BBB11:
+    # preds: BBB9
+    v0 = v0 + 1  # 0022:
+    goto BB3  # 0024:
+    # -> BBB1
+
+BBB12:
+    # preds: BBB17, BBB18
+    return v1  # 0025:
+
+BBB13:
+    # preds: BBB2
+    if v2 == 0 goto BB0  # 0006:
+    # -> BBB6, BBB19
+
+BBB14:
+    # preds: BBB2
+    if v2 < 2 goto BB0  # 0006:
+    # -> BBB15, BBB16
+
+BBB15:
+    # preds: BBB14
+    if v2 == 1 goto BB0  # 0006:
+    # -> BBB5, BBB20
+
+BBB16:
+    # preds: BBB14
+    if v2 == 2 goto BB0  # 0006:
+    # -> BBB4, BBB21
+
+BBB17:
+    # preds: BBB1
+    goto BB0
+    # -> BBB12
+
+BBB18:
+    # preds: BBB9
+    goto BB0
+    # -> BBB12
+
+BBB19:
+    # preds: BBB13
+    goto BB0
+    # -> BBB3
+
+BBB20:
+    # preds: BBB15
+    goto BB0
+    # -> BBB3
+
+BBB21:
+    # preds: BBB16
+    goto BB0
+    # -> BBB3
+

@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+/javac.*.args
+
+# Web frontend
+**/node_modules/
+**/dist/
+/dexdec-gui/src-tauri/gen/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local scratch
+/tmp/
+/refer/
+/.idea/
+/.codegraph/

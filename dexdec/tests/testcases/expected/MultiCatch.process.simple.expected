@@ -1,0 +1,97 @@
+.method process
+.registers 2
+.ins 2
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/IllegalArgumentException; {BB2..BB12} -> BB15
+# .catch Ljava/lang/ArithmeticException; {BB2..BB12} -> BB12
+
+BBB0:  # entry
+    if v0 < 0 goto BB4
+    # -> BBB3, BBB1
+
+BBB1:
+    # preds: BBB0
+    v0 = v0 / v1  # 0002:
+    # -> BBB2, BBB8, BBB9
+    # throws -> BB15, BB12
+
+BBB2:
+    # preds: BBB1
+    return v0  # 0003:
+    # throws -> BB15, BB12
+
+BBB3:
+    # preds: BBB0
+    nop
+    # -> BBB4, BBB10, BBB11
+    # throws -> BB15, BB12
+
+BBB4:
+    # preds: BBB3
+    const-string v1 = "negative a"  # 0006:
+    v0 = new Ljava/lang/IllegalArgumentException;(v1)  # 0008:
+    # -> BBB5, BBB12, BBB13
+    # throws -> BB15, BB12
+
+BBB5:
+    # preds: BBB4
+    throw v0  # 000b:
+    # -> BBB14, BBB15
+    # throws -> BB15, BB12
+
+BBB6:
+    # preds: BBB9, BBB11, BBB13, BBB15
+    move-exception v0  # 000c:
+    return -2  # 000e:
+
+BBB7:
+    # preds: BBB8, BBB10, BBB12, BBB14
+    move-exception v0  # 000f:
+    return -1  # 0011:
+
+BBB8:
+    # preds: BBB1
+    goto BB0
+    # -> BBB7
+    # throws -> BB15, BB12
+
+BBB9:
+    # preds: BBB1
+    goto BB0
+    # -> BBB6
+    # throws -> BB15, BB12
+
+BBB10:
+    # preds: BBB3
+    goto BB0
+    # -> BBB7
+    # throws -> BB15, BB12
+
+BBB11:
+    # preds: BBB3
+    goto BB0
+    # -> BBB6
+    # throws -> BB15, BB12
+
+BBB12:
+    # preds: BBB4
+    goto BB0
+    # -> BBB7
+
+BBB13:
+    # preds: BBB4
+    goto BB0
+    # -> BBB6
+
+BBB14:
+    # preds: BBB5
+    goto BB0
+    # -> BBB7
+
+BBB15:
+    # preds: BBB5
+    goto BB0
+    # -> BBB6
+

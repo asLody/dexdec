@@ -1,0 +1,69 @@
+.method classify
+.registers 3
+.ins 3
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    if v0 <= 0 goto BB17  # 0001:
+    # -> BBB8, BBB1
+
+BBB1:
+    # preds: BBB0
+    if v1 <= 0 goto BB11  # 0003:
+    # -> BBB5, BBB2
+
+BBB2:
+    # preds: BBB1
+    if v2 <= 0 goto BB9  # 0005:
+    # -> BBB4, BBB3
+
+BBB3:
+    # preds: BBB2
+    const v0 = 1  # 0007:
+    goto BB22  # 0008:
+    # -> BBB11
+
+BBB4:
+    # preds: BBB2
+    const v0 = 2  # 0009:
+    goto BB22  # 000a:
+    # -> BBB11
+
+BBB5:
+    # preds: BBB1
+    if v2 <= 0 goto BB15  # 000b:
+    # -> BBB7, BBB6
+
+BBB6:
+    # preds: BBB5
+    const v0 = 3  # 000d:
+    goto BB22  # 000e:
+    # -> BBB11
+
+BBB7:
+    # preds: BBB5
+    const v0 = 4  # 000f:
+    goto BB22  # 0010:
+    # -> BBB11
+
+BBB8:
+    # preds: BBB0
+    if v1 <= 0 goto BB21  # 0011:
+    # -> BBB10, BBB9
+
+BBB9:
+    # preds: BBB8
+    const v0 = 5  # 0013:
+    goto BB22  # 0014:
+    # -> BBB11
+
+BBB10:
+    # preds: BBB8
+    const v0 = 6  # 0015:
+    # -> BBB11
+
+BBB11:
+    # preds: BBB3, BBB4, BBB6, BBB7, BBB9, BBB10
+    return v0  # 0016:
+

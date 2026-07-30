@@ -1,0 +1,22 @@
+.method divide
+.registers 2
+.ins 2
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/ArithmeticException; {BB0..BB1} -> BB2
+
+BBB0:  # entry
+    v0 = v0 / v1
+    # -> BBB1, BBB2
+    # throws -> BB2
+
+BBB1:
+    # preds: BBB0
+    return v0  # 0001:
+
+BBB2:
+    # preds: BBB0
+    move-exception v0  # 0002:
+    return 0  # 0004:
+

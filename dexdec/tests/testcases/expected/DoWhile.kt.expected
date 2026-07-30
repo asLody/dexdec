@@ -1,0 +1,13 @@
+public open class DoWhile {
+    companion object {
+        public fun countDigits(p0: Int): Int {
+            var p0: Int = p0
+            var count: Int = 0
+            do {
+                count++
+                p0 /= 10
+            } while (p0 > 0)
+            return count
+        }
+    }
+}

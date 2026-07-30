@@ -1,0 +1,35 @@
+.method compare
+.registers 3
+.ins 2
+.entry BBB0
+
+BBB0:  # entry
+    if v1 <= v2 goto BB10  # 0002:
+    # -> BBB4, BBB1
+
+BBB1:
+    # preds: BBB0
+    if v1 <= 100 goto BB8  # 0004:
+    # -> BBB3, BBB2
+
+BBB2:
+    # preds: BBB1
+    return 2  # 0007:
+
+BBB3:
+    # preds: BBB1
+    return 1  # 0009:
+
+BBB4:
+    # preds: BBB0
+    if v2 <= 100 goto BB14  # 000a:
+    # -> BBB6, BBB5
+
+BBB5:
+    # preds: BBB4
+    return -2  # 000d:
+
+BBB6:
+    # preds: BBB4
+    return -1  # 000f:
+

@@ -1,0 +1,17 @@
+.method test
+.registers 1
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    if v0 <= 0 goto BB4
+    # -> BBB2, BBB1
+
+BBB1:
+    # preds: BBB0
+    return 1  # 0003:
+
+BBB2:
+    # preds: BBB0
+    return -1  # 0005:
+

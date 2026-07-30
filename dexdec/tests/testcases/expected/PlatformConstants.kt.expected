@@ -1,0 +1,16 @@
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.ActivityInfo
+
+public class PlatformConstants {
+    companion object {
+        public fun launch(activity: Activity, intent: Intent) {
+            intent.setFlags(335544320)
+            activity.startActivityForResult(intent, -1)
+        }
+
+        public fun orient(activity: Activity) {
+            activity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+        }
+    }
+}

@@ -1,0 +1,6 @@
+# artifact_id	source_kind	source	packaging	repo	android_api	note
+lottie-6.7.1	maven	com.airbnb.android:lottie:6.7.1	aar	-	35	Java-heavy animation parsing, state machines, geometry, nested control flow
+glide-4.16.0	maven	com.github.bumptech.glide:glide:4.16.0	aar	-	35	high-usage image loading, caches, lifecycle, concurrency, resource transforms
+picasso-2.8	maven	com.squareup.picasso:picasso:2.8	aar	-	35	compact Java Android library, dispatch loops, handlers, request state machines
+fresco-imagepipeline-3.6.0	maven	com.facebook.fresco:imagepipeline:3.6.0	aar	-	35	image pipeline orchestration, producers, caching, concurrency, exceptions
+material-1.12.0	maven	com.google.android.material:material:1.12.0	aar	https://dl.google.com/dl/android/maven2	35	large Android UI state machines, animations, callbacks, generics, nested control flow

@@ -1,0 +1,109 @@
+public open class Synchronized {
+    companion object {
+        private var lock: Any? = Any()
+
+        private var counter: Int = 0
+
+        public fun computeInSync(p0: Int, p1: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                val counter: Int = p0 + p1
+                Synchronized.counter = counter
+                return counter
+            }
+        }
+
+        public fun multiExit(p0: Int, p1: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                if (p0 < 0) {
+                    return -1
+                }
+                if (p1 < 0) {
+                    return -2
+                }
+                Synchronized.counter = p0 + p1
+            }
+            return Synchronized.counter
+        }
+
+        public fun nestedSync(any: Any?, p1: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                synchronized(any!!) {
+                    Synchronized.counter = p1 * 2
+                }
+            }
+            return Synchronized.counter
+        }
+
+        public fun simpleSync(p0: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                Synchronized.counter = p0
+                return Synchronized.counter
+            }
+        }
+
+        public @kotlin.jvm.Synchronized fun syncMethod(p0: Int): Int {
+            Synchronized.counter = p0
+            return Synchronized.counter
+        }
+
+        public fun syncWithCondition(p0: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                if (p0 <= 0) {
+                    Synchronized.counter = -p0
+                } else {
+                    Synchronized.counter = p0
+                }
+            }
+            return Synchronized.counter
+        }
+
+        public fun syncWithLoop(values: IntArray?): Int {
+            synchronized(Synchronized.lock!!) {
+                var index: Int = 0
+                var counter: Int = 0
+                while (index < values!!.size) {
+                    val v6: Int = counter + values[index]
+                    index++
+                    counter = v6
+                }
+                Synchronized.counter = counter
+                return counter
+            }
+        }
+
+        public fun syncWithReturn(p0: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                if (p0 != 0) {
+                    Synchronized.counter = 100 / p0
+                    return Synchronized.counter
+                }
+                return -1
+            }
+        }
+
+        public fun syncWithTry(p0: Int): Int {
+            synchronized(Synchronized.lock!!) {
+                try {
+                    Synchronized.counter = 100 / p0
+                } catch (exception: ArithmeticException) {
+                    Synchronized.counter = -1
+                }
+            }
+            return Synchronized.counter
+        }
+
+        public fun tryWithSync(p0: Int): Int {
+            try {
+                synchronized(Synchronized.lock!!) {
+                    if (p0 == 0) {
+                        throw RuntimeException("zero")
+                    }
+                    Synchronized.counter = p0
+                }
+            } catch (exception: RuntimeException) {
+                return -1
+            }
+            return Synchronized.counter
+        }
+    }
+}

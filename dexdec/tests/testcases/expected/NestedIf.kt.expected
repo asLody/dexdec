@@ -1,0 +1,16 @@
+public open class NestedIf {
+    companion object {
+        public fun compare(p0: Int, p1: Int): Int {
+            if (p0 <= p1) {
+                if (p1 <= 100) {
+                    return -1
+                }
+                return -2
+            }
+            if (p0 <= 100) {
+                return 1
+            }
+            return 2
+        }
+    }
+}

@@ -1,0 +1,144 @@
+.method dayName
+.registers 1
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    if v0 < 4 goto BB0
+    # -> BBB9, BBB10
+
+BBB1:
+    # preds: BBB21, BBB22, BBB23, BBB24, BBB25, BBB26, BBB27
+    const-string v0 = "Invalid"  # 0003:
+    return v0  # 0005:
+
+BBB2:
+    # preds: BBB20
+    const-string v0 = "Sunday"  # 0006:
+    return v0  # 0008:
+
+BBB3:
+    # preds: BBB19
+    const-string v0 = "Saturday"  # 0009:
+    return v0  # 000b:
+
+BBB4:
+    # preds: BBB18
+    const-string v0 = "Friday"  # 000c:
+    return v0  # 000e:
+
+BBB5:
+    # preds: BBB17
+    const-string v0 = "Thursday"  # 000f:
+    return v0  # 0011:
+
+BBB6:
+    # preds: BBB14
+    const-string v0 = "Wednesday"  # 0012:
+    return v0  # 0014:
+
+BBB7:
+    # preds: BBB13
+    const-string v0 = "Tuesday"  # 0015:
+    return v0  # 0017:
+
+BBB8:
+    # preds: BBB11
+    const-string v0 = "Monday"  # 0018:
+    return v0  # 001a:
+
+BBB9:
+    # preds: BBB0
+    if v0 < 2 goto BB0
+    # -> BBB11, BBB12
+
+BBB10:
+    # preds: BBB0
+    if v0 < 6 goto BB0
+    # -> BBB15, BBB16
+
+BBB11:
+    # preds: BBB9
+    if v0 == 1 goto BB0
+    # -> BBB8, BBB21
+
+BBB12:
+    # preds: BBB9
+    if v0 < 3 goto BB0
+    # -> BBB13, BBB14
+
+BBB13:
+    # preds: BBB12
+    if v0 == 2 goto BB0
+    # -> BBB7, BBB22
+
+BBB14:
+    # preds: BBB12
+    if v0 == 3 goto BB0
+    # -> BBB6, BBB23
+
+BBB15:
+    # preds: BBB10
+    if v0 < 5 goto BB0
+    # -> BBB17, BBB18
+
+BBB16:
+    # preds: BBB10
+    if v0 < 7 goto BB0
+    # -> BBB19, BBB20
+
+BBB17:
+    # preds: BBB15
+    if v0 == 4 goto BB0
+    # -> BBB5, BBB24
+
+BBB18:
+    # preds: BBB15
+    if v0 == 5 goto BB0
+    # -> BBB4, BBB25
+
+BBB19:
+    # preds: BBB16
+    if v0 == 6 goto BB0
+    # -> BBB3, BBB26
+
+BBB20:
+    # preds: BBB16
+    if v0 == 7 goto BB0
+    # -> BBB2, BBB27
+
+BBB21:
+    # preds: BBB11
+    goto BB0
+    # -> BBB1
+
+BBB22:
+    # preds: BBB13
+    goto BB0
+    # -> BBB1
+
+BBB23:
+    # preds: BBB14
+    goto BB0
+    # -> BBB1
+
+BBB24:
+    # preds: BBB17
+    goto BB0
+    # -> BBB1
+
+BBB25:
+    # preds: BBB18
+    goto BB0
+    # -> BBB1
+
+BBB26:
+    # preds: BBB19
+    goto BB0
+    # -> BBB1
+
+BBB27:
+    # preds: BBB20
+    goto BB0
+    # -> BBB1
+

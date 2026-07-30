@@ -1,0 +1,22 @@
+public open class BranchMaze {
+    companion object {
+        public fun classify(p0: Int, p1: Int, p2: Int): Int {
+            var result: Int
+            if (p0 > 0 && (p1 < 0 || p2 == 0)) {
+                result = 1
+            } else {
+                result = 2
+                if (p0 != 0 && (p1 <= 0 || p2 <= 0)) {
+                    result = 3
+                }
+            }
+            if (result != 2) {
+                return result
+            }
+            if (p2 >= 0 && p0 >= p1) {
+                return result
+            }
+            return result + 10
+        }
+    }
+}

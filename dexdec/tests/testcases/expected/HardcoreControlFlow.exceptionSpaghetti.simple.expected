@@ -1,0 +1,231 @@
+.method exceptionSpaghetti
+.registers 4
+.ins 3
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/ArithmeticException; {BB4..BB5} -> BB27
+# .catch Ljava/lang/Throwable; {BB4..BB5} -> BB25
+# .catch Ljava/lang/Throwable; {BB29..BB30} -> BB30
+# .catch Ljava/lang/IllegalArgumentException; {BB34..BB41} -> BB52
+# .catch Ljava/lang/ArithmeticException; {BB34..BB41} -> BB48
+# .catch Ljava/lang/Throwable; {BB34..BB41} -> BB41
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    if v2 <= 0 goto BB35  # 0002:
+    # -> BBB14, BBB1
+
+BBB1:
+    # preds: BBB0
+    v2 = v2 / v3  # 0004:
+    # -> BBB2, BBB9, BBB8
+    # throws -> BB27, BB25
+
+BBB2:
+    # preds: BBB1
+    if v2 <= 10 goto BB17  # 0007:
+    # -> BBB6, BBB3
+
+BBB3:
+    # preds: BBB2
+    v3 = v2 + 100  # 0009:
+    if v3 <= 0 goto BB16  # 000b:
+    # -> BBB5, BBB4
+
+BBB4:
+    # preds: BBB3
+    v3 = v3 * 2  # 000d:
+    return v3  # 000f:
+
+BBB5:
+    # preds: BBB3
+    return v2  # 0010:
+
+BBB6:
+    # preds: BBB2
+    v2 = v2 + 100  # 0011:
+    nop  # 0013:
+    if v2 <= 0 goto BB58  # 0014:
+    # -> BBB24, BBB25
+
+BBB7:
+    # preds: BBB25, BBB39
+    v2 = v2 * 2  # 0016:
+    return v2  # 0018:
+
+BBB8:
+    # preds: BBB1
+    move-exception v2  # 0019:
+    goto BB32  # 001a:
+    # -> BBB12
+
+BBB9:
+    # preds: BBB1
+    move-exception v2  # 001b:
+    nop  # 001c:
+    # -> BBB10
+
+BBB10:
+    # preds: BBB9
+    throw v2  # 001d:
+    # -> BBB11
+    # throws -> BB30
+
+BBB11:
+    # preds: BBB10
+    move-exception v2  # 001e:
+    const v0 = -1  # 001f:
+    # -> BBB12
+
+BBB12:
+    # preds: BBB8, BBB11
+    v0 = v0 + 100  # 0020:
+    # -> BBB13
+
+BBB13:
+    # preds: BBB12
+    throw v2  # 0022:
+    # -> BBB26, BBB27, BBB28
+    # throws -> BB52, BB48, BB41
+
+BBB14:
+    # preds: BBB0
+    nop
+    # -> BBB15, BBB29, BBB30, BBB31
+    # throws -> BB52, BB48, BB41
+
+BBB15:
+    # preds: BBB14
+    v2 = new Ljava/lang/IllegalArgumentException;()  # 0025:
+    # -> BBB16, BBB32, BBB33, BBB34
+    # throws -> BB52, BB48, BB41
+
+BBB16:
+    # preds: BBB15
+    throw v2  # 0028:
+    # -> BBB35, BBB36, BBB37
+    # throws -> BB52, BB48, BB41
+
+BBB17:
+    # preds: BBB28, BBB31, BBB34, BBB37
+    move-exception v2  # 0029:
+    if v0 <= 0 goto BB47  # 002a:
+    # -> BBB19, BBB18
+
+BBB18:
+    # preds: BBB17
+    v0 = v0 * 2  # 002c:
+    return v0  # 002e:
+
+BBB19:
+    # preds: BBB17
+    throw v2  # 002f:
+
+BBB20:
+    # preds: BBB27, BBB30, BBB33, BBB36
+    move-exception v2  # 0030:
+    nop  # 0031:
+    const v2 = -2  # 0032:
+    goto BB58  # 0033:
+    # -> BBB23
+
+BBB21:
+    # preds: BBB26, BBB29, BBB32, BBB35
+    move-exception v2  # 0034:
+    v2 = v0 + -100  # 0035:
+    if v2 <= 0 goto BB58  # 0037:
+    # -> BBB38, BBB39
+
+BBB23:
+    # preds: BBB20, BBB24, BBB38
+    return v2  # 003a:
+
+BBB24:
+    # preds: BBB6
+    goto BB0
+    # -> BBB23
+
+BBB25:
+    # preds: BBB6
+    goto BB0
+    # -> BBB7
+
+BBB26:
+    # preds: BBB13
+    goto BB0
+    # -> BBB21
+
+BBB27:
+    # preds: BBB13
+    goto BB0
+    # -> BBB20
+
+BBB28:
+    # preds: BBB13
+    goto BB0
+    # -> BBB17
+
+BBB29:
+    # preds: BBB14
+    goto BB0
+    # -> BBB21
+    # throws -> BB30
+
+BBB30:
+    # preds: BBB14
+    goto BB0
+    # -> BBB20
+
+BBB31:
+    # preds: BBB14
+    goto BB0
+    # -> BBB17
+
+BBB32:
+    # preds: BBB15
+    goto BB0
+    # -> BBB21
+
+BBB33:
+    # preds: BBB15
+    goto BB0
+    # -> BBB20
+
+BBB34:
+    # preds: BBB15
+    goto BB0
+    # -> BBB17
+    # throws -> BB52, BB48, BB41
+
+BBB35:
+    # preds: BBB16
+    goto BB0
+    # -> BBB21
+    # throws -> BB52, BB48, BB41
+
+BBB36:
+    # preds: BBB16
+    goto BB0
+    # -> BBB20
+    # throws -> BB52, BB48, BB41
+
+BBB37:
+    # preds: BBB16
+    goto BB0
+    # -> BBB17
+    # throws -> BB52, BB48, BB41
+
+BBB38:
+    # preds: BBB21
+    goto BB0
+    # -> BBB23
+    # throws -> BB52, BB48, BB41
+
+BBB39:
+    # preds: BBB21
+    goto BB0
+    # -> BBB7
+    # throws -> BB52, BB48, BB41
+

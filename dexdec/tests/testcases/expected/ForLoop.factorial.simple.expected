@@ -1,0 +1,27 @@
+.method factorial
+.registers 3
+.ins 1
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 1  # 0001:
+    const v1 = 1  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB2
+    if v0 > v2 goto BB10  # 0003:
+    # -> BBB3, BBB2
+
+BBB2:
+    # preds: BBB1
+    v1 = v1 * v0  # 0005:
+    v0 = v0 + 1  # 0007:
+    goto BB3  # 0009:
+    # -> BBB1
+
+BBB3:
+    # preds: BBB1
+    return v1  # 000a:
+

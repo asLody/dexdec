@@ -1,0 +1,32 @@
+.method checkAnd
+.registers 2
+.ins 2
+.entry BBB0
+
+BBB0:  # entry
+    if v0 <= 0 goto BB6
+    # -> BBB4, BBB1
+
+BBB1:
+    # preds: BBB0
+    if v1 <= 0 goto BB6  # 0002:
+    # -> BBB5, BBB2
+
+BBB2:
+    # preds: BBB1
+    return 1  # 0005:
+
+BBB3:
+    # preds: BBB4, BBB5
+    return 0  # 0007:
+
+BBB4:
+    # preds: BBB0
+    goto BB0
+    # -> BBB3
+
+BBB5:
+    # preds: BBB1
+    goto BB0
+    # -> BBB3
+

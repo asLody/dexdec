@@ -1,0 +1,107 @@
+public open class Throw {
+    public open fun one() {
+        System.`out`!!.println("Throw.one")
+        try {
+            this.throwNullPointerException()
+            Main.assertTrue(false)
+        } catch (exception: Exception) {
+            return
+        }
+        Main.assertTrue(false)
+    }
+
+    public open fun rethrow() {
+        System.`out`!!.println("Throw.rethrow")
+        var flag: Boolean = false
+        var flag2: Boolean = false
+        try {
+            try {
+                flag2 = true
+                this.throwNullPointerException()
+                Main.assertTrue(false)
+                flag2 = false
+            } catch (exception2: Exception) {
+                if (exception2 is ArithmeticException) {
+                    flag2 = true
+                    Main.assertTrue(false)
+                }
+                if (exception2 is NullPointerException) {
+                    flag = true
+                    flag2 = true
+                    throw exception2
+                }
+                flag2 = false
+            }
+        } catch (exception: Throwable) {
+            try {
+                throw exception
+            } catch (exception3: Exception) {
+            }
+        }
+        Main.assertTrue(flag)
+        Main.assertTrue(true)
+        Main.assertTrue(flag2)
+    }
+
+    public open fun throwArithmeticException() {
+        throw ArithmeticException()
+    }
+
+    public open fun throwNullPointerException() {
+        throw NullPointerException("npe!")
+    }
+
+    public open fun twoA() {
+        System.`out`!!.println("Throw.twoA")
+        var flag: Boolean = false
+        val v17: Int = 0
+        var flag2: Boolean = false
+        val flag3: Boolean = false
+        var v13: Int
+        try {
+            flag2 = true
+            this.throwArithmeticException()
+            v13 = 0
+        } catch (exception2: ArithmeticException) {
+            v13 = 0
+            flag = true
+        } catch (exception: NullPointerException) {
+            v13 = 0
+        }
+        Main.assertTrue(flag)
+        Main.assertTrue((v13.xor(1)) != 0)
+        Main.assertTrue((1.xor(v17)) != 0)
+    }
+
+    public open fun twoN() {
+        System.`out`!!.println("Throw.twoN")
+        var v5: Int = 0
+        val v17: Int = 0
+        var flag2: Boolean = false
+        val flag3: Boolean = false
+        var flag: Boolean
+        try {
+            flag2 = true
+            this.throwNullPointerException()
+            flag = false
+        } catch (exception2: ArithmeticException) {
+            flag = false
+            v5 = 1
+        } catch (exception: NullPointerException) {
+            flag = false
+        }
+        Main.assertTrue((v5.xor(1)) != 0)
+        Main.assertTrue(flag)
+        Main.assertTrue((1.xor(v17)) != 0)
+    }
+
+    companion object {
+        public fun run() {
+            val throwValue: Throw = Throw()
+            throwValue.one()
+            throwValue.twoA()
+            throwValue.twoN()
+            throwValue.rethrow()
+        }
+    }
+}

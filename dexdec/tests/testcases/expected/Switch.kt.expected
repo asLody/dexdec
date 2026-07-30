@@ -1,0 +1,32 @@
+public open class Switch {
+    companion object {
+        public fun dayName(p0: Int): String {
+            when (p0) {
+                1 -> {
+                    return "Monday"
+                }
+                2 -> {
+                    return "Tuesday"
+                }
+                3 -> {
+                    return "Wednesday"
+                }
+                4 -> {
+                    return "Thursday"
+                }
+                5 -> {
+                    return "Friday"
+                }
+                6 -> {
+                    return "Saturday"
+                }
+                7 -> {
+                    return "Sunday"
+                }
+                else -> {
+                    return "Invalid"
+                }
+            }
+        }
+    }
+}

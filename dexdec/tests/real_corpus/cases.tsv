@@ -1,0 +1,9 @@
+# case_id	artifact_id	source_kind	source	packaging	repo	android_api	target_class	output_path
+gson_object_type_adapter	gson-2.10.1	maven	com.google.code.gson:gson:2.10.1	auto	-	-	Lcom/google/gson/internal/bind/ObjectTypeAdapter;	gson-2.10.1/ObjectTypeAdapter.java
+gson_linked_tree_map	gson-2.10.1	maven	com.google.code.gson:gson:2.10.1	auto	-	-	Lcom/google/gson/internal/LinkedTreeMap;	gson-2.10.1/LinkedTreeMap.java
+androidx_tracing_trace	androidx-tracing-1.2.0	maven	androidx.tracing:tracing:1.2.0	aar	https://dl.google.com/dl/android/maven2	35	Landroidx/tracing/Trace;	androidx-tracing-1.2.0/Trace.java
+commons_lang3_string_utils	commons-lang3-3.14.0	maven	org.apache.commons:commons-lang3:3.14.0	jar	-	35	Lorg/apache/commons/lang3/StringUtils;	commons-lang3-3.14.0/StringUtils.java
+commons_codec_base64	commons-codec-1.16.0	maven	commons-codec:commons-codec:1.16.0	jar	-	35	Lorg/apache/commons/codec/binary/Base64;	commons-codec-1.16.0/Base64.java
+jackson_core_json_factory	jackson-core-2.16.1	maven	com.fasterxml.jackson.core:jackson-core:2.16.1	jar	-	35	Lcom/fasterxml/jackson/core/JsonFactory;	jackson-core-2.16.1/JsonFactory.java
+jsoup_jsoup	jsoup-1.17.2	maven	org.jsoup:jsoup:1.17.2	jar	-	35	Lorg/jsoup/Jsoup;	jsoup-1.17.2/Jsoup.java
+zxing_qrcode_reader	zxing-core-3.5.2	maven	com.google.zxing:core:3.5.2	jar	-	35	Lcom/google/zxing/qrcode/QRCodeReader;	zxing-core-3.5.2/QRCodeReader.java

@@ -1,0 +1,21 @@
+[package]
+name = "dexdec-workbench"
+version.workspace = true
+description = "Shared project and analysis workspace for DexDec clients"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[dependencies]
+abxml = { version = "0.8.2", default-features = false }
+apk-info-axml = "1.0.11"
+base64 = "0.22"
+dexdec = { path = "../dexdec", default-features = false }
+quick-xml = "0.41"
+regex = "1"
+roxmltree = "0.20"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

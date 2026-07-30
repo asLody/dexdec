@@ -1,0 +1,22 @@
+[workspace]
+members = ["dexdec", "dexdec-workbench", "dexdec-mcp", "dexdec-gui/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+
+[profile.fast]
+inherits = "release"
+opt-level = 1
+incremental = true
+codegen-units = 256
+
+# Desktop development runs real decompilation workloads. Optimize the complete
+# dependency graph so DEX parsing and metadata decoding do not remain at O0.
+[profile.dev]
+opt-level = 1
+incremental = true
+codegen-units = 256

@@ -1,0 +1,16 @@
+public open class MultiCatch {
+    companion object {
+        public fun process(p0: Int, p1: Int): Int {
+            try {
+                if (p0 < 0) {
+                    throw IllegalArgumentException("negative a")
+                }
+                return p0 / p1
+            } catch (exception2: IllegalArgumentException) {
+                return -1
+            } catch (exception: ArithmeticException) {
+                return -2
+            }
+        }
+    }
+}

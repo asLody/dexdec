@@ -1,0 +1,125 @@
+.method deepNesting
+.registers 6
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/ArithmeticException; {BB9..BB14} -> BB18
+# .catch Ljava/lang/Throwable; {BB9..BB14} -> BB16
+# .catch Ljava/lang/Throwable; {BB21..BB26} -> BB16
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB19
+    v2 = v5.length  # 0003:
+    if v0 >= v2 goto BB27  # 0004:
+    # -> BBB13, BBB2
+
+BBB2:
+    # preds: BBB1
+    v2 = LSynchronizedAdvanced;->lock1:Ljava/lang/Object;  # 0006:
+    monitor-enter v2  # 0008:
+    # -> BBB3
+
+BBB3:
+    # preds: BBB2
+    v3 = v5[v0]  # 0009:
+    # -> BBB4, BBB14, BBB15
+    # throws -> BB18, BB16
+
+BBB4:
+    # preds: BBB3
+    v4 = 10 / v3  # 000d:
+    # -> BBB5, BBB16, BBB17
+    # throws -> BB18, BB16
+
+BBB5:
+    # preds: BBB4
+    v1 = v1 + v4  # 000e:
+    goto BB21  # 000f:
+    # -> BBB8
+
+BBB6:
+    # preds: BBB15, BBB17, BBB18, BBB20, BBB21
+    move-exception v5  # 0010:
+    goto BB25  # 0011:
+    # -> BBB11
+
+BBB7:
+    # preds: BBB14, BBB16
+    move-exception v3  # 0012:
+    v1 = v1 + -1  # 0013:
+    # -> BBB8
+
+BBB8:
+    # preds: BBB5, BBB7
+    monitor-exit v2  # 0015:
+    # -> BBB9, BBB18
+    # throws -> BB16
+
+BBB9:
+    # preds: BBB8
+    v0 = v0 + 1  # 0016:
+    # -> BBB19, BBB20
+    # throws -> BB16
+
+BBB11:
+    # preds: BBB6
+    monitor-exit v2  # 0019:
+    # -> BBB12, BBB21
+    # throws -> BB16
+
+BBB12:
+    # preds: BBB11
+    throw v5  # 001a:
+
+BBB13:
+    # preds: BBB1
+    return v1  # 001b:
+
+BBB14:
+    # preds: BBB3
+    goto BB0
+    # -> BBB7
+
+BBB15:
+    # preds: BBB3
+    goto BB0
+    # -> BBB6
+
+BBB16:
+    # preds: BBB4
+    goto BB0
+    # -> BBB7
+
+BBB17:
+    # preds: BBB4
+    goto BB0
+    # -> BBB6
+
+BBB18:
+    # preds: BBB8
+    goto BB0
+    # -> BBB6
+
+BBB19:
+    # preds: BBB9
+    goto BB0
+    # -> BBB1
+
+BBB20:
+    # preds: BBB9
+    goto BB0
+    # -> BBB6
+
+BBB21:
+    # preds: BBB11
+    goto BB0
+    # -> BBB6
+    # throws -> BB16
+

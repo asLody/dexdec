@@ -1,0 +1,46 @@
+.method matrixSum
+.registers 7
+.ins 2
+.entry BBB0
+
+BBB0:  # entry
+    nop
+    const v0 = 0  # 0001:
+    const v1 = 0  # 0002:
+    const v2 = 0  # 0003:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB5
+    if v1 >= v5 goto BB19  # 0004:
+    # -> BBB6, BBB2
+
+BBB2:
+    # preds: BBB1
+    const v3 = 0  # 0006:
+    # -> BBB3
+
+BBB3:
+    # preds: BBB2, BBB4
+    if v3 >= v6 goto BB16  # 0007:
+    # -> BBB5, BBB4
+
+BBB4:
+    # preds: BBB3
+    v4 = v1 * v6  # 0009:
+    v2 = v2 + v4  # 000b:
+    v2 = v2 + v3  # 000c:
+    v3 = v3 + 1  # 000d:
+    goto BB7  # 000f:
+    # -> BBB3
+
+BBB5:
+    # preds: BBB3
+    v1 = v1 + 1  # 0010:
+    goto BB4  # 0012:
+    # -> BBB1
+
+BBB6:
+    # preds: BBB1
+    return v2  # 0013:
+

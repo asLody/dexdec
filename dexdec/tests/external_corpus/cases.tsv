@@ -1,0 +1,5 @@
+# id	upstream_url	source_roots	target_class	focus
+aosp_art_003_throw	https://android.googlesource.com/platform/art/+/android-6.0.0_r5/test/003-omnibus-opcodes/src/	refer/art/test/003-omnibus-opcodes/src	LThrow;	nested catch, rethrow, finally, exception dispatch
+aosp_art_047_returns	https://android.googlesource.com/platform/art/+/android-6.0.0_r5/test/047-returns/src/	refer/art/test/047-returns/src	LMain;	multiple return types, interfaces, object construction
+aosp_art_050_sync	https://android.googlesource.com/platform/art/+/android-6.0.0_r5/test/050-sync-test/src/	refer/art/test/050-sync-test/src	LMain;	synchronized blocks, wait/join, interrupted exception paths
+

@@ -1,0 +1,109 @@
+public open class ExceptionControlFlow {
+    companion object {
+        public fun finallySideEffect(values: IntArray?): Int {
+            try {
+                values!![0] = 1
+                return values[0]
+            } finally {
+                values!![0] = values!![0] + 1
+            }
+        }
+
+        public fun nestedTry(p0: Int): Int {
+            if (p0 >= 0) {
+                return 1
+            }
+            try {
+                throw IllegalArgumentException()
+            } catch (exception2: IllegalArgumentException) {
+                return 2
+            } catch (exception: RuntimeException) {
+                return 3
+            }
+        }
+
+        public fun nestedTryFinally(p0: Int): Int {
+            var result: Int = 0
+            if (p0 >= 0) {
+                result = 11
+                return result
+            }
+            try {
+                result = 2
+                throw IllegalArgumentException()
+            } catch (exception: Throwable) {
+                try {
+                    throw exception
+                } catch (exception2: RuntimeException) {
+                    return result
+                }
+            }
+        }
+
+        public fun tryCatchFinally(p0: Int, p1: Int): Int {
+            try {
+                if (p1 == 0) {
+                    throw ArithmeticException()
+                }
+                return p0 / p1
+            } catch (exception2: ArithmeticException) {
+                return -1
+            } catch (exception: Throwable) {
+                throw exception
+            }
+        }
+
+        public fun tryCatchFinallyWithContinue(values: IntArray?): Int {
+            var index: Int = 0
+            var total: Int = 0
+            while (index < values!!.size) {
+                var condition: Boolean = false
+                var v12: Int = 0
+                try {
+                    if (values[index] != 0) {
+                        v12 = 100 / values[index]
+                    } else {
+                        total += 2
+                        index++
+                        condition = true
+                    }
+                } catch (exception2: ArithmeticException) {
+                    total = total - 1 + 2
+                    index++
+                    condition = true
+                } catch (exception: Throwable) {
+                    throw exception
+                }
+                if (!condition) {
+                    val step: Int = total + v12
+                    if (step > 50) {
+                        return step
+                    }
+                    total = step + 2
+                    index++
+                }
+            }
+            return total
+        }
+
+        public fun tryInLoop(values: IntArray?): Int {
+            var index: Int = 0
+            var total: Int = 0
+            while (index < values!!.size) {
+                try {
+                    var v2: Int = 0
+                    if (values[index] != 0) {
+                        total += 10 / values[index]
+                    } else {
+                        index = v2
+                    }
+                    v2 = index + 1
+                    index = v2
+                } catch (exception: ArithmeticException) {
+                    return total
+                }
+            }
+            return total
+        }
+    }
+}

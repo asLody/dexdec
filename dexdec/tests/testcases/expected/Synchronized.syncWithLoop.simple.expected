@@ -1,0 +1,122 @@
+.method syncWithLoop
+.registers 5
+.ins 1
+.entry BBB0
+
+# Exception handlers:
+# .catch Ljava/lang/Throwable; {BB6..BB21} -> BB19
+
+BBB0:  # entry
+    nop
+    v0 = LSynchronized;->lock:Ljava/lang/Object;  # 0001:
+    monitor-enter v0  # 0003:
+    const v1 = 0  # 0004:
+    const v2 = 0  # 0005:
+    # -> BBB1
+
+BBB1:
+    # preds: BBB0, BBB15
+    v3 = v4.length  # 0006:
+    # -> BBB2, BBB12
+    # throws -> BB19
+
+BBB2:
+    # preds: BBB1
+    if v1 >= v3 goto BB15  # 0007:
+    # -> BBB7, BBB3
+    # throws -> BB19
+
+BBB3:
+    # preds: BBB2
+    v3 = v4[v1]  # 0009:
+    # -> BBB4, BBB13
+    # throws -> BB19
+
+BBB4:
+    # preds: BBB3
+    v2 = v2 + v3  # 000b:
+    # -> BBB5, BBB14
+    # throws -> BB19
+
+BBB5:
+    # preds: BBB4
+    v1 = v1 + 1  # 000c:
+    # -> BBB15, BBB16
+    # throws -> BB19
+
+BBB7:
+    # preds: BBB2
+    LSynchronized;->counter:I = v2  # 000f:
+    # -> BBB8, BBB17
+    # throws -> BB19
+
+BBB8:
+    # preds: BBB7
+    monitor-exit v0  # 0011:
+    # -> BBB9, BBB18
+    # throws -> BB19
+
+BBB9:
+    # preds: BBB8
+    return v2  # 0012:
+    # throws -> BB19
+
+BBB10:
+    # preds: BBB12, BBB13, BBB14, BBB16, BBB17, BBB18, BBB19
+    move-exception v4  # 0013:
+    monitor-exit v0  # 0014:
+    # -> BBB11, BBB19
+    # throws -> BB19
+
+BBB11:
+    # preds: BBB10
+    throw v4  # 0016:
+
+BBB12:
+    # preds: BBB1
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB13:
+    # preds: BBB3
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB14:
+    # preds: BBB4
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB15:
+    # preds: BBB5
+    goto BB0
+    # -> BBB1
+    # throws -> BB19
+
+BBB16:
+    # preds: BBB5
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB17:
+    # preds: BBB7
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB18:
+    # preds: BBB8
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
+BBB19:
+    # preds: BBB10
+    goto BB0
+    # -> BBB10
+    # throws -> BB19
+
