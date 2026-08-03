@@ -5,7 +5,6 @@ public open class ExceptionControlFlowAdvanced {
             var count: Int = 0
             while (index < values!!.size) {
                 try {
-                    var v2: Int = 0
                     if (values[index] != 0) {
                         if (values[index] < 0) {
                             count++
@@ -14,10 +13,8 @@ public open class ExceptionControlFlowAdvanced {
                         count = count + values[index] + 1
                     } else {
                         count++
-                        index = v2
                     }
-                    v2 = index + 1
-                    index = v2
+                    index++
                 } catch (exception: Throwable) {
                     throw exception
                 }

@@ -91,7 +91,6 @@ public open class HardcoreControlFlow {
         var index: Int = 0
         var total: Int = 0
         while (index < valueses.size) {
-            var v3: Int = 0
             if (valueses[index] !== null) {
                 var index2: Int = 0
                 var condition: Boolean = false
@@ -112,7 +111,6 @@ public open class HardcoreControlFlow {
                     while (step < element) {
                         if (step * index2 > 1000) {
                             total += step
-                            index = v3
                             condition = true
                             break
                         }
@@ -126,8 +124,7 @@ public open class HardcoreControlFlow {
                     continue
                 }
             }
-            v3 = index + 1
-            index = v3
+            index++
         }
         return total
     }
@@ -138,7 +135,6 @@ public open class HardcoreControlFlow {
         var selector: Int = 0
         while (index < values.size) {
             val step: Int = values[index]
-            var v3: Int = 0
             when (selector) {
                 0 -> {
                     if (step > 0) {
@@ -150,7 +146,6 @@ public open class HardcoreControlFlow {
                         return total
                     }
                     selector = 2
-                    index = v3
                 }
                 1 -> {
                     if (step != 0) {
@@ -168,8 +163,7 @@ public open class HardcoreControlFlow {
                     return -1
                 }
             }
-            v3 = index + 1
-            index = v3
+            index++
         }
         return total
     }

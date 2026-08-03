@@ -17,17 +17,14 @@ public open class SynchronizedAdvanced {
             var index: Int = 0
             var remaining: Int = 0
             while (index < values!!.size) {
-                var v2: Int = 0
                 synchronized(SynchronizedAdvanced.lock1!!) {
                     try {
                         remaining += 10 / values[index]
                     } catch (exception: ArithmeticException) {
                         remaining--
                     }
-                    index = v2
                 }
-                v2 = index + 1
-                index = v2
+                index++
             }
             return remaining
         }
