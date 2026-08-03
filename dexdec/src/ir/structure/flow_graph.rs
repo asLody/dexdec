@@ -348,6 +348,7 @@ impl SemanticFlowGraph {
         mut self,
         semantic: &SemanticFactory<'_>,
     ) -> Result<(SemanticNode, u32), StructureError> {
+        let mut pattern_budget = PatternReductionBudget::for_nodes(self.nodes.len());
         loop {
             self.prune();
             FragmentNormalizer::apply(&mut self)?;
@@ -359,7 +360,10 @@ impl SemanticFlowGraph {
                 .find(|component| self.is_cyclic(component))
             else {
                 if semantic.is_switch_region(self.region) {
-                    while let Some(switch) = SwitchRegion::analyze(&self)? {
+                    while pattern_budget.take() {
+                        let Some(switch) = SwitchRegion::analyze(&self)? else {
+                            break;
+                        };
                         self.collapse_switch(switch, semantic)?;
                         self.prune();
                         self.verify_lexical_domains()?;
@@ -368,7 +372,10 @@ impl SemanticFlowGraph {
                 if let Some(body) = self.structure_acyclic(semantic)? {
                     return Ok((body, self.next_id));
                 }
-                while let Some(branch) = BranchRegion::analyze(&self)? {
+                while pattern_budget.take() {
+                    let Some(branch) = BranchRegion::analyze(&self)? else {
+                        break;
+                    };
                     self.collapse_branch(branch, semantic)?;
                     self.prune();
                     self.verify_lexical_domains()?;
@@ -1982,6 +1989,30 @@ impl SwitchRegion {
 /// opcode or source-language shape.
 struct NodeSplittingBudget {
     limit: usize,
+}
+
+/// Bounds repeated whole-graph pattern searches before the equivalent lexical
+/// label fallback is used. Branch-arm discovery can be quadratic in graph size;
+/// without a shared budget, a single generated coroutine can stall an archive
+/// batch for minutes even though label lowering can finish it directly.
+struct PatternReductionBudget {
+    remaining: usize,
+}
+
+impl PatternReductionBudget {
+    fn for_nodes(nodes: usize) -> Self {
+        const WORK_BUDGET: usize = 1_000_000;
+        let nodes = nodes.max(1);
+        Self {
+            remaining: (WORK_BUDGET / nodes / nodes).clamp(4, 64),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let available = self.remaining > 0;
+        self.remaining = self.remaining.saturating_sub(1);
+        available
+    }
 }
 
 impl NodeSplittingBudget {
