@@ -15,22 +15,30 @@ pub enum JavaPrimitiveType {
 pub struct JavaIdentifier(String);
 
 impl JavaIdentifier {
+    const MAX_BYTES: usize = 200;
+
     pub fn from_dex(value: &str) -> Self {
         if Self::is_source_identifier(value)
             && !Self::is_reserved(value)
             && !value.starts_with("$dex$")
         {
-            return Self(value.to_string());
+            return Self(Self::bounded(value.to_string(), value));
         }
         let mut encoded = String::from("$dex$");
         if value.is_empty() {
             encoded.push_str("empty");
         } else {
             for character in value.chars() {
-                encoded.push_str(&format!("{:X}_", character as u32));
+                if character == '$' {
+                    encoded.push_str("$$");
+                } else if character == '_' || character.is_alphanumeric() {
+                    encoded.push(character);
+                } else {
+                    encoded.push_str(&format!("$u{:X}$", character as u32));
+                }
             }
         }
-        Self(encoded)
+        Self(Self::bounded(encoded, value))
     }
 
     pub fn from_hint(value: &str) -> Self {
@@ -45,6 +53,28 @@ impl JavaIdentifier {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn bounded(candidate: String, original: &str) -> String {
+        if candidate.len() <= Self::MAX_BYTES {
+            return candidate;
+        }
+        // FNV-1a keeps the on-disk spelling deterministic while making a
+        // collision between truncated identifiers negligibly likely.
+        let hash = original
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        let suffix = format!("${hash:016X}");
+        let marker = "$dex$long$";
+        let budget = Self::MAX_BYTES - marker.len() - suffix.len();
+        let mut end = budget.min(candidate.len());
+        while !candidate.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{marker}{}{suffix}", &candidate[..end])
     }
 
     fn is_reserved(value: &str) -> bool {
@@ -860,5 +890,34 @@ pub enum JavaStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JavaMethodBody {
     pub root: JavaStmt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JavaIdentifier;
+
+    #[test]
+    fn invalid_dex_identifiers_use_compact_reversible_escapes() {
+        assert_eq!(
+            JavaIdentifier::from_dex("measure-3").as_str(),
+            "$dex$measure$u2D$3"
+        );
+        assert_ne!(
+            JavaIdentifier::from_dex("measure-3"),
+            JavaIdentifier::from_dex("measure$u2D$3")
+        );
+    }
+
+    #[test]
+    fn long_dex_identifiers_are_bounded_and_distinct() {
+        let first = format!("{}-first", "LongName".repeat(40));
+        let second = format!("{}-second", "LongName".repeat(40));
+        let first = JavaIdentifier::from_dex(&first);
+        let second = JavaIdentifier::from_dex(&second);
+
+        assert!(first.as_str().len() <= JavaIdentifier::MAX_BYTES);
+        assert!(first.as_str().starts_with("$dex$long$"));
+        assert_ne!(first, second);
+    }
 }
 use crate::ir::Utf16String;
