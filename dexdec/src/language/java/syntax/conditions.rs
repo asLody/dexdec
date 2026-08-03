@@ -471,6 +471,14 @@ impl PathConditionDomain {
         }
     }
 
+    fn invalidate_after_statement(
+        &self,
+        known: &mut BooleanState,
+        statement: &crate::ir::SemanticStatement,
+    ) {
+        known.invalidate(statement.result().and_then(|result| result.code_var));
+    }
+
     fn variables_after(
         &self,
         mut known: BooleanState,
@@ -1118,8 +1126,10 @@ impl PathConditionReduction {
                     } => {
                         let site = test.condition.site;
                         let condition = test.condition.into_inner();
-                        let mut body_state = known.clone();
-                        self.domain.invalidate_after(&mut body_state, &test.setup);
+                        let mut header_state = known.clone();
+                        self.domain.invalidate_after(&mut header_state, &test.setup);
+                        self.domain.invalidate_after(&mut header_state, &body);
+                        let mut body_state = header_state.clone();
                         if kind == SemanticLoopKind::PreTested {
                             body_state =
                                 self.domain.assume_variables(&body_state, &condition, true);
@@ -1148,7 +1158,7 @@ impl PathConditionReduction {
                         tasks.push(ReductionTask::Visit {
                             node: *test.setup,
                             care,
-                            known,
+                            known: header_state,
                         });
                     }
                     SemanticNode::For {
@@ -1160,7 +1170,13 @@ impl PathConditionReduction {
                     } => {
                         let site = condition.site;
                         let condition = condition.into_inner();
-                        let body_state = self.domain.assume_variables(&known, &condition, true);
+                        let mut header_state = known.clone();
+                        self.domain.invalidate_after(&mut header_state, &body);
+                        self.domain
+                            .invalidate_after_statement(&mut header_state, &update);
+                        let body_state =
+                            self.domain
+                                .assume_variables(&header_state, &condition, true);
                         let fact = self.domain.simplify(condition, care);
                         self.changed |= fact.changed;
                         let body_care = self.domain.assume(care, fact.value, true);
@@ -1185,6 +1201,8 @@ impl PathConditionReduction {
                         iterable,
                         body,
                     } => {
+                        let mut body_state = known;
+                        self.domain.invalidate_after(&mut body_state, &body);
                         tasks.push(ReductionTask::Rebuild(ReductionFrame::ForEach {
                             control,
                             variable,
@@ -1193,7 +1211,7 @@ impl PathConditionReduction {
                         tasks.push(ReductionTask::Visit {
                             node: *body,
                             care,
-                            known,
+                            known: body_state,
                         });
                     }
                     SemanticNode::Switch {

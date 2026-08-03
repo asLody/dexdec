@@ -598,3 +598,21 @@ fn test_synchronized_loop_phi_copy_is_not_duplicated_at_region_exit() {
     assert!(!code.contains("int v2 = 0;"), "{code}");
     assert!(!code.contains("index = v2;"), "{code}");
 }
+
+#[test]
+fn test_java_state_machine_preserves_switch_state_resets() {
+    let (mut ctx, class_name) = load_testcase("HardcoreControlFlow");
+    ctx.load_all_classes().expect("test classes should load");
+
+    let code = ctx
+        .decompile_java_method_with_config(
+            &class_name,
+            "stateMachine",
+            Some("([I)I"),
+            &JavaDecompilerConfig::default(),
+        )
+        .expect("stateMachine should decompile")
+        .expect("stateMachine should be present");
+
+    assert_eq!(code.matches("selector = 0;").count(), 3, "{code}");
+}
