@@ -448,7 +448,8 @@ impl ConstructorBindings {
             | JavaExpr::Super
             | JavaExpr::Name(_)
             | JavaExpr::Literal(_)
-            | JavaExpr::ClassLiteral(_) => true,
+            | JavaExpr::ClassLiteral(_)
+            | JavaExpr::StaticField { .. } => true,
             JavaExpr::Cast { value, .. } => Self::stable(value),
             _ => false,
         }
@@ -1024,6 +1025,34 @@ mod tests {
                 target: JavaConstructorTarget::Super,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn static_field_bindings_inline_into_constructor_arguments() {
+        let binding = JavaIdentifier::from_dex("trueValue");
+        let value = JavaExpr::StaticField {
+            owner: JavaType::source_class("java.lang.Boolean"),
+            name: JavaIdentifier::from_dex("TRUE"),
+        };
+        let mut statements = vec![
+            JavaStmt::Variable {
+                ty: JavaType::source_class("java.lang.Boolean"),
+                name: binding.clone(),
+                value: Some(value.clone()),
+            },
+            JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::Super,
+                args: vec![JavaExpr::Name(binding.clone()), JavaExpr::Name(binding)],
+            },
+        ];
+
+        ConstructorSyntaxRecovery::schedule_arguments(&mut statements);
+
+        assert!(matches!(
+            statements.as_slice(),
+            [JavaStmt::ConstructorInvocation { args, .. }]
+                if args == &vec![value.clone(), value]
         ));
     }
 }
