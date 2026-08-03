@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::language::java::{
     JavaAssignOp, JavaAstRewriter, JavaBinaryOp, JavaConstructorTarget, JavaExpr, JavaIdentifier,
-    JavaLiteral, JavaMethodDeclarationKind, JavaStmt, JavaType, JavaTypeDeclaration, JavaUnaryOp,
+    JavaLiteral, JavaMethodDeclarationKind, JavaStmt, JavaType, JavaTypeDeclaration,
+    JavaTypeDeclarationKind, JavaUnaryOp,
 };
 
 /// Removes constructor syntax that Java inserts implicitly.
@@ -10,6 +11,7 @@ pub(super) struct ConstructorSyntaxRecovery;
 
 impl ConstructorSyntaxRecovery {
     pub(super) fn apply(declaration: &mut JavaTypeDeclaration) {
+        let is_enum = declaration.kind == JavaTypeDeclarationKind::Enum;
         let final_fields = declaration
             .fields
             .iter()
@@ -31,16 +33,28 @@ impl ConstructorSyntaxRecovery {
             let JavaStmt::Block(statements) = &mut body.root else {
                 continue;
             };
-            ConstructorCapturePrelude::schedule(
-                statements,
-                &constructor
-                    .parameters
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect(),
-                &final_fields,
-            );
+            let parameters = constructor
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<BTreeSet<_>>();
+            let guards = ConstructorParameterGuards::take(statements, &parameters);
+            ConstructorCapturePrelude::schedule(statements, &parameters, &final_fields);
             Self::schedule_arguments(statements);
+            ConstructorParameterGuards::restore(statements, guards);
+            if is_enum {
+                // Java enum constructors invoke java.lang.Enum implicitly and
+                // reject an explicit super(name, ordinal) invocation.
+                statements.retain(|statement| {
+                    !matches!(
+                        statement,
+                        JavaStmt::ConstructorInvocation {
+                            target: JavaConstructorTarget::Super,
+                            ..
+                        }
+                    )
+                });
+            }
             if matches!(
                 statements.first(),
                 Some(JavaStmt::ConstructorInvocation {
@@ -91,6 +105,67 @@ impl ConstructorSyntaxRecovery {
 
 struct ConstructorCapturePrelude;
 
+struct ConstructorParameterGuards;
+
+impl ConstructorParameterGuards {
+    fn take(
+        statements: &mut Vec<JavaStmt>,
+        parameters: &BTreeSet<JavaIdentifier>,
+    ) -> Vec<JavaStmt> {
+        let Some(invocation) = statements
+            .iter()
+            .position(|statement| matches!(statement, JavaStmt::ConstructorInvocation { .. }))
+        else {
+            return Vec::new();
+        };
+        let leading = statements[..invocation]
+            .iter()
+            .take_while(|statement| Self::is_parameter_guard(statement, parameters))
+            .count();
+        statements.drain(..leading).collect()
+    }
+
+    fn restore(statements: &mut Vec<JavaStmt>, guards: Vec<JavaStmt>) {
+        if guards.is_empty() {
+            return;
+        }
+        let Some(0) = statements
+            .iter()
+            .position(|statement| matches!(statement, JavaStmt::ConstructorInvocation { .. }))
+        else {
+            statements.splice(0..0, guards);
+            return;
+        };
+        statements.splice(1..1, guards);
+    }
+
+    fn is_parameter_guard(statement: &JavaStmt, parameters: &BTreeSet<JavaIdentifier>) -> bool {
+        let JavaStmt::Expression(JavaExpr::Call {
+            receiver: None,
+            owner: Some(JavaType::Class(owner)),
+            method,
+            args,
+            ..
+        }) = statement
+        else {
+            return false;
+        };
+        let is_intrinsics = owner
+            .name()
+            .components()
+            .last()
+            .is_some_and(|component| component.as_str() == "Intrinsics");
+        is_intrinsics
+            && matches!(
+                method.as_str(),
+                "checkNotNullParameter" | "checkParameterIsNotNull"
+            )
+            && args
+                .first()
+                .is_some_and(|value| ConstructorCapturePrelude::is_capture_value(value, parameters))
+    }
+}
+
 impl ConstructorCapturePrelude {
     fn schedule(
         statements: &mut Vec<JavaStmt>,
@@ -127,12 +202,18 @@ impl ConstructorCapturePrelude {
                 ..
             } if matches!(owner.as_ref(), JavaExpr::This)
                 && final_fields.contains(field)
-                && match value {
-                    JavaExpr::Name(parameter) => parameters.contains(parameter),
-                    JavaExpr::QualifiedThis(_) => true,
-                    _ => false,
-                }
+                && Self::is_capture_value(value, parameters)
         )
+    }
+
+    fn is_capture_value(value: &JavaExpr, parameters: &BTreeSet<JavaIdentifier>) -> bool {
+        match value {
+            JavaExpr::Name(parameter) => parameters.contains(parameter),
+            JavaExpr::QualifiedThis(_) => true,
+            JavaExpr::Literal(_) => true,
+            JavaExpr::Cast { value, .. } => Self::is_capture_value(value, parameters),
+            _ => false,
+        }
     }
 }
 
@@ -844,5 +925,105 @@ impl ExpressionNames {
             }
         }
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{ConstructorCapturePrelude, ConstructorParameterGuards, ConstructorSyntaxRecovery};
+    use crate::language::java::{
+        JavaAssignOp, JavaConstructorTarget, JavaExpr, JavaIdentifier, JavaStmt, JavaType,
+    };
+
+    #[test]
+    fn casted_capture_stores_move_after_the_super_invocation() {
+        let parameter = JavaIdentifier::from_dex("captured");
+        let field = JavaIdentifier::from_dex("field");
+        let constant_field = JavaIdentifier::from_dex("constantField");
+        let mut statements = vec![
+            JavaStmt::Assign {
+                target: JavaExpr::Field {
+                    owner: Box::new(JavaExpr::This),
+                    name: field.clone(),
+                },
+                op: JavaAssignOp::Assign,
+                value: JavaExpr::Cast {
+                    ty: JavaType::source_class("java.util.List"),
+                    value: Box::new(JavaExpr::Name(parameter.clone())),
+                },
+            },
+            JavaStmt::Assign {
+                target: JavaExpr::Field {
+                    owner: Box::new(JavaExpr::This),
+                    name: constant_field.clone(),
+                },
+                op: JavaAssignOp::Assign,
+                value: JavaExpr::Literal(crate::language::java::JavaLiteral::Integer(0)),
+            },
+            JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::Super,
+                args: vec![JavaExpr::Literal(
+                    crate::language::java::JavaLiteral::Integer(2),
+                )],
+            },
+        ];
+
+        ConstructorCapturePrelude::schedule(
+            &mut statements,
+            &BTreeSet::from([parameter]),
+            &BTreeSet::from([field, constant_field]),
+        );
+
+        assert!(matches!(
+            statements.first(),
+            Some(JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::Super,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kotlin_parameter_guards_move_after_the_super_invocation() {
+        let parameter = JavaIdentifier::from_dex("context");
+        let alias = JavaIdentifier::from_dex("checkedContext");
+        let mut statements = vec![
+            JavaStmt::Expression(JavaExpr::Call {
+                receiver: None,
+                owner: Some(JavaType::source_class("kotlin.jvm.internal.Intrinsics")),
+                type_arguments: Vec::new(),
+                method: JavaIdentifier::from_dex("checkNotNullParameter"),
+                args: vec![
+                    JavaExpr::Name(parameter.clone()),
+                    JavaExpr::Literal(crate::language::java::JavaLiteral::String(
+                        crate::ir::Utf16String::from("context"),
+                    )),
+                ],
+            }),
+            JavaStmt::Variable {
+                ty: JavaType::source_class("android.content.Context"),
+                name: alias.clone(),
+                value: Some(JavaExpr::Name(parameter.clone())),
+            },
+            JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::Super,
+                args: vec![JavaExpr::Name(alias)],
+            },
+        ];
+
+        let parameters = BTreeSet::from([parameter]);
+        let guards = ConstructorParameterGuards::take(&mut statements, &parameters);
+        ConstructorSyntaxRecovery::schedule_arguments(&mut statements);
+        ConstructorParameterGuards::restore(&mut statements, guards);
+
+        assert!(matches!(
+            statements.first(),
+            Some(JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::Super,
+                ..
+            })
+        ));
     }
 }
