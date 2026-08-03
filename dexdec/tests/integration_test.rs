@@ -6,6 +6,7 @@ mod common;
 
 use dexdec::api::DecompilerContext;
 use dexdec::ir::{ArgType, MemberReference, CFG};
+use dexdec::JavaDecompilerConfig;
 
 /// Helper to compile and load a test case
 fn load_testcase(name: &str) -> (DecompilerContext, String) {
@@ -575,4 +576,25 @@ fn test_lru_cache_sim() {
         Ok(None) => panic!("Analyzed trimToSize returned None"),
         Err(e) => panic!("Error decompiling trimToSize: {:?}", e),
     }
+}
+
+#[test]
+fn test_synchronized_loop_phi_copy_is_not_duplicated_at_region_exit() {
+    let (mut ctx, class_name) = load_testcase("SynchronizedAdvanced");
+    ctx.load_all_classes().expect("test classes should load");
+
+    let code = ctx
+        .decompile_java_method_with_config(
+            &class_name,
+            "deepNesting",
+            Some("([I)I"),
+            &JavaDecompilerConfig::default(),
+        )
+        .expect("deepNesting should decompile")
+        .expect("deepNesting should be present");
+
+    assert!(code.contains("while (index < values.length)"), "{code}");
+    assert!(code.contains("index++;"), "{code}");
+    assert!(!code.contains("int v2 = 0;"), "{code}");
+    assert!(!code.contains("index = v2;"), "{code}");
 }

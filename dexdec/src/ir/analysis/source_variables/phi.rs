@@ -1934,6 +1934,7 @@ pub(super) struct PhiLowering {
     handler_entries: BTreeMap<BlockId, Vec<SemanticStatement>>,
     handler_regions: BTreeMap<RegionId, BlockId>,
     handler_blocks: BTreeSet<BlockId>,
+    semantic_blocks: BTreeSet<BlockId>,
     statement_blocks: BTreeSet<BlockId>,
     placed_exceptional: BTreeSet<InstructionId>,
     seen: BTreeSet<BlockId>,
@@ -2063,6 +2064,7 @@ impl PhiLowering {
             handler_entries,
             handler_regions,
             handler_blocks,
+            semantic_blocks: BTreeSet::new(),
             statement_blocks: BTreeSet::new(),
             placed_exceptional: BTreeSet::new(),
             seen: BTreeSet::new(),
@@ -2075,6 +2077,7 @@ impl PhiLowering {
     }
 
     pub(super) fn apply(mut self, root: &mut SemanticNode) -> Result<(), SourceVariableError> {
+        self.semantic_blocks = SemanticBlocks::collect(root);
         self.statement_blocks = StatementBlocks::collect(root);
         let body = std::mem::replace(root, SemanticNode::Empty);
         *root = self.fold_node(body)?;
@@ -2300,16 +2303,19 @@ impl PhiLowering {
             .origin
             .and_then(|origin| {
                 self.seen.insert(origin);
-                let sites = leave
-                    .edge
-                    .into_iter()
-                    .flat_map(|edge| {
-                        [
-                            NormalCopySite::Edge(edge),
-                            NormalCopySite::Block(edge.target),
-                        ]
-                    })
-                    .chain(std::iter::once(NormalCopySite::Block(origin)));
+                let mut sites = Vec::with_capacity(3);
+                if let Some(edge) = leave.edge {
+                    sites.push(NormalCopySite::Edge(edge));
+                    // A surviving target block owns its block-local copies.
+                    // Lifting those copies onto this leave would execute them
+                    // once before the transfer and again when the target is
+                    // lowered. Only absorb target copies when structural
+                    // recovery removed the target's semantic identity.
+                    if !self.semantic_blocks.contains(&edge.target) {
+                        sites.push(NormalCopySite::Block(edge.target));
+                    }
+                }
+                sites.push(NormalCopySite::Block(origin));
                 self.normal.place_once_on_path(sites).map(|statements| {
                     SemanticNode::BasicBlock(SemanticBlock {
                         id: origin,

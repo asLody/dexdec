@@ -91,14 +91,10 @@ public open class ExceptionControlFlow {
             var total: Int = 0
             while (index < values!!.size) {
                 try {
-                    var v2: Int = 0
                     if (values[index] != 0) {
                         total += 10 / values[index]
-                    } else {
-                        index = v2
                     }
-                    v2 = index + 1
-                    index = v2
+                    index++
                 } catch (exception: ArithmeticException) {
                     return total
                 }
