@@ -3663,12 +3663,37 @@ impl HandlerDomains {
             .iter()
             .flat_map(|region| region.handlers.iter().map(|handler| handler.semantic_entry))
             .collect::<BTreeSet<_>>();
+        let mut handler_entry_owners = BTreeMap::<BlockId, BTreeSet<u32>>::new();
+        let mut bound_handler_entries = BTreeSet::new();
+        for region in regions {
+            for handler in &region.handlers {
+                handler_entry_owners
+                    .entry(handler.semantic_entry)
+                    .or_default()
+                    .insert(region.id);
+                if handler.exception_value.is_some() {
+                    bound_handler_entries.insert(handler.semantic_entry);
+                }
+            }
+        }
+        // DEX can share an exception-insensitive terminal body between handlers in
+        // different try ranges. Represent each clause as an empty catch that reaches
+        // the common continuation instead of giving one block two lexical owners.
+        let shared_handler_continuations = handler_entry_owners
+            .into_iter()
+            .filter_map(|(entry, owners)| {
+                (owners.len() > 1
+                    && !bound_handler_entries.contains(&entry)
+                    && cfg.normal_successors(entry).next().is_none())
+                .then_some(entry)
+            })
+            .collect::<BTreeSet<_>>();
         let physical_handler_entries = regions
             .iter()
             .flat_map(|region| &region.handlers)
             .flat_map(|handler| handler.entry_blocks.iter().copied())
             .collect::<BTreeSet<_>>();
-        let continuations = regions
+        let mut continuations = regions
             .iter()
             .flat_map(|region| {
                 region.handlers.iter().filter(|handler| {
@@ -3683,6 +3708,7 @@ impl HandlerDomains {
             })
             .map(|handler| handler.semantic_entry)
             .collect::<BTreeSet<_>>();
+        continuations.extend(shared_handler_continuations.iter().copied());
         let reachable = entries
             .iter()
             .copied()
@@ -3700,8 +3726,12 @@ impl HandlerDomains {
             .intersection(&ordinary)
             .copied()
             .collect::<BTreeSet<_>>();
+        let detached_continuations = ordinary_continuations
+            .union(&shared_handler_continuations)
+            .copied()
+            .collect::<BTreeSet<_>>();
         let descendants =
-            Self::handler_descendants(regions, &entries, &ordinary_continuations, &reachable);
+            Self::handler_descendants(regions, &entries, &detached_continuations, &reachable);
 
         regions
             .iter()
@@ -4211,6 +4241,78 @@ mod tests {
         );
         assert_eq!(regions[1].handlers[0].lexical_blocks, Vec::new());
         assert_eq!(regions[1].handlers[0].continuation, Some(BlockId::new(6)));
+    }
+
+    #[test]
+    fn repeated_exception_terminal_becomes_shared_continuation() {
+        let mut cfg = CFG::new("repeated_exception_terminal");
+        for block in 0..=6 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Exception);
+
+        let mut regions = vec![
+            try_region(
+                0,
+                1,
+                2,
+                &[1],
+                vec![catch_handler(5, &[5]), catch_handler(3, &[3, 4, 5, 6])],
+            ),
+            try_region(1, 3, 5, &[3, 4], vec![catch_handler(5, &[5])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert_eq!(regions[0].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[0].handlers[0].continuation, Some(BlockId::new(5)));
+        assert_eq!(
+            regions[0].handlers[1].lexical_blocks,
+            vec![BlockId::new(3), BlockId::new(4), BlockId::new(6)]
+        );
+        assert_eq!(regions[1].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[1].handlers[0].continuation, Some(BlockId::new(5)));
+    }
+
+    #[test]
+    fn repeated_nonterminal_handler_entry_remains_lexical() {
+        let mut cfg = CFG::new("repeated_nonterminal_handler_entry");
+        for block in 0..=6 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(5), BlockId::new(6), EdgeKind::Normal);
+
+        let mut regions = vec![
+            try_region(
+                0,
+                1,
+                2,
+                &[1],
+                vec![catch_handler(5, &[5, 6]), catch_handler(3, &[3, 4])],
+            ),
+            try_region(1, 3, 5, &[3, 4], vec![catch_handler(5, &[5, 6])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert!(regions[0].handlers[0]
+            .lexical_blocks
+            .contains(&BlockId::new(5)));
+        assert_ne!(regions[0].handlers[0].continuation, Some(BlockId::new(5)));
+        assert!(regions[1].handlers[0]
+            .lexical_blocks
+            .contains(&BlockId::new(5)));
+        assert_ne!(regions[1].handlers[0].continuation, Some(BlockId::new(5)));
     }
 
     #[test]
