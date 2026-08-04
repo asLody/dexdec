@@ -336,22 +336,72 @@ impl<'a> ValuePlanner<'a> {
         if blocking_keys.is_empty() {
             return Ok(());
         }
+        let ssa_identity = self.graph().identity() == ValueIdentity::Ssa;
+        let mut deferred_keys = BTreeSet::new();
+        for action in actions.iter() {
+            let Some(key) = Self::replacement_key(action) else {
+                continue;
+            };
+            let mut dependencies = self.replacement_dependencies(action)?;
+            dependencies.remove(&key);
+            if (!ssa_identity || self.facts.uses_of(key).len() > 1)
+                && !dependencies.is_disjoint(&blocking_keys)
+            {
+                deferred_keys.insert(key);
+            }
+        }
+        if ssa_identity {
+            // A canonical replacement may jump over register moves.  If an
+            // intermediate alias fans out, composing every replacement in one
+            // round would clone the effectful producer at those uses.
+            // Carry that boundary through the actual move chain, including
+            // aliases whose canonical replacement points straight at the
+            // producer.  Do not cross arithmetic or Phi definitions: those
+            // are distinct state transitions whose old/new ordering must stay
+            // available to the current schedule.
+            loop {
+                let discovered = actions
+                    .iter()
+                    .filter_map(Self::replacement_key)
+                    .filter(|key| !deferred_keys.contains(key))
+                    .filter(|key| {
+                        self.graph()
+                            .definitions
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|definition| self.register_move_source(definition))
+                            .any(|dependency| deferred_keys.contains(&dependency))
+                    })
+                    .collect::<BTreeSet<_>>();
+                if discovered.is_empty() {
+                    break;
+                }
+                deferred_keys.extend(discovered);
+            }
+        }
         let mut retained = Vec::with_capacity(actions.len());
         for action in std::mem::take(actions) {
             let Some(key) = Self::replacement_key(&action) else {
                 retained.push(action);
                 continue;
             };
-            let mut dependencies = self.replacement_dependencies(&action)?;
-            dependencies.remove(&key);
-            let duplicates_effects = self.graph().identity() == ValueIdentity::Source
-                || self.facts.uses_of(key).len() > 1;
-            if !duplicates_effects || dependencies.is_disjoint(&blocking_keys) {
+            if !deferred_keys.contains(&key) {
                 retained.push(action);
             }
         }
         *actions = retained;
         Ok(())
+    }
+
+    fn register_move_source(&self, definition: &DefinitionFact) -> Option<SsaVar> {
+        let operation = definition.operation()?;
+        let [SemanticExpression::Register(register)] = operation.operands() else {
+            return None;
+        };
+        (operation.insn_type == InsnType::Move)
+            .then(|| self.graph().key(register))
+            .flatten()
     }
 
     fn replacement_key(action: &ValueAction) -> Option<SsaVar> {
@@ -1803,5 +1853,124 @@ impl ValueAction {
             | Self::Remove { event, .. }
             | Self::DiscardResult { event, .. } => *event,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        analysis::SsaValueGraph, block::Block, ArgType, BlockId, InsnNode, InvokeType, RegisterArg,
+        SemanticBlock, SemanticNode, SemanticStatement, CFG,
+    };
+
+    fn register(value: SsaVar, ty: &ArgType) -> RegisterArg {
+        RegisterArg::new_ssa(value.reg_num, value.version, ty.clone())
+    }
+
+    fn argument(value: SsaVar, ty: &ArgType) -> InsnArg {
+        InsnArg::Reg(register(value, ty))
+    }
+
+    fn scheduled_replacements(name: &str, block: Block) -> BTreeSet<SsaVar> {
+        let mut cfg = CFG::new(name);
+        cfg.add_block(block);
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let statements = cfg
+            .block(BlockId::new(0))
+            .expect("entry block")
+            .insns
+            .iter()
+            .cloned()
+            .map(|instruction| SemanticStatement::instruction(instruction).expect("semantic op"))
+            .collect();
+        let mut root = SemanticNode::BasicBlock(SemanticBlock {
+            id: BlockId::new(0),
+            statements,
+        });
+        crate::ir::SemanticSiteNumbering::assign(&mut root).expect("semantic sites");
+
+        let graph = ValueFlowGraph::build(&root, &values, &BTreeMap::new()).expect("value graph");
+        graph
+            .schedule(RecoveryMode::Full)
+            .expect("value plan")
+            .actions
+            .iter()
+            .filter_map(ValuePlanner::replacement_key)
+            .collect()
+    }
+
+    #[test]
+    fn defers_transitive_alias_across_effectful_producer() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let first_alias = SsaVar::new(14, 0);
+        let second_alias = SsaVar::new(9, 0);
+
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        block.push(InsnNode::mov(
+            register(first_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+        block.push(InsnNode::aput(
+            InsnArg::lit(0, ArgType::object("java/lang/Object")),
+            argument(first_alias, &array_type),
+            InsnArg::lit(0, ArgType::INT),
+        ));
+        block.push(InsnNode::mov(
+            register(second_alias, &array_type),
+            argument(first_alias, &array_type),
+        ));
+        block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(second_alias, &array_type)],
+        ));
+
+        let scheduled = scheduled_replacements("allocation_alias_fork", block);
+
+        assert!(scheduled.contains(&allocation));
+        assert!(!scheduled.contains(&first_alias));
+        assert!(!scheduled.contains(&second_alias));
+    }
+
+    #[test]
+    fn keeps_linear_alias_chain_with_effectful_producer() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let first_alias = SsaVar::new(14, 0);
+        let second_alias = SsaVar::new(9, 0);
+
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        block.push(InsnNode::mov(
+            register(first_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+        block.push(InsnNode::mov(
+            register(second_alias, &array_type),
+            argument(first_alias, &array_type),
+        ));
+        block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(second_alias, &array_type)],
+        ));
+
+        let scheduled = scheduled_replacements("allocation_alias_chain", block);
+
+        assert!(scheduled.contains(&allocation));
+        assert!(scheduled.contains(&first_alias));
+        assert!(scheduled.contains(&second_alias));
     }
 }
