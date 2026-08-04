@@ -640,7 +640,10 @@ pub(super) struct PhiCopySet {
 struct NormalCopies {
     by_site: BTreeMap<NormalCopySite, Vec<SemanticStatement>>,
     canonical_site: BTreeMap<NormalCopySite, NormalCopySite>,
-    placed: BTreeSet<NormalCopySite>,
+    // Equivalent sites satisfy one structural coverage obligation, but each
+    // concrete CFG site that survives semantically must still execute copies.
+    placed_sites: BTreeSet<NormalCopySite>,
+    covered_classes: BTreeSet<NormalCopySite>,
 }
 
 impl NormalCopies {
@@ -651,7 +654,8 @@ impl NormalCopies {
         Self {
             by_site,
             canonical_site,
-            placed: BTreeSet::new(),
+            placed_sites: BTreeSet::new(),
+            covered_classes: BTreeSet::new(),
         }
     }
 
@@ -660,11 +664,15 @@ impl NormalCopies {
     }
 
     fn place_once(&mut self, site: NormalCopySite) -> Option<Vec<SemanticStatement>> {
-        let site = self.canonical(site);
-        if !self.placed.insert(site) {
+        if !self.placed_sites.insert(site) {
             return None;
         }
-        let statements = self.by_site.get(&site)?;
+        let canonical = self.canonical(site);
+        self.covered_classes.insert(canonical);
+        let statements = self
+            .by_site
+            .get(&site)
+            .or_else(|| self.by_site.get(&canonical))?;
         Some(statements.clone())
     }
 
@@ -679,9 +687,13 @@ impl NormalCopies {
     }
 
     fn place_at_occurrence(&mut self, site: NormalCopySite) -> Option<Vec<SemanticStatement>> {
-        let site = self.canonical(site);
-        self.placed.insert(site);
-        self.by_site.get(&site).cloned()
+        let canonical = self.canonical(site);
+        self.placed_sites.insert(site);
+        self.covered_classes.insert(canonical);
+        self.by_site
+            .get(&site)
+            .or_else(|| self.by_site.get(&canonical))
+            .cloned()
     }
 
     fn place_block_occurrence(
@@ -726,7 +738,7 @@ impl NormalCopies {
         self.by_site
             .keys()
             .map(|site| self.canonical(*site))
-            .find(|site| !self.placed.contains(site))
+            .find(|site| !self.covered_classes.contains(site))
     }
 
     fn get(&self, site: NormalCopySite) -> Option<&Vec<SemanticStatement>> {
@@ -2991,6 +3003,27 @@ mod tests {
 
         assert_eq!(copies.place_block_occurrence(site, false).unwrap().len(), 1);
         assert!(copies.place_block_occurrence(site, false).is_none());
+    }
+
+    #[test]
+    fn equivalent_concrete_copy_sites_are_each_placed() {
+        let first = NormalCopySite::Block(BlockId::new(7));
+        let second = NormalCopySite::Block(BlockId::new(8));
+        let mut copies = normal_copies();
+        let statements = copies.by_site[&first].clone();
+        copies.by_site.insert(second, statements);
+        copies.canonical_site = BTreeMap::from([(first, first), (second, first)]);
+
+        assert_eq!(
+            copies.place_block_occurrence(second, false).unwrap().len(),
+            1
+        );
+        assert!(copies.first_unplaced().is_none());
+        assert_eq!(
+            copies.place_block_occurrence(first, false).unwrap().len(),
+            1
+        );
+        assert!(copies.place_block_occurrence(first, false).is_none());
     }
 
     #[test]
