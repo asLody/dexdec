@@ -3407,18 +3407,59 @@ struct HandlerContinuation<'a> {
 struct HandlerAdapterEffects;
 
 impl HandlerAdapterEffects {
-    fn is_transparent(block: &super::Block, exception_flow: &BTreeSet<SsaVar>) -> bool {
-        block.insns.iter().all(|instruction| {
+    fn is_transparent(
+        block: &super::Block,
+        successor: &super::Block,
+        exception_flow: &BTreeSet<SsaVar>,
+    ) -> bool {
+        let exception_phis = block
+            .insns
+            .iter()
+            .filter(|instruction| instruction.insn_type == InsnType::Phi)
+            .filter_map(|instruction| instruction.result.as_ref().and_then(SsaVar::from_reg))
+            .filter(|result| exception_flow.contains(result))
+            .collect::<BTreeSet<_>>();
+        let is_bookkeeping = block.insns.iter().all(|instruction| {
             let is_bookkeeping = InstructionEffects::is_ssa_bookkeeping(instruction)
                 || instruction.insn_type == InsnType::Const;
-            let carries_caught_exception = instruction.insn_type != InsnType::MoveException
-                && instruction
-                    .result
-                    .as_ref()
-                    .and_then(SsaVar::from_reg)
-                    .is_some_and(|result| exception_flow.contains(&result));
-            is_bookkeeping && !carries_caught_exception
-        })
+            let materializes_exception_state = !matches!(
+                instruction.insn_type,
+                InsnType::MoveException | InsnType::Phi
+            ) && instruction
+                .result
+                .as_ref()
+                .and_then(SsaVar::from_reg)
+                .is_some_and(|result| exception_flow.contains(&result));
+            is_bookkeeping && !materializes_exception_state
+        });
+        if !is_bookkeeping || exception_phis.is_empty() {
+            return is_bookkeeping;
+        }
+
+        // A terminal exception phi is the source-level catch binding and must anchor the
+        // handler.  A phi whose value is immediately re-merged by the semantic successor is
+        // only an SSA edge adapter, so it is safe to cross.
+        let forwards_exception = exception_phis.iter().all(|value| {
+            successor.insns.iter().any(|instruction| {
+                instruction.insn_type == InsnType::Phi
+                    && instruction
+                        .result
+                        .as_ref()
+                        .and_then(SsaVar::from_reg)
+                        .is_some_and(|result| exception_flow.contains(&result))
+                    && instruction
+                        .args
+                        .iter()
+                        .filter_map(InsnArg::as_register)
+                        .filter_map(SsaVar::from_reg)
+                        .any(|argument| argument == *value)
+            })
+        });
+        let reaches_semantics = successor.insns.iter().any(|instruction| {
+            !InstructionEffects::is_ssa_bookkeeping(instruction)
+                && instruction.insn_type != InsnType::Const
+        });
+        forwards_exception && reaches_semantics
     }
 }
 
@@ -3443,9 +3484,6 @@ impl<'a> HandlerContinuation<'a> {
             let Some(block) = self.cfg.block(current) else {
                 break;
             };
-            if !HandlerAdapterEffects::is_transparent(block, self.exception_flow) {
-                break;
-            }
             let successors = self
                 .cfg
                 .normal_successors(current)
@@ -3454,6 +3492,12 @@ impl<'a> HandlerContinuation<'a> {
             let [successor] = successors.as_slice() else {
                 break;
             };
+            let Some(successor_block) = self.cfg.block(*successor) else {
+                break;
+            };
+            if !HandlerAdapterEffects::is_transparent(block, successor_block, self.exception_flow) {
+                break;
+            }
             adapters.insert(current);
             current = *successor;
         }
@@ -4316,6 +4360,84 @@ mod tests {
             SsaVar::from_reg(&caught).expect("caught SSA value"),
             SsaVar::from_reg(&state).expect("state SSA value"),
         ]);
+        let continuation =
+            HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
+
+        assert_eq!(continuation.entry, BlockId::new(1));
+        assert_eq!(continuation.adapters, BTreeSet::from([BlockId::new(0)]));
+    }
+
+    #[test]
+    fn handler_adapter_crosses_forwarded_exception_phi() {
+        let mut cfg = CFG::new("handler_exception_phi");
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let merged = RegisterArg::new_ssa(0, 1, ArgType::throwable());
+        let canonical = RegisterArg::new_ssa(0, 2, ArgType::throwable());
+
+        let mut entry = Block::new(0);
+        entry.push(InsnNode::move_exception(caught.clone()));
+        cfg.add_block(entry);
+
+        let mut adapter = Block::new(1);
+        adapter.push(InsnNode::phi(
+            merged.clone(),
+            vec![(0, InsnArg::Reg(caught.clone()))],
+        ));
+        cfg.add_block(adapter);
+
+        let mut body = Block::new(2);
+        body.push(InsnNode::phi(
+            canonical.clone(),
+            vec![(1, InsnArg::Reg(merged.clone()))],
+        ));
+        body.push(InsnNode::new(InsnType::Invoke, 2));
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+
+        let domain = BTreeSet::from([BlockId::new(0), BlockId::new(1), BlockId::new(2)]);
+        let exception_flow = [caught, merged, canonical]
+            .iter()
+            .filter_map(SsaVar::from_reg)
+            .collect::<BTreeSet<_>>();
+        let continuation =
+            HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
+
+        assert_eq!(continuation.entry, BlockId::new(2));
+        assert_eq!(
+            continuation.adapters,
+            BTreeSet::from([BlockId::new(0), BlockId::new(1)])
+        );
+    }
+
+    #[test]
+    fn handler_adapter_stops_at_terminal_exception_phi() {
+        let mut cfg = CFG::new("handler_terminal_exception_phi");
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let merged = RegisterArg::new_ssa(0, 1, ArgType::throwable());
+
+        let mut entry = Block::new(0);
+        entry.push(InsnNode::move_exception(caught.clone()));
+        cfg.add_block(entry);
+
+        let mut binding = Block::new(1);
+        binding.push(InsnNode::phi(
+            merged.clone(),
+            vec![(0, InsnArg::Reg(caught.clone()))],
+        ));
+        cfg.add_block(binding);
+
+        let mut body = Block::new(2);
+        body.push(InsnNode::new(InsnType::Invoke, 1));
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+
+        let domain = BTreeSet::from([BlockId::new(0), BlockId::new(1), BlockId::new(2)]);
+        let exception_flow = [caught, merged]
+            .iter()
+            .filter_map(SsaVar::from_reg)
+            .collect::<BTreeSet<_>>();
         let continuation =
             HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
 
