@@ -2240,8 +2240,8 @@ impl TerminalBranchLinearizer {
             return true;
         }
         if cases
-            .last()
-            .is_some_and(|case| Self::sequence_can_complete_normally(&case.body))
+            .iter()
+            .any(|case| Self::sequence_can_complete_normally(&case.body))
         {
             return true;
         }
@@ -2745,11 +2745,28 @@ impl SyntaxFrame {
                 condition,
                 body: Box::new(Self::child(&mut children)?),
             },
-            Self::DoWhile { label, condition } => KotlinStmt::DoWhile {
-                label,
-                body: Box::new(Self::child(&mut children)?),
-                condition,
-            },
+            Self::DoWhile { label, condition } => {
+                let body = Self::child(&mut children)?;
+                let repeated_single_iteration_scope = matches!(
+                    (&condition, &body),
+                    (
+                        KotlinExpr::Literal(super::KotlinLiteral::Boolean(false)),
+                        KotlinStmt::DoWhile {
+                            label: inner_label,
+                            condition: KotlinExpr::Literal(super::KotlinLiteral::Boolean(false)),
+                            ..
+                        }
+                    ) if inner_label == &label
+                );
+                if repeated_single_iteration_scope {
+                    return Ok((body, true));
+                }
+                KotlinStmt::DoWhile {
+                    label,
+                    body: Box::new(body),
+                    condition,
+                }
+            }
             Self::For {
                 label,
                 init,
@@ -2788,16 +2805,33 @@ impl SyntaxFrame {
                         KotlinStmt::Empty => Vec::new(),
                         statement => vec![statement],
                     };
+                    changed |= Self::lower_nonterminal_switch_exits(&mut case.body, label.as_ref());
                     changed |= Self::remove_terminal_switch_exit(&mut case.body, label.as_ref());
                 }
-                return Ok((
-                    KotlinStmt::Switch {
-                        label: None,
-                        selector,
-                        cases,
-                    },
-                    changed || label.is_some(),
-                ));
+                let has_switch_exit = cases
+                    .iter()
+                    .any(|case| Self::contains_switch_exit(&case.body, label.as_ref()));
+                // A synthetic loop gives residual switch exits a legal Kotlin target. Do not
+                // introduce it when an unlabeled continue still targets an enclosing real loop.
+                let needs_exit_scope = has_switch_exit
+                    && !cases
+                        .iter()
+                        .any(|case| Self::contains_free_unlabeled_continue(&case.body));
+                let switch = KotlinStmt::Switch {
+                    label: None,
+                    selector,
+                    cases,
+                };
+                let statement = if needs_exit_scope {
+                    KotlinStmt::DoWhile {
+                        label: label.clone(),
+                        body: Box::new(switch),
+                        condition: KotlinExpr::Literal(super::KotlinLiteral::Boolean(false)),
+                    }
+                } else {
+                    switch
+                };
+                return Ok((statement, changed || label.is_some() || needs_exit_scope));
             }
             Self::Try {
                 mut catches,
@@ -2830,6 +2864,333 @@ impl SyntaxFrame {
         children
             .next()
             .ok_or(super::KotlinStructuralError::MalformedWorkStack)
+    }
+
+    fn lower_nonterminal_switch_exits(
+        statements: &mut Vec<KotlinStmt>,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        let mut changed = statements.iter_mut().fold(false, |changed, statement| {
+            Self::lower_nonterminal_switch_exits_from(statement, label) || changed
+        });
+        while statements.len() > 1 {
+            let candidate = (0..statements.len() - 1).rev().find(|index| {
+                let KotlinStmt::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } = &statements[*index]
+                else {
+                    return false;
+                };
+                Self::unconditionally_exits_switch(then_stmt, label)
+                    || else_stmt.as_deref().is_some_and(|statement| {
+                        Self::unconditionally_exits_switch(statement, label)
+                    })
+            });
+            let Some(index) = candidate else {
+                break;
+            };
+            let tail = statements.split_off(index + 1);
+            let Some(KotlinStmt::If {
+                condition,
+                mut then_stmt,
+                mut else_stmt,
+            }) = statements.pop()
+            else {
+                unreachable!("switch exit candidate changed during lowering");
+            };
+            let then_exits = Self::unconditionally_exits_switch(&then_stmt, label);
+            let else_exits = else_stmt
+                .as_deref()
+                .is_some_and(|statement| Self::unconditionally_exits_switch(statement, label));
+            if then_exits {
+                let stripped = Self::strip_unconditional_switch_exit(&mut then_stmt, label);
+                debug_assert!(stripped);
+            }
+            if else_exits {
+                let stripped = Self::strip_unconditional_switch_exit(
+                    else_stmt.as_deref_mut().expect("exiting else branch"),
+                    label,
+                );
+                debug_assert!(stripped);
+            }
+            let then_stmt = *then_stmt;
+            let else_stmt = else_stmt.map(|statement| *statement);
+            let (replacement, _) = match (then_exits, else_exits, else_stmt) {
+                (true, true, Some(else_stmt)) => {
+                    KotlinAstNormalizer::conditional(condition, then_stmt, Some(else_stmt))
+                }
+                (true, false, Some(else_stmt)) => KotlinAstNormalizer::conditional(
+                    condition,
+                    then_stmt,
+                    Some(Self::append_switch_tail(else_stmt, tail)),
+                ),
+                (true, false, None) => KotlinAstNormalizer::conditional(
+                    condition,
+                    then_stmt,
+                    Some(Self::append_switch_tail(KotlinStmt::Empty, tail)),
+                ),
+                (false, true, Some(else_stmt)) => KotlinAstNormalizer::conditional(
+                    condition,
+                    Self::append_switch_tail(then_stmt, tail),
+                    Some(else_stmt),
+                ),
+                _ => unreachable!("switch exit candidate has no exiting branch"),
+            };
+            statements.push(replacement);
+            changed = true;
+        }
+        changed
+    }
+
+    fn lower_nonterminal_switch_exits_from(
+        statement: &mut KotlinStmt,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        match statement {
+            KotlinStmt::Block(statements) => {
+                Self::lower_nonterminal_switch_exits(statements, label)
+            }
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut changed = Self::lower_nonterminal_switch_exits_from(then_stmt, label);
+                if let Some(else_stmt) = else_stmt {
+                    changed |= Self::lower_nonterminal_switch_exits_from(else_stmt, label);
+                }
+                changed
+            }
+            KotlinStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                let mut changed = Self::lower_nonterminal_switch_exits_from(body, label);
+                for catch in catches {
+                    changed |= Self::lower_nonterminal_switch_exits_from(&mut catch.body, label);
+                }
+                if let Some(finally) = finally {
+                    changed |= Self::lower_nonterminal_switch_exits_from(finally, label);
+                }
+                changed
+            }
+            KotlinStmt::Synchronized { body, .. } | KotlinStmt::Labeled { body, .. } => {
+                Self::lower_nonterminal_switch_exits_from(body, label)
+            }
+            KotlinStmt::Empty
+            | KotlinStmt::Variable { .. }
+            | KotlinStmt::Expression(_)
+            | KotlinStmt::ConstructorInvocation { .. }
+            | KotlinStmt::Assign { .. }
+            | KotlinStmt::While { .. }
+            | KotlinStmt::DoWhile { .. }
+            | KotlinStmt::For { .. }
+            | KotlinStmt::ForEach { .. }
+            | KotlinStmt::Switch { .. }
+            | KotlinStmt::Return(_)
+            | KotlinStmt::Throw(_)
+            | KotlinStmt::Break(_)
+            | KotlinStmt::Continue(_) => false,
+        }
+    }
+
+    fn unconditionally_exits_switch(
+        statement: &KotlinStmt,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        if Self::is_switch_exit(statement, label) {
+            return true;
+        }
+        match statement {
+            KotlinStmt::Block(statements) => statements
+                .last()
+                .is_some_and(|statement| Self::unconditionally_exits_switch(statement, label)),
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt: Some(else_stmt),
+                ..
+            } => {
+                Self::unconditionally_exits_switch(then_stmt, label)
+                    && Self::unconditionally_exits_switch(else_stmt, label)
+            }
+            KotlinStmt::Synchronized { body, .. } | KotlinStmt::Labeled { body, .. } => {
+                Self::unconditionally_exits_switch(body, label)
+            }
+            _ => false,
+        }
+    }
+
+    fn strip_unconditional_switch_exit(
+        statement: &mut KotlinStmt,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        if Self::is_switch_exit(statement, label) {
+            *statement = KotlinStmt::Empty;
+            return true;
+        }
+        match statement {
+            KotlinStmt::Block(statements) => {
+                let changed = statements.last_mut().is_some_and(|statement| {
+                    Self::strip_unconditional_switch_exit(statement, label)
+                });
+                if matches!(statements.last(), Some(KotlinStmt::Empty)) {
+                    statements.pop();
+                }
+                changed
+            }
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt: Some(else_stmt),
+                ..
+            } => {
+                let then_changed = Self::strip_unconditional_switch_exit(then_stmt, label);
+                let else_changed = Self::strip_unconditional_switch_exit(else_stmt, label);
+                then_changed && else_changed
+            }
+            KotlinStmt::Synchronized { body, .. } | KotlinStmt::Labeled { body, .. } => {
+                Self::strip_unconditional_switch_exit(body, label)
+            }
+            _ => false,
+        }
+    }
+
+    fn append_switch_tail(statement: KotlinStmt, tail: Vec<KotlinStmt>) -> KotlinStmt {
+        let mut statements = match statement {
+            KotlinStmt::Empty => Vec::new(),
+            KotlinStmt::Block(statements) => statements,
+            statement => vec![statement],
+        };
+        statements.extend(tail);
+        KotlinStmt::Block(statements)
+    }
+
+    fn contains_switch_exit(statements: &[KotlinStmt], label: Option<&KotlinIdentifier>) -> bool {
+        statements
+            .iter()
+            .any(|statement| Self::contains_switch_exit_from(statement, label, false))
+    }
+
+    fn contains_switch_exit_from(
+        statement: &KotlinStmt,
+        label: Option<&KotlinIdentifier>,
+        nested_break_scope: bool,
+    ) -> bool {
+        match statement {
+            KotlinStmt::Break(None) => !nested_break_scope,
+            KotlinStmt::Break(Some(target)) => label.is_some_and(|label| target == label),
+            KotlinStmt::Block(statements) => statements.iter().any(|statement| {
+                Self::contains_switch_exit_from(statement, label, nested_break_scope)
+            }),
+            KotlinStmt::Labeled { body, .. } | KotlinStmt::Synchronized { body, .. } => {
+                Self::contains_switch_exit_from(body, label, nested_break_scope)
+            }
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::contains_switch_exit_from(then_stmt, label, nested_break_scope)
+                    || else_stmt.as_deref().is_some_and(|statement| {
+                        Self::contains_switch_exit_from(statement, label, nested_break_scope)
+                    })
+            }
+            KotlinStmt::While { body, .. }
+            | KotlinStmt::DoWhile { body, .. }
+            | KotlinStmt::For { body, .. }
+            | KotlinStmt::ForEach { body, .. } => {
+                Self::contains_switch_exit_from(body, label, true)
+            }
+            KotlinStmt::Switch { cases, .. } => cases.iter().any(|case| {
+                case.body
+                    .iter()
+                    .any(|statement| Self::contains_switch_exit_from(statement, label, true))
+            }),
+            KotlinStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::contains_switch_exit_from(body, label, nested_break_scope)
+                    || catches.iter().any(|catch| {
+                        Self::contains_switch_exit_from(&catch.body, label, nested_break_scope)
+                    })
+                    || finally.as_deref().is_some_and(|statement| {
+                        Self::contains_switch_exit_from(statement, label, nested_break_scope)
+                    })
+            }
+            KotlinStmt::Empty
+            | KotlinStmt::Variable { .. }
+            | KotlinStmt::Expression(_)
+            | KotlinStmt::ConstructorInvocation { .. }
+            | KotlinStmt::Assign { .. }
+            | KotlinStmt::Return(_)
+            | KotlinStmt::Throw(_)
+            | KotlinStmt::Continue(_) => false,
+        }
+    }
+
+    fn contains_free_unlabeled_continue(statements: &[KotlinStmt]) -> bool {
+        statements
+            .iter()
+            .any(|statement| Self::contains_free_unlabeled_continue_from(statement, false))
+    }
+
+    fn contains_free_unlabeled_continue_from(statement: &KotlinStmt, nested_loop: bool) -> bool {
+        match statement {
+            KotlinStmt::Continue(None) => !nested_loop,
+            KotlinStmt::Block(statements) => statements.iter().any(|statement| {
+                Self::contains_free_unlabeled_continue_from(statement, nested_loop)
+            }),
+            KotlinStmt::Labeled { body, .. } | KotlinStmt::Synchronized { body, .. } => {
+                Self::contains_free_unlabeled_continue_from(body, nested_loop)
+            }
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::contains_free_unlabeled_continue_from(then_stmt, nested_loop)
+                    || else_stmt.as_deref().is_some_and(|statement| {
+                        Self::contains_free_unlabeled_continue_from(statement, nested_loop)
+                    })
+            }
+            KotlinStmt::While { body, .. }
+            | KotlinStmt::DoWhile { body, .. }
+            | KotlinStmt::For { body, .. }
+            | KotlinStmt::ForEach { body, .. } => {
+                Self::contains_free_unlabeled_continue_from(body, true)
+            }
+            KotlinStmt::Switch { cases, .. } => cases.iter().any(|case| {
+                case.body.iter().any(|statement| {
+                    Self::contains_free_unlabeled_continue_from(statement, nested_loop)
+                })
+            }),
+            KotlinStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::contains_free_unlabeled_continue_from(body, nested_loop)
+                    || catches.iter().any(|catch| {
+                        Self::contains_free_unlabeled_continue_from(&catch.body, nested_loop)
+                    })
+                    || finally.as_deref().is_some_and(|statement| {
+                        Self::contains_free_unlabeled_continue_from(statement, nested_loop)
+                    })
+            }
+            KotlinStmt::Empty
+            | KotlinStmt::Variable { .. }
+            | KotlinStmt::Expression(_)
+            | KotlinStmt::ConstructorInvocation { .. }
+            | KotlinStmt::Assign { .. }
+            | KotlinStmt::Return(_)
+            | KotlinStmt::Throw(_)
+            | KotlinStmt::Break(_)
+            | KotlinStmt::Continue(Some(_)) => false,
+        }
     }
 
     fn remove_terminal_switch_exit(
@@ -3250,6 +3611,344 @@ mod tests {
         assert!(matches!(
             catches[0].body,
             KotlinStmt::Block(ref statements) if statements.is_empty()
+        ));
+    }
+
+    #[test]
+    fn lowers_guarded_switch_exit_before_try_tail() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: vec![KotlinExpr::Literal(KotlinLiteral::Integer(1))],
+                    body: vec![KotlinStmt::Try {
+                        body: Box::new(KotlinStmt::Block(vec![
+                            KotlinStmt::If {
+                                condition: name("resumed"),
+                                then_stmt: Box::new(KotlinStmt::Block(vec![
+                                    KotlinStmt::Expression(name("complete")),
+                                    KotlinStmt::Break(None),
+                                ])),
+                                else_stmt: None,
+                            },
+                            KotlinStmt::Return(Some(name("suspended"))),
+                        ])),
+                        catches: vec![KotlinCatch {
+                            types: vec![KotlinType::source_class("java.lang.Throwable")],
+                            variable: KotlinIdentifier::from_dex("exception"),
+                            body: KotlinStmt::Block(vec![
+                                KotlinStmt::Expression(name("recover")),
+                                KotlinStmt::Break(None),
+                            ]),
+                        }],
+                        finally: None,
+                    }],
+                    is_default: false,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+
+        let KotlinStmt::Switch { cases, .. } = body.root else {
+            panic!("switch statement")
+        };
+        let [KotlinStmt::Try { body, catches, .. }] = cases[0].body.as_slice() else {
+            panic!("try case body")
+        };
+        assert!(matches!(
+            body.as_ref(),
+            KotlinStmt::Block(statements)
+                if matches!(
+                    statements.as_slice(),
+                    [KotlinStmt::If {
+                        then_stmt,
+                        else_stmt: Some(else_stmt),
+                        ..
+                    }] if matches!(
+                        then_stmt.as_ref(),
+                        KotlinStmt::Block(then_statements)
+                            if matches!(then_statements.as_slice(), [KotlinStmt::Expression(_)])
+                    ) && matches!(
+                        else_stmt.as_ref(),
+                        KotlinStmt::Block(else_statements)
+                            if matches!(else_statements.as_slice(), [KotlinStmt::Return(Some(_))])
+                    )
+                )
+        ));
+        assert!(matches!(
+            catches[0].body,
+            KotlinStmt::Block(ref statements)
+                if matches!(statements.as_slice(), [KotlinStmt::Expression(_)])
+        ));
+    }
+
+    #[test]
+    fn guarded_switch_exit_keeps_shared_method_return() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Block(vec![
+                KotlinStmt::If {
+                    condition: name("resumed_case"),
+                    then_stmt: Box::new(KotlinStmt::Return(Some(name("unit")))),
+                    else_stmt: None,
+                },
+                KotlinStmt::Switch {
+                    label: None,
+                    selector: name("selector"),
+                    cases: vec![
+                        KotlinSwitchCase {
+                            labels: vec![KotlinExpr::Literal(KotlinLiteral::Integer(1))],
+                            body: vec![
+                                KotlinStmt::If {
+                                    condition: name("completed"),
+                                    then_stmt: Box::new(KotlinStmt::Block(vec![
+                                        KotlinStmt::Expression(name("finish")),
+                                        KotlinStmt::Break(None),
+                                    ])),
+                                    else_stmt: None,
+                                },
+                                KotlinStmt::Return(Some(name("suspended"))),
+                            ],
+                            is_default: false,
+                        },
+                        KotlinSwitchCase {
+                            labels: Vec::new(),
+                            body: vec![KotlinStmt::Throw(name("failure"))],
+                            is_default: true,
+                        },
+                    ],
+                },
+                KotlinStmt::Return(Some(name("unit"))),
+            ]),
+        };
+
+        for _ in 0..3 {
+            KotlinAstNormalizer.apply(&mut body).unwrap();
+        }
+
+        assert!(matches!(
+            body.root,
+            KotlinStmt::Block(ref statements)
+                if matches!(statements.last(), Some(KotlinStmt::Return(Some(_))))
+        ));
+    }
+
+    #[test]
+    fn kotlin_switch_completion_accepts_any_normal_case() {
+        let cases = vec![
+            KotlinSwitchCase {
+                labels: vec![KotlinExpr::Literal(KotlinLiteral::Integer(1))],
+                body: vec![KotlinStmt::Expression(name("complete"))],
+                is_default: false,
+            },
+            KotlinSwitchCase {
+                labels: Vec::new(),
+                body: vec![KotlinStmt::Throw(name("failure"))],
+                is_default: true,
+            },
+        ];
+
+        assert!(TerminalBranchLinearizer::switch_can_complete_normally(
+            None, &cases
+        ));
+    }
+
+    #[test]
+    fn nests_tail_below_successive_guarded_switch_exits() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: Vec::new(),
+                    body: vec![
+                        KotlinStmt::If {
+                            condition: name("first"),
+                            then_stmt: Box::new(KotlinStmt::Break(None)),
+                            else_stmt: None,
+                        },
+                        KotlinStmt::Expression(name("middle")),
+                        KotlinStmt::If {
+                            condition: name("second"),
+                            then_stmt: Box::new(KotlinStmt::Break(None)),
+                            else_stmt: None,
+                        },
+                        KotlinStmt::Expression(name("tail")),
+                    ],
+                    is_default: true,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+
+        assert!(matches!(
+            body.root,
+            KotlinStmt::Switch { ref cases, .. }
+                if matches!(
+                    cases[0].body.as_slice(),
+                    [KotlinStmt::If {
+                        then_stmt,
+                        else_stmt: None,
+                        ..
+                    }] if matches!(
+                        then_stmt.as_ref(),
+                        KotlinStmt::Block(statements)
+                            if matches!(
+                                statements.as_slice(),
+                                [KotlinStmt::Expression(_), KotlinStmt::If {
+                                    then_stmt: nested_then,
+                                    else_stmt: None,
+                                    ..
+                                }] if matches!(
+                                    nested_then.as_ref(),
+                                    KotlinStmt::Block(nested_statements)
+                                        if matches!(
+                                            nested_statements.as_slice(),
+                                            [KotlinStmt::Expression(_)]
+                                        )
+                                )
+                            )
+                    )
+                )
+        ));
+    }
+
+    #[test]
+    fn wraps_partial_nested_switch_exit_in_single_iteration_loop() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: Vec::new(),
+                    body: vec![
+                        KotlinStmt::If {
+                            condition: name("outer"),
+                            then_stmt: Box::new(KotlinStmt::Block(vec![
+                                KotlinStmt::Expression(name("prefix")),
+                                KotlinStmt::If {
+                                    condition: name("inner"),
+                                    then_stmt: Box::new(KotlinStmt::Break(None)),
+                                    else_stmt: None,
+                                },
+                            ])),
+                            else_stmt: None,
+                        },
+                        KotlinStmt::Expression(name("tail")),
+                    ],
+                    is_default: true,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+        let normalized = body.root.clone();
+        KotlinAstNormalizer.apply(&mut body).unwrap();
+        assert_eq!(body.root, normalized);
+
+        assert!(matches!(
+            body.root,
+            KotlinStmt::DoWhile {
+                label: None,
+                condition: KotlinExpr::Literal(KotlinLiteral::Boolean(false)),
+                ref body,
+            } if matches!(
+                body.as_ref(),
+                KotlinStmt::Switch { cases, .. }
+                    if matches!(
+                        cases[0].body.as_slice(),
+                        [KotlinStmt::If { then_stmt, .. }, KotlinStmt::Expression(_)]
+                            if matches!(
+                                then_stmt.as_ref(),
+                                KotlinStmt::Block(statements)
+                                    if matches!(
+                                        statements.as_slice(),
+                                        [KotlinStmt::Expression(_), KotlinStmt::If { then_stmt, .. }]
+                                            if matches!(
+                                                then_stmt.as_ref(),
+                                                KotlinStmt::Break(None)
+                                            )
+                                    )
+                            )
+                    )
+            )
+        ));
+    }
+
+    #[test]
+    fn does_not_wrap_switch_around_outer_continue() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: Vec::new(),
+                    body: vec![
+                        KotlinStmt::If {
+                            condition: name("outer"),
+                            then_stmt: Box::new(KotlinStmt::Block(vec![
+                                KotlinStmt::Expression(name("prefix")),
+                                KotlinStmt::If {
+                                    condition: name("inner"),
+                                    then_stmt: Box::new(KotlinStmt::Break(None)),
+                                    else_stmt: None,
+                                },
+                            ])),
+                            else_stmt: None,
+                        },
+                        KotlinStmt::Continue(None),
+                    ],
+                    is_default: true,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+
+        assert!(matches!(body.root, KotlinStmt::Switch { .. }));
+    }
+
+    #[test]
+    fn labels_switch_exit_scope_reached_from_nested_loop() {
+        let label = KotlinIdentifier::from_dex("switch_exit");
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: Some(label.clone()),
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: Vec::new(),
+                    body: vec![KotlinStmt::While {
+                        label: None,
+                        condition: name("condition"),
+                        body: Box::new(KotlinStmt::Break(Some(label.clone()))),
+                    }],
+                    is_default: true,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+
+        assert!(matches!(
+            body.root,
+            KotlinStmt::DoWhile {
+                label: Some(ref scope),
+                ref body,
+                ..
+            } if scope == &label && matches!(
+                body.as_ref(),
+                KotlinStmt::Switch { cases, .. }
+                    if matches!(
+                        cases[0].body.as_slice(),
+                        [KotlinStmt::While { body, .. }]
+                            if matches!(
+                                body.as_ref(),
+                                KotlinStmt::Break(Some(target)) if target == &label
+                            )
+                    )
+            )
         ));
     }
 

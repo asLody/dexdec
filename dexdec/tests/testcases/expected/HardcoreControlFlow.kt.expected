@@ -140,20 +140,20 @@ public open class HardcoreControlFlow {
                     if (step > 0) {
                         total += step
                         selector = 1
-                        break
+                    } else {
+                        if (step >= 0) {
+                            return total
+                        }
+                        selector = 2
                     }
-                    if (step >= 0) {
-                        return total
-                    }
-                    selector = 2
                 }
                 1 -> {
                     if (step != 0) {
                         total *= 2
                         index++
-                        break
+                    } else {
+                        selector = 0
                     }
-                    selector = 0
                 }
                 2 -> {
                     total -= step
