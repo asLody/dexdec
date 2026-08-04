@@ -2788,15 +2788,7 @@ impl SyntaxFrame {
                         KotlinStmt::Empty => Vec::new(),
                         statement => vec![statement],
                     };
-                    let exits_switch = matches!(case.body.last(), Some(KotlinStmt::Break(None)))
-                        || matches!(
-                            (case.body.last(), label.as_ref()),
-                            (Some(KotlinStmt::Break(Some(target))), Some(label)) if target == label
-                        );
-                    if exits_switch {
-                        case.body.pop();
-                        changed = true;
-                    }
+                    changed |= Self::remove_terminal_switch_exit(&mut case.body, label.as_ref());
                 }
                 return Ok((
                     KotlinStmt::Switch {
@@ -2838,6 +2830,85 @@ impl SyntaxFrame {
         children
             .next()
             .ok_or(super::KotlinStructuralError::MalformedWorkStack)
+    }
+
+    fn remove_terminal_switch_exit(
+        statements: &mut Vec<KotlinStmt>,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        let Some(statement) = statements.last_mut() else {
+            return false;
+        };
+        if Self::is_switch_exit(statement, label) {
+            statements.pop();
+            return true;
+        }
+        Self::remove_terminal_switch_exit_from(statement, label)
+    }
+
+    fn remove_terminal_switch_exit_from(
+        statement: &mut KotlinStmt,
+        label: Option<&KotlinIdentifier>,
+    ) -> bool {
+        if Self::is_switch_exit(statement, label) {
+            *statement = KotlinStmt::Empty;
+            return true;
+        }
+        // Descend only through tail constructs that do not bind `break` themselves.
+        // A loop or nested switch owns its exits, even when it is the last statement.
+        match statement {
+            KotlinStmt::Block(statements) => Self::remove_terminal_switch_exit(statements, label),
+            KotlinStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut changed = Self::remove_terminal_switch_exit_from(then_stmt, label);
+                if let Some(else_stmt) = else_stmt {
+                    changed |= Self::remove_terminal_switch_exit_from(else_stmt, label);
+                }
+                changed
+            }
+            KotlinStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                let mut changed = Self::remove_terminal_switch_exit_from(body, label);
+                for catch in catches {
+                    changed |= Self::remove_terminal_switch_exit_from(&mut catch.body, label);
+                }
+                if let Some(finally) = finally {
+                    changed |= Self::remove_terminal_switch_exit_from(finally, label);
+                }
+                changed
+            }
+            KotlinStmt::Synchronized { body, .. } | KotlinStmt::Labeled { body, .. } => {
+                Self::remove_terminal_switch_exit_from(body, label)
+            }
+            KotlinStmt::Empty
+            | KotlinStmt::Variable { .. }
+            | KotlinStmt::Expression(_)
+            | KotlinStmt::ConstructorInvocation { .. }
+            | KotlinStmt::Assign { .. }
+            | KotlinStmt::While { .. }
+            | KotlinStmt::DoWhile { .. }
+            | KotlinStmt::For { .. }
+            | KotlinStmt::ForEach { .. }
+            | KotlinStmt::Switch { .. }
+            | KotlinStmt::Return(_)
+            | KotlinStmt::Throw(_)
+            | KotlinStmt::Break(_)
+            | KotlinStmt::Continue(_) => false,
+        }
+    }
+
+    fn is_switch_exit(statement: &KotlinStmt, label: Option<&KotlinIdentifier>) -> bool {
+        matches!(statement, KotlinStmt::Break(None))
+            || matches!(
+                (statement, label),
+                (KotlinStmt::Break(Some(target)), Some(label)) if target == label
+            )
     }
 }
 
@@ -3136,5 +3207,80 @@ mod tests {
         };
         assert_eq!(ty, parameterized);
         assert!(matches!(*value, KotlinExpr::Name(_)));
+    }
+
+    #[test]
+    fn removes_terminal_switch_exits_from_try_paths() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: vec![KotlinExpr::Literal(KotlinLiteral::Integer(1))],
+                    body: vec![KotlinStmt::Try {
+                        body: Box::new(KotlinStmt::Block(vec![
+                            KotlinStmt::Expression(name("work")),
+                            KotlinStmt::Break(None),
+                        ])),
+                        catches: vec![KotlinCatch {
+                            types: vec![KotlinType::source_class("java.lang.Throwable")],
+                            variable: KotlinIdentifier::from_dex("exception"),
+                            body: KotlinStmt::Block(vec![KotlinStmt::Break(None)]),
+                        }],
+                        finally: None,
+                    }],
+                    is_default: false,
+                }],
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+
+        let KotlinStmt::Switch { cases, .. } = body.root else {
+            panic!("switch statement")
+        };
+        let [KotlinStmt::Try { body, catches, .. }] = cases[0].body.as_slice() else {
+            panic!("try case body")
+        };
+        assert!(matches!(
+            body.as_ref(),
+            KotlinStmt::Block(statements)
+                if matches!(statements.as_slice(), [KotlinStmt::Expression(_)])
+        ));
+        assert!(matches!(
+            catches[0].body,
+            KotlinStmt::Block(ref statements) if statements.is_empty()
+        ));
+    }
+
+    #[test]
+    fn preserves_breaks_owned_by_a_nested_loop() {
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Switch {
+                label: None,
+                selector: name("selector"),
+                cases: vec![KotlinSwitchCase {
+                    labels: Vec::new(),
+                    body: vec![KotlinStmt::While {
+                        label: None,
+                        condition: KotlinExpr::Literal(KotlinLiteral::Boolean(true)),
+                        body: Box::new(KotlinStmt::Break(None)),
+                    }],
+                    is_default: true,
+                }],
+            },
+        };
+
+        KotlinAstNormalizer.apply(&mut body).unwrap();
+
+        assert!(matches!(
+            body.root,
+            KotlinStmt::Switch { ref cases, .. }
+                if matches!(
+                    cases[0].body.as_slice(),
+                    [KotlinStmt::While { body, .. }]
+                        if matches!(body.as_ref(), KotlinStmt::Break(None))
+                )
+        ));
     }
 }
