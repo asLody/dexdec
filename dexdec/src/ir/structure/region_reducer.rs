@@ -466,13 +466,14 @@ impl<'a> RegionReducer<'a> {
             .collect();
         let local = &region_cfg.cfg;
         let has_open_flows = !region_cfg.open_flows.is_empty();
-        let is_switch_dispatch = matches!(kind, RegionKind::Switch(_))
-            && self
-                .regions
+        let is_switch_dispatch = Self::has_direct_switch_dispatch(
+            kind,
+            self.regions
                 .tree()
                 .region(region_id)
-                .and_then(|region| region.entry)
-                == Some(local.entry);
+                .and_then(|region| region.entry),
+            local,
+        );
         if is_switch_dispatch {
             return SwitchStructurer::new(local, &semantic, region_id, seeded)
                 .terminal_seeds(terminal_seeds)
@@ -483,6 +484,23 @@ impl<'a> RegionReducer<'a> {
             .terminal_seeds(terminal_seeds)
             .force_graph_reduction(has_open_flows)
             .structure()
+    }
+
+    fn has_direct_switch_dispatch(
+        kind: &RegionKind,
+        region_entry: Option<BlockId>,
+        local: &CFG,
+    ) -> bool {
+        // A child region can own the same physical entry as its switch parent.
+        // RegionCfgBuilder then preserves the entry as a contracted nop whose
+        // semantic body is supplied through `seeded`; only the original switch
+        // header satisfies SwitchStructurer's input contract.
+        matches!(kind, RegionKind::Switch(_))
+            && region_entry == Some(local.entry)
+            && local
+                .block(local.entry)
+                .and_then(|block| block.terminator())
+                .is_some_and(|terminator| terminator.insn_type == crate::ir::InsnType::Switch)
     }
 
     fn anchor_block(block: BlockId, continuation: SemanticNode) -> SemanticNode {
@@ -584,5 +602,37 @@ impl ReducedPort {
             body,
             continuations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegionReducer;
+    use crate::ir::{Block, BlockId, InsnNode, InsnType, RegionKind, SwitchRegion, CFG};
+
+    #[test]
+    fn contracted_switch_header_uses_general_structurer() {
+        let entry = BlockId::new(0);
+        let kind = RegionKind::Switch(SwitchRegion { follow: None });
+
+        let mut direct = CFG::new("direct_switch");
+        let mut header = Block::new(entry.raw());
+        header.push(InsnNode::new(InsnType::Switch, 0));
+        direct.add_block(header);
+        assert!(RegionReducer::has_direct_switch_dispatch(
+            &kind,
+            Some(entry),
+            &direct,
+        ));
+
+        let mut contracted = CFG::new("contracted_switch");
+        let mut header = Block::new(entry.raw());
+        header.push(InsnNode::nop());
+        contracted.add_block(header);
+        assert!(!RegionReducer::has_direct_switch_dispatch(
+            &kind,
+            Some(entry),
+            &contracted,
+        ));
     }
 }
