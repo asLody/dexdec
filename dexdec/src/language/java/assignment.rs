@@ -140,6 +140,7 @@ impl KnownValues {
             JavaStmt::While {
                 condition, body, ..
             } => {
+                self.forget_statement_writes(body);
                 self.invalidate(condition);
                 let incoming = self.values.clone();
                 let result = self.branch(body, &incoming).0;
@@ -152,6 +153,7 @@ impl KnownValues {
             JavaStmt::DoWhile {
                 body, condition, ..
             } => {
+                self.forget_statement_writes(body);
                 let incoming = self.values.clone();
                 let result = self.branch(body, &incoming).0;
                 self.invalidate(condition);
@@ -169,6 +171,8 @@ impl KnownValues {
                 ..
             } => {
                 let mut result = self.sequence(init);
+                self.forget_statement_writes(body);
+                self.forget_expression_writes(update);
                 if let Some(condition) = condition {
                     self.invalidate(condition);
                 }
@@ -183,6 +187,7 @@ impl KnownValues {
                 result
             }
             JavaStmt::ForEach { iterable, body, .. } => {
+                self.forget_statement_writes(body);
                 self.invalidate(iterable);
                 let incoming = self.values.clone();
                 let result = self.branch(body, &incoming).0;
@@ -276,6 +281,26 @@ impl KnownValues {
         }
     }
 
+    fn forget_statement_writes(&mut self, statement: &JavaStmt) {
+        let mut writes = StatementWrites::default();
+        writes.collect(statement);
+        self.forget_names(writes.names);
+    }
+
+    fn forget_expression_writes(&mut self, expressions: &[JavaExpr]) {
+        let mut writes = ExpressionWrites::default();
+        for expression in expressions {
+            writes.rewrite_expression(expression.clone());
+        }
+        self.forget_names(writes.names);
+    }
+
+    fn forget_names(&mut self, names: BTreeSet<JavaIdentifier>) {
+        for name in names {
+            self.values.remove(&name);
+        }
+    }
+
     fn complete(changed: bool) -> RewriteResult {
         RewriteResult {
             changed,
@@ -307,6 +332,62 @@ impl JavaAstRewriter for ExpressionWrites {
             _ => {}
         }
         expression
+    }
+}
+
+#[derive(Default)]
+struct StatementWrites {
+    names: BTreeSet<JavaIdentifier>,
+}
+
+impl StatementWrites {
+    fn collect(&mut self, statement: &JavaStmt) {
+        self.rewrite_statement(statement.clone());
+    }
+
+    fn record_target(&mut self, target: &JavaExpr) {
+        if let JavaExpr::Name(name) = target {
+            self.names.insert(name.clone());
+        }
+    }
+}
+
+impl JavaAstRewriter for StatementWrites {
+    fn rewrite_nested_functions(&self) -> bool {
+        false
+    }
+
+    fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
+        if let JavaExpr::Assignment { target, .. } | JavaExpr::Update { target, .. } = &expression {
+            self.record_target(target);
+        }
+        expression
+    }
+
+    fn finish_statement(&mut self, statement: JavaStmt) -> JavaStmt {
+        match &statement {
+            JavaStmt::Variable { name, .. } | JavaStmt::ForEach { variable: name, .. } => {
+                self.names.insert(name.clone());
+            }
+            JavaStmt::Assign { target, .. } => self.record_target(target),
+            JavaStmt::Empty
+            | JavaStmt::Block(_)
+            | JavaStmt::Labeled { .. }
+            | JavaStmt::Expression(_)
+            | JavaStmt::ConstructorInvocation { .. }
+            | JavaStmt::If { .. }
+            | JavaStmt::While { .. }
+            | JavaStmt::DoWhile { .. }
+            | JavaStmt::For { .. }
+            | JavaStmt::Switch { .. }
+            | JavaStmt::Try { .. }
+            | JavaStmt::Synchronized { .. }
+            | JavaStmt::Return(_)
+            | JavaStmt::Throw(_)
+            | JavaStmt::Break(_)
+            | JavaStmt::Continue(_) => {}
+        }
+        statement
     }
 }
 
