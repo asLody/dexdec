@@ -844,6 +844,17 @@ impl ExceptionHandlerPort {
     ) -> Option<Self> {
         Self::at(ingress, regions)
             .or_else(|| {
+                Self::detached_continuation(
+                    ingress,
+                    regions.tree(),
+                    regions
+                        .tree()
+                        .regions()
+                        .filter(|region| regions.is_exception_handler(region.id))
+                        .map(|region| region.id),
+                )
+            })
+            .or_else(|| {
                 regions
                     .handler_adapters()
                     .get(&ingress)
@@ -855,6 +866,26 @@ impl ExceptionHandlerPort {
                     .filter(|terminal| *terminal != ingress)
                     .and_then(|terminal| Self::at(terminal, regions))
             })
+    }
+
+    /// Resolve an empty handler whose physical entry is also an ordinary CFG
+    /// continuation. Such handlers cannot own the shared block lexically, so
+    /// region recovery records it as the handler continuation instead.
+    fn detached_continuation(
+        block: BlockId,
+        tree: &crate::ir::RegionTree,
+        handlers: impl IntoIterator<Item = RegionId>,
+    ) -> Option<Self> {
+        let mut matches = handlers.into_iter().filter(|handler| {
+            tree.region(*handler).is_some_and(|region| {
+                region.entry.is_none() && region.kind.continuation() == Some(block)
+            })
+        });
+        let region = matches.next()?;
+        matches.next().is_none().then_some(Self {
+            region,
+            entry: block,
+        })
     }
 
     fn at(block: BlockId, regions: &RegionGraph) -> Option<Self> {
@@ -2566,13 +2597,72 @@ mod tests {
     use super::*;
     use crate::ir::analysis::ClassHierarchyIndex;
     use crate::ir::{
-        Block, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, SemanticExpression,
+        Block, CatchRegion, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, RegionKind,
+        RegionTree, SemanticExpression,
     };
 
     fn source_variable(register: u32, version: u32, variable: u32) -> RegisterArg {
         let mut value = RegisterArg::new_ssa(register, version, ArgType::INT);
         value.code_var = Some(variable);
         value
+    }
+
+    #[test]
+    fn detached_handler_continuation_is_an_exception_port() {
+        let continuation = BlockId::new(7);
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let protected = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(6)))
+            .expect("try region");
+        let handler = tree
+            .add_child(
+                protected,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::throwable()],
+                    exception_value: None,
+                    continuation: Some(continuation),
+                }),
+                None,
+            )
+            .expect("detached handler");
+
+        assert_eq!(
+            ExceptionHandlerPort::detached_continuation(continuation, &tree, [handler]),
+            Some(ExceptionHandlerPort {
+                region: handler,
+                entry: continuation,
+            })
+        );
+    }
+
+    #[test]
+    fn ambiguous_detached_handler_continuation_is_not_selected() {
+        let continuation = BlockId::new(7);
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let protected = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(6)))
+            .expect("try region");
+        let handler = |tree: &mut RegionTree| {
+            tree.add_child(
+                protected,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::throwable()],
+                    exception_value: None,
+                    continuation: Some(continuation),
+                }),
+                None,
+            )
+            .expect("detached handler")
+        };
+        let left = handler(&mut tree);
+        let right = handler(&mut tree);
+
+        assert_eq!(
+            ExceptionHandlerPort::detached_continuation(continuation, &tree, [left, right]),
+            None
+        );
     }
 
     #[test]
