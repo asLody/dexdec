@@ -1707,15 +1707,17 @@ impl<'a> CleanupProof<'a> {
         if mapped == normal {
             return true;
         }
+        if self.empty_path_reaches(mapped, normal) {
+            self.blocks.insert(handler, normal);
+            return true;
+        }
+        if self.empty_path_reaches(normal, mapped) {
+            return true;
+        }
         if !self.rethrow_blocks.contains(&handler) {
             return false;
         }
-        if self.empty_path_reaches(mapped, normal) {
-            self.blocks.insert(handler, normal);
-            true
-        } else if self.empty_path_reaches(normal, mapped) {
-            true
-        } else if let Some(join) = self.empty_path_join(mapped, normal) {
+        if let Some(join) = self.empty_path_join(mapped, normal) {
             self.blocks.insert(handler, join);
             true
         } else {
@@ -2329,4 +2331,45 @@ enum EquivalenceTask<'a> {
         Option<&'a crate::ir::RegisterArg>,
         Option<&'a crate::ir::RegisterArg>,
     ),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{ArgType, Block, RegisterArg};
+
+    #[test]
+    fn remaps_non_rethrow_handler_across_empty_normal_trampoline() {
+        let handler = BlockId::new(0);
+        let trampoline = BlockId::new(1);
+        let target = BlockId::new(2);
+        let observable = BlockId::new(3);
+        let mut cfg = CFG::new("cleanup_empty_trampoline");
+        cfg.add_block(Block::new(handler));
+        cfg.add_block(Block::new(trampoline));
+        cfg.add_block(Block::new(target));
+        let mut observable_block = Block::new(observable);
+        observable_block.push(InsnNode::monitor_exit(InsnArg::Reg(RegisterArg::new(
+            0,
+            ArgType::object("java/lang/Object"),
+        ))));
+        cfg.add_block(observable_block);
+        cfg.add_edge(trampoline, target, EdgeKind::Normal);
+        cfg.add_edge(observable, target, EdgeKind::Normal);
+
+        let values = SsaValueGraph::default();
+        let origins = SsaOrigins::analyze(&values);
+        let handler_blocks = BTreeSet::from([handler]);
+        let rethrow_blocks = BTreeSet::new();
+        let mut proof =
+            CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
+        assert!(proof.bind_block(handler, trampoline));
+        assert!(proof.bind_block(handler, target));
+        assert_eq!(proof.blocks.get(&handler), Some(&target));
+
+        let mut proof =
+            CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
+        assert!(proof.bind_block(handler, observable));
+        assert!(!proof.bind_block(handler, target));
+    }
 }

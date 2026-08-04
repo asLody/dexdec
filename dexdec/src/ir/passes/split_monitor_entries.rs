@@ -45,10 +45,6 @@ impl Pass for SplitMonitorEntries {
                     .is_some_and(|block| !Self::partition_boundaries(&block.insns).is_empty())
             })
             .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(PassResult::Unchanged);
-        }
-
         let mut next = cfg
             .block_ids()
             .into_iter()
@@ -56,6 +52,7 @@ impl Pass for SplitMonitorEntries {
             .max()
             .unwrap_or(0)
             + 1;
+        let split = !candidates.is_empty();
         for original_id in candidates {
             let outgoing = cfg.successors_with_kind(original_id).to_vec();
             let instructions = std::mem::take(
@@ -121,7 +118,8 @@ impl Pass for SplitMonitorEntries {
                 }
             }
         }
-        Ok(PassResult::Changed)
+        let distributed = Self::distribute_shared_releases(cfg, &mut next);
+        Ok((split || distributed).into())
     }
 }
 
@@ -150,6 +148,74 @@ impl SplitMonitorEntries {
         boundaries.sort_unstable();
         boundaries.dedup();
         boundaries
+    }
+
+    /// A compiler may merge normal exits from duplicated synchronized cleanup
+    /// bodies into one `monitor-exit` block. SSA then needs a Phi for the lock
+    /// register, and no individual `monitor-enter` dominates that shared
+    /// release. Put the release on each incoming edge while leaving its
+    /// continuation shared, so monitor ownership remains path-local.
+    fn distribute_shared_releases(cfg: &mut CFG, next: &mut u32) -> bool {
+        let candidates = cfg
+            .block_ids()
+            .into_iter()
+            .filter(|block| *block != cfg.entry)
+            .filter(|block| {
+                cfg.block(*block)
+                    .is_some_and(|block| Self::is_pure_release(&block.insns))
+            })
+            .filter_map(|block| {
+                let incoming = cfg.incoming_edges(block);
+                let sources = incoming
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect::<std::collections::BTreeSet<_>>();
+                (incoming.len() > 1
+                    && sources.len() == incoming.len()
+                    && incoming
+                        .iter()
+                        .all(|(_, kind)| *kind != EdgeKind::Exception))
+                .then_some((block, incoming))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (release, incoming) in candidates {
+            let Some(template) = cfg.block(release).cloned() else {
+                continue;
+            };
+            let outgoing = cfg.successors_with_kind(release).to_vec();
+            for (predecessor, kind) in incoming.into_iter().skip(1) {
+                let clone_id = BlockId::new(*next);
+                *next += 1;
+                let mut clone = template.clone();
+                clone.id = clone_id;
+                cfg.add_block(clone);
+                cfg.set_exception_coverage(clone_id, cfg.exception_coverage_for(&template.insns));
+                cfg.remove_edge(predecessor, release);
+                cfg.add_edge(predecessor, clone_id, kind);
+                for &(target, kind) in &outgoing {
+                    cfg.add_edge(clone_id, target, kind);
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn is_pure_release(instructions: &[InsnNode]) -> bool {
+        instructions
+            .iter()
+            .filter(|instruction| instruction.insn_type != InsnType::Nop)
+            .try_fold(0usize, |releases, instruction| {
+                match instruction.insn_type {
+                    InsnType::MonitorExit => Some(releases + 1),
+                    _ if InstructionEffects::is_kotlin_finally_marker(instruction) => {
+                        Some(releases)
+                    }
+                    _ => None,
+                }
+            })
+            == Some(1)
     }
 }
 
@@ -231,5 +297,64 @@ mod tests {
             cfg.normal_successors(1).collect::<Vec<_>>(),
             vec![BlockId::new(2)]
         );
+    }
+
+    #[test]
+    fn distributes_a_shared_release_across_incoming_edges() {
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+        let mut first = Block::new(0);
+        first.push(InsnNode::monitor_enter(lock.clone()));
+        let mut second = Block::new(1);
+        second.push(InsnNode::monitor_enter(lock.clone()));
+        let mut release = Block::new(2);
+        release.push(InsnNode::monitor_exit(lock));
+        release.push(InsnNode::nop());
+        let handler = Block::new(3);
+        let continuation = Block::new(4);
+        let mut cfg = CFG::new("shared_monitor_release");
+        cfg.add_block(first);
+        cfg.add_block(second);
+        cfg.add_block(release);
+        cfg.add_block(handler);
+        cfg.add_block(continuation);
+        cfg.add_edge(BlockId::new(0), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(2), BlockId::new(4), EdgeKind::Normal);
+
+        assert_eq!(
+            SplitMonitorEntries.run(&mut cfg).unwrap(),
+            PassResult::Changed
+        );
+        let release_blocks = cfg
+            .block_ids()
+            .into_iter()
+            .filter(|block| {
+                cfg.block(*block).is_some_and(|block| {
+                    block
+                        .insns
+                        .iter()
+                        .any(|instruction| instruction.insn_type == InsnType::MonitorExit)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(release_blocks.len(), 2);
+        for release in release_blocks {
+            assert_eq!(cfg.incoming_edges(release).len(), 1);
+            assert!(cfg.has_edge(release, BlockId::new(3)));
+            let continuation = cfg
+                .normal_successors(release)
+                .next()
+                .expect("shared continuation");
+            assert_eq!(
+                cfg.block(continuation)
+                    .unwrap()
+                    .insns
+                    .iter()
+                    .map(|instruction| instruction.insn_type)
+                    .collect::<Vec<_>>(),
+                vec![InsnType::Nop]
+            );
+        }
     }
 }
