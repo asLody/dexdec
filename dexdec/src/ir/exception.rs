@@ -3649,7 +3649,15 @@ impl HandlerDomains {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let descendants = Self::handler_descendants(regions, &entries, &reachable);
+        // A no-op catch can target a continuation shared with ordinary flow.
+        // Such a target is not an exception-only descendant of an enclosing
+        // handler. Keep handler-local continuations eligible for ownership.
+        let ordinary_continuations = continuations
+            .intersection(&ordinary)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let descendants =
+            Self::handler_descendants(regions, &entries, &ordinary_continuations, &reachable);
 
         regions
             .iter()
@@ -3815,6 +3823,7 @@ impl HandlerDomains {
     fn handler_descendants(
         regions: &[TryRegion],
         entries: &BTreeSet<BlockId>,
+        ordinary_continuations: &BTreeSet<BlockId>,
         reachable: &BTreeMap<BlockId, BTreeSet<BlockId>>,
     ) -> BTreeMap<BlockId, BTreeSet<BlockId>> {
         let mut descendants = entries
@@ -3836,7 +3845,9 @@ impl HandlerDomains {
                             .handlers
                             .iter()
                             .map(|handler| handler.semantic_entry)
-                            .filter(|entry| entry != outer),
+                            .filter(|entry| {
+                                entry != outer && !ordinary_continuations.contains(entry)
+                            }),
                     );
                 }
             }
@@ -4128,6 +4139,34 @@ mod tests {
             children: Vec::new(),
             normal_exit_blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn shared_noop_catch_continuation_is_not_inherited_by_outer_handler() {
+        let mut cfg = CFG::new("shared_noop_catch_continuation");
+        for block in 0..=7 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(6), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(6), BlockId::new(7), EdgeKind::Normal);
+
+        let mut regions = vec![
+            try_region(0, 1, 2, &[1], vec![catch_handler(2, &[2, 3, 6])]),
+            try_region(1, 3, 4, &[3], vec![catch_handler(6, &[6, 7])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert_eq!(
+            regions[0].handlers[0].lexical_blocks,
+            vec![BlockId::new(2), BlockId::new(3)]
+        );
+        assert_eq!(regions[1].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[1].handlers[0].continuation, Some(BlockId::new(6)));
     }
 
     #[test]
