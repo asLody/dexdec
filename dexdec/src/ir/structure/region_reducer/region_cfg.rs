@@ -873,17 +873,28 @@ impl RegionCfgState {
     }
 
     fn intern_boundary(&mut self, leave: &ResolvedRegionExit) -> Result<BlockId, StructureError> {
-        let preserve_origin = leave
+        let copy_anchors = leave
             .leave
             .source_block
-            .is_some_and(|block| self.origin_sensitive_boundaries.contains(&block));
+            .into_iter()
+            .chain(
+                leave
+                    .leave
+                    .edge
+                    .into_iter()
+                    .flat_map(|edge| [edge.source, edge.target]),
+            )
+            .filter(|block| self.origin_sensitive_boundaries.contains(block))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let canonical_fallthrough = match &leave.leave.exit {
             RegionExit::FallThrough(target) => {
                 Some(self.canonical_continuations.destination(*target))
             }
             _ => None,
         };
-        let key = BoundaryKey::of(leave, preserve_origin, canonical_fallthrough);
+        let key = BoundaryKey::of(leave, copy_anchors, canonical_fallthrough);
         if let Some(boundary) = self.boundary_ids.get(&key) {
             return Ok(*boundary);
         }
@@ -1101,7 +1112,7 @@ impl RegionCfg {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct BoundaryKey {
     exit: BoundaryExitKey,
-    origin: Option<BlockId>,
+    copy_anchors: Vec<BlockId>,
     region_target: RegionId,
     target: RegionId,
     cleanup: Vec<RegionId>,
@@ -1110,12 +1121,12 @@ struct BoundaryKey {
 impl BoundaryKey {
     fn of(
         exit: &ResolvedRegionExit,
-        preserve_origin: bool,
+        copy_anchors: Vec<BlockId>,
         canonical_fallthrough: Option<BlockId>,
     ) -> Self {
         Self {
             exit: BoundaryExitKey::of(&exit.leave.exit, canonical_fallthrough),
-            origin: preserve_origin.then_some(exit.leave.source_block).flatten(),
+            copy_anchors,
             region_target: exit.leave.target,
             target: exit.leave.control_target.unwrap_or(exit.leave.target),
             cleanup: exit.cleanup_regions.clone(),
@@ -1186,12 +1197,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        BoundaryExitKey, BoundaryValueKey, RegionCfg, RegionCfgBuilder, RegionEntryPorts,
-        RegionLayout,
+        BoundaryExitKey, BoundaryKey, BoundaryValueKey, RegionCfg, RegionCfgBuilder,
+        RegionEntryPorts, RegionLayout,
     };
     use crate::ir::{
-        ArgType, Block, BlockId, CatchRegion, EdgeKind, InsnArg, RegionExit, RegionKind,
-        RegionTree, CFG,
+        ArgType, Block, BlockId, CatchRegion, EdgeKind, InsnArg, RegionEdge, RegionExit, RegionId,
+        RegionKind, RegionLeave, RegionTree, ResolvedRegionExit, CFG,
     };
 
     #[test]
@@ -1270,6 +1281,34 @@ mod tests {
         assert_eq!(
             BoundaryExitKey::of(&RegionExit::Return(Some(value.clone())), None),
             BoundaryExitKey::Return(Some(BoundaryValueKey::of(&value)))
+        );
+    }
+
+    #[test]
+    fn phi_copy_targets_keep_equivalent_break_boundaries_distinct() {
+        let region = RegionId::new(3);
+        let resolved = |source, target| ResolvedRegionExit {
+            leave: RegionLeave::new(region, region, RegionExit::Break)
+                .with_source_block(source)
+                .with_edge(RegionEdge {
+                    source,
+                    target,
+                    kind: EdgeKind::False,
+                }),
+            cleanup_regions: Vec::new(),
+        };
+        let left_target = BlockId::new(33);
+        let right_target = BlockId::new(34);
+        let left = resolved(BlockId::new(16), left_target);
+        let right = resolved(BlockId::new(20), right_target);
+
+        assert_eq!(
+            BoundaryKey::of(&left, Vec::new(), None),
+            BoundaryKey::of(&right, Vec::new(), None)
+        );
+        assert_ne!(
+            BoundaryKey::of(&left, vec![left_target], None),
+            BoundaryKey::of(&right, vec![right_target], None)
         );
     }
 
