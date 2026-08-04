@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ir::{EdgeKind, InsnArg, InsnType, MemberReference, MethodReference, CFG};
 
 use super::{
-    DominanceError, DominatorTree, InsnPosition, SsaValueGraph, SsaVar, TypeHierarchy, UsePosition,
+    DominanceError, DominatorTree, InsnPosition, SsaValueGraph, SsaVar, SubtypeRelation,
+    TypeHierarchy, UsePosition,
 };
 
 #[derive(Debug, Clone)]
@@ -202,7 +203,14 @@ impl ObjectInitializations {
                 });
             };
             let Some(constructors) = constructors.get(&class) else {
-                if Self::is_unobserved_allocation(cfg, values, &aliases, class, *allocation) {
+                if Self::is_unobserved_allocation(
+                    cfg,
+                    values,
+                    &aliases,
+                    hierarchy,
+                    class,
+                    *allocation,
+                ) {
                     discarded_allocations.insert(*allocation);
                     continue;
                 }
@@ -295,11 +303,13 @@ impl ObjectInitializations {
         cfg: &CFG,
         values: &SsaValueGraph,
         aliases: &ObjectAliases,
+        hierarchy: &dyn TypeHierarchy,
         class: SsaVar,
         allocation: InsnPosition,
     ) -> bool {
         if !Self::has_stable_exception_scope(cfg, allocation.block)
             && !Self::is_orphan_string_builder(cfg, allocation)
+            && !Self::allocation_errors_bypass_handlers(cfg, hierarchy, allocation)
         {
             return false;
         }
@@ -317,6 +327,44 @@ impl ObjectInitializations {
                 })
             })
         })
+    }
+
+    /// A valid DEX `new-instance` can fail while resolving or allocating the
+    /// class, but those failures are VM/linkage `Error`s rather than
+    /// `Exception`s. A dead allocation inside a typed `catch Exception` range
+    /// can therefore be removed without changing which handler executes.
+    /// Unknown hierarchies and catch-all/Error handlers remain conservative.
+    fn allocation_errors_bypass_handlers(
+        cfg: &CFG,
+        hierarchy: &dyn TypeHierarchy,
+        allocation: InsnPosition,
+    ) -> bool {
+        let Some(offset) = cfg
+            .block(allocation.block)
+            .and_then(|block| block.insns.get(allocation.index))
+            .map(|instruction| instruction.offset)
+        else {
+            return false;
+        };
+        let mut covered = false;
+        for handler in cfg.handlers.iter().filter(|handler| handler.covers(offset)) {
+            covered = true;
+            let Some(catch_type) = handler
+                .catch_type
+                .as_ref()
+                .and_then(crate::ir::ArgType::as_object)
+            else {
+                return false;
+            };
+            let excludes_error = hierarchy.subtype_relation("java/lang/Error", catch_type)
+                == SubtypeRelation::No
+                || hierarchy.subtype_relation(catch_type, "java/lang/Exception")
+                    == SubtypeRelation::Yes;
+            if !excludes_error {
+                return false;
+            }
+        }
+        covered
     }
 
     /// DEX producers can leave a dead `new-instance StringBuilder` behind
@@ -559,7 +607,10 @@ impl std::error::Error for ObjectInitializationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{analysis::ClassHierarchyIndex, Block, BlockId, InsnNode, RegisterArg};
+    use crate::ir::{
+        analysis::ClassHierarchyIndex, ArgType, Block, BlockId, ExceptionHandler, InsnNode,
+        RegisterArg,
+    };
 
     fn orphan_allocation(ty: &str) -> CFG {
         let allocation = BlockId::new(0);
@@ -613,6 +664,66 @@ mod tests {
         let values = SsaValueGraph::build(&cfg).expect("SSA graph");
         let error = ObjectInitializations::analyze(&cfg, &values, &ClassHierarchyIndex::default())
             .expect_err("arbitrary allocation must remain strict");
+
+        assert!(matches!(
+            error,
+            ObjectInitializationError::MissingConstructor(InsnPosition {
+                block: BlockId(0),
+                index: 0
+            })
+        ));
+    }
+
+    fn hierarchy_with_throwables() -> ClassHierarchyIndex {
+        let mut hierarchy = ClassHierarchyIndex::default();
+        hierarchy.add("java/lang/Object", Vec::new());
+        hierarchy.add("java/lang/Throwable", vec!["java/lang/Object".to_string()]);
+        hierarchy.add("java/lang/Error", vec!["java/lang/Throwable".to_string()]);
+        hierarchy.add(
+            "java/lang/Exception",
+            vec!["java/lang/Throwable".to_string()],
+        );
+        hierarchy.add(
+            "java/lang/ReflectiveOperationException",
+            vec!["java/lang/Exception".to_string()],
+        );
+        hierarchy
+    }
+
+    #[test]
+    fn discards_unobserved_allocation_when_typed_handler_excludes_errors() {
+        let mut cfg = orphan_allocation("java/lang/NullPointerException");
+        cfg.handlers.push(ExceptionHandler::new(
+            0,
+            1,
+            2,
+            Some(ArgType::object("java/lang/ReflectiveOperationException")),
+        ));
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let facts = ObjectInitializations::analyze(&cfg, &values, &hierarchy_with_throwables())
+            .expect("an Exception handler cannot observe allocation Errors");
+
+        assert_eq!(
+            facts.discarded_allocations(),
+            &BTreeSet::from([InsnPosition {
+                block: BlockId::new(0),
+                index: 0,
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_unobserved_allocation_when_handler_catches_errors() {
+        let mut cfg = orphan_allocation("java/lang/NullPointerException");
+        cfg.handlers.push(ExceptionHandler::new(
+            0,
+            1,
+            2,
+            Some(ArgType::object("java/lang/Throwable")),
+        ));
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let error = ObjectInitializations::analyze(&cfg, &values, &hierarchy_with_throwables())
+            .expect_err("a Throwable handler can observe allocation Errors");
 
         assert!(matches!(
             error,
