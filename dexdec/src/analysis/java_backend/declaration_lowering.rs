@@ -1021,6 +1021,19 @@ impl<'a> JavaTypeLowering<'a> {
         let signature = declaration.signature.as_ref();
         let annotations = self.method_annotations(declaration)?;
         let mut name_scope = crate::language::java::JavaNameScope::default();
+        let reserved_type_qualifiers = method
+            .body
+            .as_ref()
+            .into_iter()
+            .flat_map(super::java_model::method::JavaMethodBody::static_owner_types)
+            .map(|owner| self.names.resolve_type(&owner))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .filter_map(source_type_qualifier)
+            .collect::<std::collections::BTreeSet<_>>();
+        for qualifier in &reserved_type_qualifiers {
+            name_scope.reserve(qualifier.clone());
+        }
         let parameter_naming = super::semantic_naming::ParameterNameRecovery::new(self.names);
         let mut visible_parameter = 0usize;
         let parameter_names = declaration
@@ -1166,12 +1179,17 @@ impl<'a> JavaTypeLowering<'a> {
                             source_type_bounds.clone(),
                             generic_throw_types.clone(),
                             outer_instances,
-                            declaration
-                                .kind
-                                .is_class_initializer()
-                                .then(|| owner.map(|owner| self.members.field_names(owner)))
-                                .flatten()
-                                .unwrap_or_default(),
+                            {
+                                let mut reserved = reserved_type_qualifiers.clone();
+                                if declaration.kind.is_class_initializer() {
+                                    reserved.extend(
+                                        owner
+                                            .map(|owner| self.members.field_names(owner))
+                                            .unwrap_or_default(),
+                                    );
+                                }
+                                reserved
+                            },
                             declaration.kind.is_class_initializer(),
                             self.observer.clone(),
                         )
@@ -1692,6 +1710,16 @@ fn type_kind(kind: JavaClassKind) -> JavaTypeDeclarationKind {
     }
 }
 
+/// The first source component is the expression qualifier that a static
+/// member access must keep visible. Reserving it prevents a local binding from
+/// turning `Owner.field` into an access through an unrelated local variable.
+fn source_type_qualifier(ty: &JavaType) -> Option<JavaIdentifier> {
+    let JavaType::Class(class) = ty else {
+        return None;
+    };
+    class.segments.first().map(|segment| segment.name.clone())
+}
+
 fn method_kind(kind: MethodModelKind) -> JavaMethodDeclarationKind {
     match kind {
         MethodModelKind::Method => JavaMethodDeclarationKind::Method,
@@ -1705,6 +1733,19 @@ mod tests {
     use super::*;
     use crate::ir::generic_types::GenericSignatures;
     use crate::language::java::GenericTypeProjection;
+
+    #[test]
+    fn static_type_qualifier_is_reserved_from_local_names() {
+        let owner = JavaType::source_class("a");
+        let owner = source_type_qualifier(&owner).expect("owner qualifier");
+        let mut names = crate::language::java::JavaNameScope::default();
+        names.reserve(owner);
+
+        assert_eq!(
+            names.claim(JavaIdentifier::from_dex("a")),
+            JavaIdentifier::from_dex("a2")
+        );
+    }
 
     #[test]
     fn merged_throwable_rethrow_uses_generic_cast_but_catch_parameter_does_not() {
