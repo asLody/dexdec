@@ -4,8 +4,8 @@ use crate::ir::{
     analysis::{types::SourceTypeLattice, TypeHierarchy},
     ArgType, BlockId, InsnArg, InsnNode, InsnType, InstructionId, InstructionTree,
     InstructionVisitor, RegionExit, RegionGraph, RegionId, RegisterArg, SemanticBlock,
-    SemanticFolder, SemanticNode, SemanticStatement, SemanticVisitor, StatementOrigin, Utf16String,
-    CFG,
+    SemanticExpression, SemanticFolder, SemanticNode, SemanticStatement, SemanticVisitor,
+    StatementOrigin, Utf16String, CFG,
 };
 
 use super::{
@@ -682,6 +682,44 @@ impl NormalCopies {
         let site = self.canonical(site);
         self.placed.insert(site);
         self.by_site.get(&site).cloned()
+    }
+
+    fn place_block_occurrence(
+        &mut self,
+        site: NormalCopySite,
+        repeats_semantically: bool,
+    ) -> Option<Vec<SemanticStatement>> {
+        if repeats_semantically && self.is_idempotent(site) {
+            self.place_at_occurrence(site)
+        } else {
+            self.place_once(site)
+        }
+    }
+
+    fn is_idempotent(&self, site: NormalCopySite) -> bool {
+        let site = self.canonical(site);
+        let Some(statements) = self.by_site.get(&site) else {
+            return false;
+        };
+        let destinations = statements
+            .iter()
+            .filter_map(SemanticStatement::result)
+            .filter_map(|result| result.code_var)
+            .collect::<BTreeSet<_>>();
+        !destinations.is_empty()
+            && statements.iter().all(|statement| {
+                let Some(instruction) = statement.instruction_ref() else {
+                    return false;
+                };
+                instruction.insn_type == InsnType::Move
+                    && instruction.payload.edge_copy
+                    && instruction
+                        .operands()
+                        .first()
+                        .and_then(SemanticExpression::as_register)
+                        .and_then(|source| source.code_var)
+                        .is_none_or(|source| !destinations.contains(&source))
+            })
     }
 
     fn first_unplaced(&self) -> Option<NormalCopySite> {
@@ -2092,6 +2130,7 @@ pub(super) struct PhiLowering {
     handler_regions: BTreeMap<RegionId, BlockId>,
     handler_blocks: BTreeSet<BlockId>,
     semantic_blocks: BTreeSet<BlockId>,
+    repeated_semantic_blocks: BTreeSet<BlockId>,
     statement_blocks: BTreeSet<BlockId>,
     materialized_instructions: BTreeSet<InstructionId>,
     placed_exceptional: BTreeSet<InstructionId>,
@@ -2223,6 +2262,7 @@ impl PhiLowering {
             handler_regions,
             handler_blocks,
             semantic_blocks: BTreeSet::new(),
+            repeated_semantic_blocks: BTreeSet::new(),
             statement_blocks: BTreeSet::new(),
             materialized_instructions: BTreeSet::new(),
             placed_exceptional: BTreeSet::new(),
@@ -2237,6 +2277,7 @@ impl PhiLowering {
 
     pub(super) fn apply(mut self, root: &mut SemanticNode) -> Result<(), SourceVariableError> {
         self.semantic_blocks = SemanticBlocks::collect(root);
+        self.repeated_semantic_blocks = SemanticBlockOccurrences::repeated(root);
         self.statement_blocks = StatementBlocks::collect(root);
         self.materialized_instructions =
             EvaluationInstructions::of_node(root).into_iter().collect();
@@ -2428,11 +2469,11 @@ impl PhiLowering {
         block.statements = statements;
         if owns_normal_copies {
             let site = NormalCopySite::Block(block.id);
-            let copies = if block.statements.is_empty() {
-                self.normal.place_once(site)
-            } else {
-                self.normal.place_at_occurrence(site)
-            };
+            let repeats_semantically =
+                !block.statements.is_empty() || self.repeated_semantic_blocks.contains(&block.id);
+            let copies = self
+                .normal
+                .place_block_occurrence(site, repeats_semantically);
             if let Some(statements) = copies {
                 block.statements.extend(statements);
             }
@@ -2577,6 +2618,31 @@ impl SemanticVisitor for SemanticBlocks {
     fn enter_node(&mut self, node: &SemanticNode) {
         if let SemanticNode::BasicBlock(block) = node {
             self.blocks.insert(block.id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SemanticBlockOccurrences {
+    counts: BTreeMap<BlockId, usize>,
+}
+
+impl SemanticBlockOccurrences {
+    fn repeated(root: &SemanticNode) -> BTreeSet<BlockId> {
+        let mut collector = Self::default();
+        collector.visit_node(root);
+        collector
+            .counts
+            .into_iter()
+            .filter_map(|(block, count)| (count > 1).then_some(block))
+            .collect()
+    }
+}
+
+impl SemanticVisitor for SemanticBlockOccurrences {
+    fn enter_node(&mut self, node: &SemanticNode) {
+        if let SemanticNode::BasicBlock(block) = node {
+            *self.counts.entry(block.id).or_default() += 1;
         }
     }
 }
@@ -2897,11 +2963,11 @@ mod tests {
     }
 
     fn normal_copies() -> NormalCopies {
-        let statement = SemanticStatement::definition(
-            InstructionId::new(1),
-            RegisterArg::new(0, ArgType::INT),
-            SemanticExpression::Literal(LiteralArg::int(1)),
-        );
+        let mut destination = RegisterArg::new(0, ArgType::INT);
+        destination.code_var = Some(7);
+        let mut copy = InsnNode::mov(destination, InsnArg::Lit(LiteralArg::int(1)));
+        copy.payload.edge_copy = true;
+        let statement = SemanticStatement::instruction(copy).expect("edge copy statement");
         NormalCopies::new(
             BTreeMap::from([(NormalCopySite::Block(BlockId::new(7)), vec![statement])]),
             BTreeMap::new(),
@@ -2923,8 +2989,53 @@ mod tests {
         let site = NormalCopySite::Block(BlockId::new(7));
         let mut copies = normal_copies();
 
-        assert_eq!(copies.place_once(site).unwrap().len(), 1);
-        assert!(copies.place_once(site).is_none());
+        assert_eq!(copies.place_block_occurrence(site, false).unwrap().len(), 1);
+        assert!(copies.place_block_occurrence(site, false).is_none());
+    }
+
+    #[test]
+    fn repeated_semantic_block_copies_follow_each_occurrence() {
+        let site = NormalCopySite::Block(BlockId::new(7));
+        let mut copies = normal_copies();
+
+        assert_eq!(copies.place_block_occurrence(site, true).unwrap().len(), 1);
+        assert_eq!(copies.place_block_occurrence(site, true).unwrap().len(), 1);
+        assert!(copies.first_unplaced().is_none());
+    }
+
+    #[test]
+    fn repeated_semantic_blocks_are_detected() {
+        let block = || {
+            SemanticNode::BasicBlock(SemanticBlock {
+                id: BlockId::new(7),
+                statements: Vec::new(),
+            })
+        };
+        let root = SemanticNode::sequence(vec![block(), block()]);
+
+        assert_eq!(
+            SemanticBlockOccurrences::repeated(&root),
+            BTreeSet::from([BlockId::new(7)])
+        );
+    }
+
+    #[test]
+    fn dependent_block_copies_are_not_repeated() {
+        let site = NormalCopySite::Block(BlockId::new(7));
+        let left = source_variable(0, 0, 1);
+        let right = source_variable(1, 0, 2);
+        let mut left_copy = InsnNode::mov(left.clone(), InsnArg::Reg(right.clone()));
+        left_copy.payload.edge_copy = true;
+        let mut right_copy = InsnNode::mov(right, InsnArg::Reg(left));
+        right_copy.payload.edge_copy = true;
+        let statements = vec![
+            SemanticStatement::instruction(left_copy).expect("left edge copy"),
+            SemanticStatement::instruction(right_copy).expect("right edge copy"),
+        ];
+        let mut copies = NormalCopies::new(BTreeMap::from([(site, statements)]), BTreeMap::new());
+
+        assert_eq!(copies.place_block_occurrence(site, true).unwrap().len(), 2);
+        assert!(copies.place_block_occurrence(site, true).is_none());
     }
 
     #[test]
