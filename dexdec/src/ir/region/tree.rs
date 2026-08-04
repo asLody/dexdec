@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::analysis::LexicalBoundaryAnalysis;
+use crate::ir::analysis::{InstructionEffects, LexicalBoundaryAnalysis};
 use crate::ir::{BlockId, InsnArg, CFG};
 
 use super::{
@@ -68,6 +68,7 @@ impl RegionTree {
         }
         SynchronizationPlacement::analyze(
             self,
+            cfg,
             owner,
             handlers,
             lock,
@@ -890,6 +891,7 @@ pub(super) struct SynchronizationRewrite {
 impl SynchronizationPlacement {
     fn analyze(
         tree: &RegionTree,
+        cfg: &CFG,
         owner: RegionId,
         handlers: &[RegionId],
         lock: InsnArg,
@@ -905,7 +907,7 @@ impl SynchronizationPlacement {
         let release_handlers = handlers
             .iter()
             .copied()
-            .filter(|handler| Self::is_release_entry(tree, *handler, release_entries))
+            .filter(|handler| Self::is_release_entry(cfg, tree, *handler, release_entries))
             .collect::<BTreeSet<_>>();
         if release_handlers.is_empty() {
             return Err(RegionInvariantError::MissingSynchronizationHandler {
@@ -958,7 +960,7 @@ impl SynchronizationPlacement {
             .values()
             .filter(|region| !release_handlers.contains(&region.id))
             .filter(|region| !nested_release_handlers.contains(&region.id))
-            .filter(|region| Self::is_release_entry(tree, region.id, release_entries))
+            .filter(|region| Self::is_release_entry(cfg, tree, region.id, release_entries))
             .filter(|region| {
                 region
                     .parent
@@ -1540,7 +1542,12 @@ impl SynchronizationPlacement {
         Ok(())
     }
 
-    fn is_release_entry(tree: &RegionTree, region: RegionId, entries: &BTreeSet<BlockId>) -> bool {
+    fn is_release_entry(
+        cfg: &CFG,
+        tree: &RegionTree,
+        region: RegionId,
+        entries: &BTreeSet<BlockId>,
+    ) -> bool {
         tree.region(region).is_some_and(|region| {
             let semantic_entry = region.entry.or_else(|| match &region.kind {
                 RegionKind::Catch(catch) | RegionKind::Cleanup(catch) => catch.continuation,
@@ -1549,8 +1556,46 @@ impl SynchronizationPlacement {
             matches!(
                 &region.kind,
                 RegionKind::Catch(_) | RegionKind::Finally | RegionKind::Cleanup(_)
-            ) && semantic_entry.is_some_and(|entry| entries.contains(&entry))
+            ) && semantic_entry.is_some_and(|target| {
+                entries.iter().copied().any(|entry| {
+                    entry == target || Self::transparent_release_adapter(cfg, entry, target)
+                })
+            })
         })
+    }
+
+    /// Exception analysis can retain a `move-exception` adapter as the
+    /// release entry while the lexical handler starts at its successor.
+    /// Relate those representations only across a deterministic path of SSA
+    /// bookkeeping with no exceptional side exit.
+    fn transparent_release_adapter(cfg: &CFG, entry: BlockId, target: BlockId) -> bool {
+        let mut current = entry;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current) {
+            if current == target {
+                return true;
+            }
+            let Some(block) = cfg.block(current) else {
+                return false;
+            };
+            if block
+                .insns
+                .iter()
+                .any(|instruction| !InstructionEffects::is_ssa_bookkeeping(instruction))
+                || cfg
+                    .successors_with_kind(current)
+                    .iter()
+                    .any(|(_, kind)| kind.is_exception())
+            {
+                return false;
+            }
+            let successors = cfg.normal_successors(current).collect::<Vec<_>>();
+            let [next] = successors.as_slice() else {
+                return false;
+            };
+            current = *next;
+        }
+        false
     }
 
     fn mark_release_handlers(&self, tree: &mut RegionTree) -> Result<(), RegionInvariantError> {
@@ -1705,6 +1750,7 @@ impl SynchronizationPlacement {
 mod tests {
     use super::super::{CatchRegion, LoopRegion};
     use super::*;
+    use crate::ir::{ArgType, Block, EdgeKind, InsnNode, RegisterArg};
 
     fn blocks(ids: impl IntoIterator<Item = u32>) -> BTreeSet<BlockId> {
         ids.into_iter().map(BlockId::new).collect()
@@ -1816,5 +1862,60 @@ mod tests {
         tree.canonicalize_nesting().unwrap();
 
         assert_eq!(tree.region(protected).unwrap().parent, Some(handler));
+    }
+
+    #[test]
+    fn release_handler_matches_a_transparent_move_exception_adapter() {
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let handler = add_region(&mut tree, root, RegionKind::Finally, 1, [0, 1, 2, 3, 4]);
+
+        let mut adapter = Block::new(0);
+        adapter.push(InsnNode::move_exception(RegisterArg::new(
+            0,
+            ArgType::throwable(),
+        )));
+        let target = Block::new(1);
+        let exceptional_target = Block::new(2);
+        let mut observable = Block::new(3);
+        observable.push(InsnNode::monitor_exit(InsnArg::Reg(RegisterArg::new(
+            1,
+            ArgType::object("java/lang/Object"),
+        ))));
+        let mut branching_adapter = Block::new(4);
+        branching_adapter.push(InsnNode::move_exception(RegisterArg::new(
+            2,
+            ArgType::throwable(),
+        )));
+
+        let mut cfg = CFG::new("release_handler_adapter");
+        cfg.add_block(adapter);
+        cfg.add_block(target);
+        cfg.add_block(exceptional_target);
+        cfg.add_block(observable);
+        cfg.add_block(branching_adapter);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(2), EdgeKind::Exception);
+
+        assert!(SynchronizationPlacement::is_release_entry(
+            &cfg,
+            &tree,
+            handler,
+            &blocks([0]),
+        ));
+        assert!(!SynchronizationPlacement::is_release_entry(
+            &cfg,
+            &tree,
+            handler,
+            &blocks([3]),
+        ));
+        assert!(!SynchronizationPlacement::is_release_entry(
+            &cfg,
+            &tree,
+            handler,
+            &blocks([4]),
+        ));
     }
 }
