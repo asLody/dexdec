@@ -949,10 +949,23 @@ impl SynchronizationPlacement {
                 !release_handlers.contains(handler) && !nested_release_handlers.contains(handler)
             })
             .collect::<BTreeSet<_>>();
-        let mut blocks = blocks
-            .difference(&own_release_blocks)
-            .copied()
-            .collect::<BTreeSet<_>>();
+        // A declared-synchronized method is one source-level lexical scope.
+        // Runtime monitor analysis stops at each synthetic monitor-exit, so it
+        // omits return/throw tails split after the exit. Those tails still
+        // belong to the method body and can otherwise cross a user handler at
+        // the same region depth. Keep only the synthetic enter and this
+        // monitor's release handler outside the recovered source scope.
+        let mut blocks = if method {
+            cfg.block_ids()
+                .into_iter()
+                .filter(|block| *block != enter && !own_release_blocks.contains(block))
+                .collect::<BTreeSet<_>>()
+        } else {
+            blocks
+                .difference(&own_release_blocks)
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
         blocks.extend(user_handlers.iter().flat_map(|handler| {
             tree.region(*handler)
                 .into_iter()
@@ -1934,6 +1947,58 @@ mod tests {
             Some(RegionKind::Synchronized(_))
         ));
         assert_eq!(tree.region(synchronization).unwrap().blocks, scope);
+    }
+
+    #[test]
+    fn declared_synchronization_owns_split_return_tails() {
+        let mut cfg = CFG::new("declared_synchronized_return_tails");
+        for id in 0..=7 {
+            cfg.add_block(Block::new(id));
+        }
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4, 5],
+        );
+        let user_handler = add_region(
+            &mut tree,
+            root,
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            6,
+            [6, 7],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        let placement = SynchronizationPlacement::analyze(
+            &tree,
+            &cfg,
+            root,
+            &[release, user_handler],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 4, 6]),
+            &blocks([4]),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(placement.blocks, blocks([1, 2, 3, 6, 7]));
     }
 
     #[test]
