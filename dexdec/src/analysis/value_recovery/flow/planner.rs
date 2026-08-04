@@ -288,6 +288,8 @@ impl<'a> ValuePlanner<'a> {
     /// read, or call after both actions are composed. Applying producer leaves
     /// first preserves use cardinality and lets the next recovery stage rebuild
     /// domains, effects, and use-def facts before moving the expanded consumer.
+    /// A single lexical use in a loop is also a repeated dynamic use and may
+    /// not acquire an effect evaluated before that loop.
     fn retain_replacement_frontier(
         &self,
         actions: &mut Vec<ValueAction>,
@@ -344,7 +346,9 @@ impl<'a> ValuePlanner<'a> {
             };
             let mut dependencies = self.replacement_dependencies(action)?;
             dependencies.remove(&key);
-            if (!ssa_identity || self.facts.uses_of(key).len() > 1)
+            let crosses_repetition =
+                self.replacement_enters_repetition(key, &dependencies, &blocking_keys);
+            if (!ssa_identity || self.facts.uses_of(key).len() > 1 || crosses_repetition)
                 && !dependencies.is_disjoint(&blocking_keys)
             {
                 deferred_keys.insert(key);
@@ -392,6 +396,27 @@ impl<'a> ValuePlanner<'a> {
         }
         *actions = retained;
         Ok(())
+    }
+
+    fn replacement_enters_repetition(
+        &self,
+        key: SsaVar,
+        dependencies: &BTreeSet<SsaVar>,
+        blocking_keys: &BTreeSet<SsaVar>,
+    ) -> bool {
+        self.facts.uses_of(key).iter().any(|usage| {
+            usage.repetitive
+                && dependencies.iter().any(|dependency| {
+                    blocking_keys.contains(dependency)
+                        && self
+                            .graph()
+                            .definitions
+                            .get(dependency)
+                            .is_some_and(|definitions| {
+                                definitions.iter().any(|definition| !definition.repetitive)
+                            })
+                })
+        })
     }
 
     fn register_move_source(&self, definition: &DefinitionFact) -> Option<SsaVar> {
@@ -1860,8 +1885,9 @@ impl ValueAction {
 mod tests {
     use super::*;
     use crate::ir::{
-        analysis::SsaValueGraph, block::Block, ArgType, BlockId, InsnNode, InvokeType, RegisterArg,
-        SemanticBlock, SemanticNode, SemanticStatement, CFG,
+        analysis::SsaValueGraph, block::Block, ArgType, BlockId, EdgeKind, InsnNode, InvokeType,
+        RegionId, RegisterArg, SemanticBlock, SemanticLoopControl, SemanticLoopKind,
+        SemanticLoopTest, SemanticNode, SemanticPredicate, SemanticStatement, CFG,
     };
 
     fn register(value: SsaVar, ty: &ArgType) -> RegisterArg {
@@ -1972,5 +1998,99 @@ mod tests {
         assert!(scheduled.contains(&allocation));
         assert!(scheduled.contains(&first_alias));
         assert!(scheduled.contains(&second_alias));
+    }
+
+    #[test]
+    fn defers_effectful_phi_replacement_entering_loop() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let initial_alias = SsaVar::new(14, 0);
+        let loop_value = SsaVar::new(14, 1);
+        let body_alias = SsaVar::new(9, 0);
+        let backedge_alias = SsaVar::new(14, 2);
+
+        let mut preheader = Block::new(0u32);
+        preheader.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        preheader.push(InsnNode::mov(
+            register(initial_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+
+        let mut header = Block::new(1u32);
+        header.push(InsnNode::phi(
+            register(loop_value, &array_type),
+            vec![
+                (0, argument(initial_alias, &array_type)),
+                (2, argument(backedge_alias, &array_type)),
+            ],
+        ));
+
+        let mut body = Block::new(2u32);
+        body.push(InsnNode::mov(
+            register(body_alias, &array_type),
+            argument(loop_value, &array_type),
+        ));
+        body.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(body_alias, &array_type)],
+        ));
+        body.push(InsnNode::mov(
+            register(backedge_alias, &array_type),
+            argument(body_alias, &array_type),
+        ));
+
+        let mut cfg = CFG::new("effectful_loop_invariant");
+        cfg.add_block(preheader);
+        cfg.add_block(header);
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(1), EdgeKind::Normal);
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let semantic_block = |id| {
+            SemanticNode::BasicBlock(SemanticBlock {
+                id,
+                statements: cfg
+                    .block(id)
+                    .expect("semantic block")
+                    .insns
+                    .iter()
+                    .filter(|instruction| instruction.insn_type != InsnType::Phi)
+                    .cloned()
+                    .map(|instruction| {
+                        SemanticStatement::instruction(instruction).expect("semantic op")
+                    })
+                    .collect(),
+            })
+        };
+        let mut root = SemanticNode::sequence([
+            semantic_block(BlockId::new(0)),
+            SemanticNode::Loop {
+                control: SemanticLoopControl::Region(RegionId::new(1)),
+                header: Some(BlockId::new(1)),
+                kind: SemanticLoopKind::Endless,
+                test: SemanticLoopTest::pure(SemanticPredicate::True),
+                body: Box::new(semantic_block(BlockId::new(2))),
+            },
+        ]);
+        crate::ir::SemanticSiteNumbering::assign(&mut root).expect("semantic sites");
+
+        let graph = ValueFlowGraph::build(&root, &values, &BTreeMap::new()).expect("value graph");
+        let scheduled = graph
+            .schedule(RecoveryMode::Full)
+            .expect("value plan")
+            .actions
+            .iter()
+            .filter_map(ValuePlanner::replacement_key)
+            .collect::<BTreeSet<_>>();
+
+        assert!(scheduled.contains(&allocation));
+        assert!(!scheduled.contains(&loop_value));
     }
 }
