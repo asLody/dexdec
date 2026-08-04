@@ -6,7 +6,7 @@ use crate::language::java::{
     JavaFieldDeclaration, JavaFieldSymbol, JavaIdentifier, JavaLiteral, JavaMemberNames,
     JavaMethodBody, JavaMethodDeclaration, JavaMethodDeclarationKind, JavaMethodParameter,
     JavaMethodSymbol, JavaModifier, JavaStmt, JavaType, JavaTypeArgument, JavaTypeDeclaration,
-    JavaTypeDeclarationKind,
+    JavaTypeDeclarationKind, JavaTypeParameter,
 };
 
 use super::anonymous_lowering::{
@@ -1074,7 +1074,14 @@ impl<'a> JavaTypeLowering<'a> {
             })
             .collect::<Result<Vec<_>, JavaDecompilerError>>()?;
         let return_type = self.method_return_type(declaration, signature)?;
-        let throws = self.method_throws(declaration, signature)?;
+        let mut throws = self.method_throws(declaration, signature)?;
+        let mut type_parameters = signature
+            .map(|signature| {
+                self.names
+                    .resolve_type_parameters(&signature.type_parameters)
+            })
+            .transpose()?
+            .unwrap_or_default();
         let instance_scope = declaration.kind != MethodModelKind::ClassInitializer
             && !declaration.modifiers.contains(&JavaModifier::Static);
         let lexical_owner = instance_scope.then_some(owner).flatten();
@@ -1100,7 +1107,7 @@ impl<'a> JavaTypeLowering<'a> {
                     .flatten()
             })
             .collect::<Vec<_>>();
-        let body = method
+        let mut body = method
             .failure
             .as_ref()
             .map(Self::failure_body)
@@ -1172,18 +1179,40 @@ impl<'a> JavaTypeLowering<'a> {
                 })
             })
             .transpose()?;
+        if declaration.override_semantics.is_none()
+            && (declaration.kind == MethodModelKind::Constructor
+                || declaration.modifiers.iter().any(|modifier| {
+                    matches!(
+                        modifier,
+                        JavaModifier::Final | JavaModifier::Private | JavaModifier::Static
+                    )
+                }))
+        {
+            if let Some(body) = body.as_mut() {
+                let throwable = self.names.resolve_type(&ArgType::throwable())?;
+                if !throws.contains(&throwable)
+                    && MergedThrowableRethrow::contains(body, &throwable)
+                {
+                    for parameter in &type_parameters {
+                        name_scope.reserve(parameter.name.clone());
+                    }
+                    let name = name_scope.claim(JavaIdentifier::from_hint("$dex$Thrown"));
+                    let variable = JavaType::Variable(name.clone());
+                    MergedThrowableRethrow::rewrite(body, &throwable, &variable);
+                    type_parameters.push(JavaTypeParameter {
+                        name,
+                        bounds: vec![throwable],
+                    });
+                    throws.push(variable);
+                }
+            }
+        }
         Ok(JavaMethodDeclaration {
             annotations,
             modifiers: declaration.modifiers.clone(),
             compiler_generated: declaration.access_flags.is_synthetic(),
             kind: method_kind(declaration.kind),
-            type_parameters: signature
-                .map(|signature| {
-                    self.names
-                        .resolve_type_parameters(&signature.type_parameters)
-                })
-                .transpose()?
-                .unwrap_or_default(),
+            type_parameters,
             return_type,
             name: (!declaration.kind.is_class_initializer()).then(|| {
                 if declaration.kind == MethodModelKind::Method {
@@ -1486,6 +1515,174 @@ impl<'a> JavaTypeLowering<'a> {
     }
 }
 
+/// Legalizes a DEX catch-all value that crosses several handler scopes before
+/// being rethrown. Java's precise-rethrow rule only applies to catch parameters,
+/// so the merged `Throwable` local otherwise requires `throws Throwable` even
+/// when the original method has a narrower source contract.
+struct MergedThrowableRethrow;
+
+impl MergedThrowableRethrow {
+    fn contains(body: &JavaMethodBody, throwable: &JavaType) -> bool {
+        let mut locals = std::collections::BTreeSet::new();
+        Self::collect_locals(&body.root, throwable, &mut locals);
+        Self::contains_throw(&body.root, &locals)
+    }
+
+    fn rewrite(body: &mut JavaMethodBody, throwable: &JavaType, target: &JavaType) {
+        let mut locals = std::collections::BTreeSet::new();
+        Self::collect_locals(&body.root, throwable, &mut locals);
+        Self::rewrite_throws(&mut body.root, &locals, target);
+    }
+
+    fn collect_locals(
+        statement: &JavaStmt,
+        throwable: &JavaType,
+        locals: &mut std::collections::BTreeSet<JavaIdentifier>,
+    ) {
+        if let JavaStmt::Variable { ty, name, .. } = statement {
+            if ty == throwable {
+                locals.insert(name.clone());
+            }
+        }
+        Self::visit_children(statement, &mut |child| {
+            Self::collect_locals(child, throwable, locals)
+        });
+    }
+
+    fn contains_throw(
+        statement: &JavaStmt,
+        locals: &std::collections::BTreeSet<JavaIdentifier>,
+    ) -> bool {
+        if matches!(statement, JavaStmt::Throw(JavaExpr::Name(name)) if locals.contains(name)) {
+            return true;
+        }
+        let mut found = false;
+        Self::visit_children(statement, &mut |child| {
+            found |= Self::contains_throw(child, locals)
+        });
+        found
+    }
+
+    fn rewrite_throws(
+        statement: &mut JavaStmt,
+        locals: &std::collections::BTreeSet<JavaIdentifier>,
+        target: &JavaType,
+    ) {
+        if let JavaStmt::Throw(JavaExpr::Name(name)) = statement {
+            if locals.contains(name) {
+                let value = JavaExpr::Name(name.clone());
+                *statement = JavaStmt::Throw(JavaExpr::Cast {
+                    ty: target.clone(),
+                    value: Box::new(value),
+                });
+                return;
+            }
+        }
+        Self::visit_children_mut(statement, &mut |child| {
+            Self::rewrite_throws(child, locals, target)
+        });
+    }
+
+    fn visit_children(statement: &JavaStmt, visit: &mut impl FnMut(&JavaStmt)) {
+        match statement {
+            JavaStmt::Block(statements) => statements.iter().for_each(visit),
+            JavaStmt::Labeled { body, .. }
+            | JavaStmt::While { body, .. }
+            | JavaStmt::DoWhile { body, .. }
+            | JavaStmt::For { body, .. }
+            | JavaStmt::ForEach { body, .. }
+            | JavaStmt::Synchronized { body, .. } => visit(body),
+            JavaStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                visit(then_stmt);
+                if let Some(else_stmt) = else_stmt {
+                    visit(else_stmt);
+                }
+            }
+            JavaStmt::Switch { cases, .. } => {
+                cases.iter().flat_map(|case| &case.body).for_each(visit);
+            }
+            JavaStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                visit(body);
+                catches
+                    .iter()
+                    .map(|catch| &catch.body)
+                    .for_each(&mut *visit);
+                if let Some(finally) = finally {
+                    visit(finally);
+                }
+            }
+            JavaStmt::Empty
+            | JavaStmt::Variable { .. }
+            | JavaStmt::Expression(_)
+            | JavaStmt::ConstructorInvocation { .. }
+            | JavaStmt::Assign { .. }
+            | JavaStmt::Return(_)
+            | JavaStmt::Throw(_)
+            | JavaStmt::Break(_)
+            | JavaStmt::Continue(_) => {}
+        }
+    }
+
+    fn visit_children_mut(statement: &mut JavaStmt, visit: &mut impl FnMut(&mut JavaStmt)) {
+        match statement {
+            JavaStmt::Block(statements) => statements.iter_mut().for_each(visit),
+            JavaStmt::Labeled { body, .. }
+            | JavaStmt::While { body, .. }
+            | JavaStmt::DoWhile { body, .. }
+            | JavaStmt::For { body, .. }
+            | JavaStmt::ForEach { body, .. }
+            | JavaStmt::Synchronized { body, .. } => visit(body),
+            JavaStmt::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                visit(then_stmt);
+                if let Some(else_stmt) = else_stmt {
+                    visit(else_stmt);
+                }
+            }
+            JavaStmt::Switch { cases, .. } => {
+                cases
+                    .iter_mut()
+                    .flat_map(|case| &mut case.body)
+                    .for_each(visit);
+            }
+            JavaStmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                visit(body);
+                catches
+                    .iter_mut()
+                    .map(|catch| &mut catch.body)
+                    .for_each(&mut *visit);
+                if let Some(finally) = finally {
+                    visit(finally);
+                }
+            }
+            JavaStmt::Empty
+            | JavaStmt::Variable { .. }
+            | JavaStmt::Expression(_)
+            | JavaStmt::ConstructorInvocation { .. }
+            | JavaStmt::Assign { .. }
+            | JavaStmt::Return(_)
+            | JavaStmt::Throw(_)
+            | JavaStmt::Break(_)
+            | JavaStmt::Continue(_) => {}
+        }
+    }
+}
+
 fn type_kind(kind: JavaClassKind) -> JavaTypeDeclarationKind {
     match kind {
         JavaClassKind::Class => JavaTypeDeclarationKind::Class,
@@ -1508,6 +1705,55 @@ mod tests {
     use super::*;
     use crate::ir::generic_types::GenericSignatures;
     use crate::language::java::GenericTypeProjection;
+
+    #[test]
+    fn merged_throwable_rethrow_uses_generic_cast_but_catch_parameter_does_not() {
+        let throwable = JavaType::source_class("Throwable");
+        let merged = JavaIdentifier::from_hint("merged");
+        let caught = JavaIdentifier::from_hint("caught");
+        let target = JavaType::Variable(JavaIdentifier::from_hint("T"));
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![
+                JavaStmt::Variable {
+                    ty: throwable.clone(),
+                    name: merged.clone(),
+                    value: None,
+                },
+                JavaStmt::Try {
+                    body: Box::new(JavaStmt::Throw(JavaExpr::Name(merged.clone()))),
+                    catches: vec![crate::language::java::JavaCatch {
+                        types: vec![throwable.clone()],
+                        variable: caught.clone(),
+                        body: JavaStmt::Throw(JavaExpr::Name(caught.clone())),
+                    }],
+                    finally: None,
+                },
+            ]),
+        };
+
+        assert!(MergedThrowableRethrow::contains(&body, &throwable));
+        MergedThrowableRethrow::rewrite(&mut body, &throwable, &target);
+
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let JavaStmt::Try {
+            body: try_body,
+            catches,
+            ..
+        } = &statements[1]
+        else {
+            panic!("expected try statement");
+        };
+        assert_eq!(
+            try_body.as_ref(),
+            &JavaStmt::Throw(JavaExpr::Cast {
+                ty: target,
+                value: Box::new(JavaExpr::Name(merged)),
+            })
+        );
+        assert_eq!(catches[0].body, JavaStmt::Throw(JavaExpr::Name(caught)));
+    }
 
     #[test]
     fn annotation_header_omits_jvm_generics_and_marker_interface() {
