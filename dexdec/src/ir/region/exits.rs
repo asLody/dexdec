@@ -402,10 +402,11 @@ impl<'a> RegionExitAnalysis<'a> {
     }
 
     /// A nested compiler cleanup can forward its caught exception directly
-    /// into an enclosing source-level finally body. Once that finally is
-    /// represented lexically, retaining the physical edge as a fallthrough
-    /// would execute the cleanup and then jump back to its entry. Model the
-    /// proven cleanup handler's logical completion as a rethrow instead.
+    /// into an enclosing cleanup handler. Once that handler is represented
+    /// lexically as a finally or catch-all cleanup, its physical entry no
+    /// longer denotes an ordinary source continuation (and a finally could be
+    /// replayed). Model the proven cleanup handler's logical completion as a
+    /// rethrow instead.
     fn forwarded_cleanup_throw(
         &self,
         transfer: &RegionTransfer,
@@ -428,14 +429,29 @@ impl<'a> RegionExitAnalysis<'a> {
         let destination = self.tree.region(transfer.destination_region).ok_or(
             RegionInvariantError::UnknownRegion(transfer.destination_region),
         )?;
-        if !matches!(&destination.kind, RegionKind::Finally)
-            || destination.entry != Some(transfer.destination_block)
-        {
+        if destination.entry != Some(transfer.destination_block) {
             return Ok(None);
         }
         let target = transfer.exit_destination(self.tree.root());
-        let cleanups = self.cleanup_chain(transfer.source_region, target)?;
-        if !cleanups.contains(&transfer.destination_region) {
+        let forwarded_handler = if matches!(&destination.kind, RegionKind::Finally) {
+            self.cleanup_chain(transfer.source_region, target)?
+                .contains(&transfer.destination_region)
+        } else if matches!(&destination.kind, RegionKind::Cleanup(_)) {
+            let mut attached = false;
+            for (owner, handlers) in self.handlers {
+                if handlers.contains(&transfer.destination_region)
+                    && (*owner == transfer.source_region
+                        || self.tree.is_ancestor(*owner, transfer.source_region)?)
+                {
+                    attached = true;
+                    break;
+                }
+            }
+            attached
+        } else {
+            false
+        };
+        if !forwarded_handler {
             return Ok(None);
         }
         Ok(cleanup.exception_value.clone())
@@ -798,6 +814,29 @@ mod tests {
 
     #[test]
     fn cleanup_forwarding_to_enclosing_finally_is_a_rethrow() {
+        let (leaves, exception, handler) = cleanup_forwarding_leaves(true);
+        let forwarded = forwarded_cleanup_leave(&leaves);
+        assert!(matches!(
+            &forwarded.leave.exit,
+            RegionExit::Throw(InsnArg::Reg(value)) if value == &exception
+        ));
+        assert_eq!(forwarded.cleanup_regions, vec![handler]);
+    }
+
+    #[test]
+    fn cleanup_forwarding_to_enclosing_cleanup_is_a_rethrow() {
+        let (leaves, exception, _) = cleanup_forwarding_leaves(false);
+        let forwarded = forwarded_cleanup_leave(&leaves);
+        assert!(matches!(
+            &forwarded.leave.exit,
+            RegionExit::Throw(InsnArg::Reg(value)) if value == &exception
+        ));
+        assert!(forwarded.cleanup_regions.is_empty());
+    }
+
+    fn cleanup_forwarding_leaves(
+        source_level_finally: bool,
+    ) -> (Vec<ResolvedRegionExit>, RegisterArg, RegionId) {
         let source = BlockId::new(0);
         let finally_entry = BlockId::new(1);
         let exception = RegisterArg::new_ssa(0, 0, ArgType::throwable());
@@ -829,8 +868,17 @@ mod tests {
                 Some(source),
             )
             .unwrap();
+        let destination_kind = if source_level_finally {
+            RegionKind::Finally
+        } else {
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: Some(exception.clone()),
+                continuation: None,
+            })
+        };
         let finally_region = tree
-            .add_child(root, RegionKind::Finally, Some(finally_entry))
+            .add_child(root, destination_kind, Some(finally_entry))
             .unwrap();
         for region in [outer, inner, adapter_region] {
             tree.add_block(region, source).unwrap();
@@ -854,15 +902,14 @@ mod tests {
         .unwrap()
         .leaves;
 
-        let forwarded = leaves
+        (leaves, exception, finally_region)
+    }
+
+    fn forwarded_cleanup_leave(leaves: &[ResolvedRegionExit]) -> &ResolvedRegionExit {
+        leaves
             .iter()
-            .find(|leave| leave.leave.source_block == Some(source))
-            .expect("cleanup adapter leave");
-        assert!(matches!(
-            &forwarded.leave.exit,
-            RegionExit::Throw(InsnArg::Reg(value)) if value == &exception
-        ));
-        assert_eq!(forwarded.cleanup_regions, vec![finally_region]);
+            .find(|leave| leave.leave.source_block == Some(BlockId::new(0)))
+            .expect("cleanup adapter leave")
     }
 
     #[test]
