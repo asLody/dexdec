@@ -1704,10 +1704,21 @@ impl SynchronizationPlacement {
         &self,
         tree: &mut RegionTree,
     ) -> Result<(), RegionInvariantError> {
+        let owner_ancestors = tree
+            .parent_chain(self.owner)?
+            .into_iter()
+            .skip(1)
+            .collect::<BTreeSet<_>>();
         let contained = tree
             .regions
             .values()
             .filter(|region| region.id != tree.root && region.id != self.owner)
+            // An enclosing try can cover exactly the synchronized body while
+            // providing source catches outside the monitor. It contains the
+            // same blocks, but moving it below its own synchronized child
+            // creates a parent cycle and inverts the release-before-catch
+            // semantics.
+            .filter(|region| !owner_ancestors.contains(&region.id))
             .filter(|region| !region.blocks.is_empty() && region.blocks.is_subset(&self.blocks))
             .map(|region| region.id)
             .collect::<BTreeSet<_>>();
@@ -1813,6 +1824,46 @@ mod tests {
             .unwrap();
         tree.region_mut(id).unwrap().blocks = blocks(body);
         id
+    }
+
+    #[test]
+    fn synchronization_reparenting_preserves_coincident_try_ancestor() {
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let outer_try = add_region(&mut tree, root, RegionKind::Try, 1, [1, 2]);
+        let owner = add_region(&mut tree, outer_try, RegionKind::Try, 1, [1, 2]);
+        let contained = add_region(
+            &mut tree,
+            outer_try,
+            RegionKind::Loop(LoopRegion {
+                follow: None,
+                latches: blocks([2]),
+            }),
+            2,
+            [2],
+        );
+        let placement = SynchronizationPlacement {
+            owner,
+            enter: BlockId::new(0),
+            lock: InsnArg::Reg(RegisterArg::new(
+                0,
+                ArgType::object("java/lang/Object"),
+            )),
+            entry: BlockId::new(1),
+            blocks: blocks([1, 2]),
+            release_handlers: BTreeSet::new(),
+            user_handlers: BTreeSet::new(),
+            release_segments: BTreeSet::new(),
+            duplicate_handlers: Vec::new(),
+            method: false,
+        };
+
+        placement.reparent_contained_regions(&mut tree).unwrap();
+
+        assert_eq!(tree.region(outer_try).unwrap().parent, Some(root));
+        assert_eq!(tree.region(owner).unwrap().parent, Some(outer_try));
+        assert_eq!(tree.region(contained).unwrap().parent, Some(owner));
+        assert_eq!(tree.parent_chain(owner).unwrap(), vec![owner, outer_try, root]);
     }
 
     #[test]
