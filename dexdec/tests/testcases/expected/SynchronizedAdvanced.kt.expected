@@ -131,16 +131,15 @@ public open class SynchronizedAdvanced {
 
         public fun syncWithFinally(p0: Int): Int {
             synchronized(SynchronizedAdvanced.lock1!!) {
-                var result: Int
+                var value: Int
                 try {
-                    result = 100 / p0
+                    value = 100 / p0
                 } catch (exception: ArithmeticException) {
-                    result = -1
-                    return result
+                    return -1
                 } finally {
                     SynchronizedAdvanced.value = 0
                 }
-                return result
+                return value
             }
         }
 

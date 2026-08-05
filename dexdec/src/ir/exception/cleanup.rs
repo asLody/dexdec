@@ -1487,6 +1487,7 @@ impl<'a> CleanupProof<'a> {
                             .map(|(handler, normal)| (handler, 0, normal, 0)),
                     );
                 }
+                let prior_values = self.values.clone();
                 if !self.instruction(handler_insn, normal_insn) {
                     return self.reject(
                         handler,
@@ -1496,6 +1497,12 @@ impl<'a> CleanupProof<'a> {
                         CleanupMismatchReason::Instruction,
                     );
                 }
+                // The normal cleanup copy is elided after this proof, so
+                // values consumed by the two observable operations must be
+                // represented by the same source variable. Branch operands
+                // are recorded by `branch_relation`; straight-line cleanup
+                // operations need the same treatment here.
+                self.record_state_bindings(&prior_values);
                 if handler != normal {
                     self.matched_normal.insert(StatementOrigin {
                         block: normal,
@@ -2371,5 +2378,52 @@ mod tests {
             CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
         assert!(proof.bind_block(handler, observable));
         assert!(!proof.bind_block(handler, target));
+    }
+
+    #[test]
+    fn straight_line_cleanup_records_observable_argument_binding() {
+        let handler = BlockId::new(0);
+        let normal = BlockId::new(1);
+        let handler_value = RegisterArg::new_ssa(
+            1,
+            7,
+            ArgType::object("java/io/Closeable"),
+        );
+        let normal_value = RegisterArg::new_ssa(
+            12,
+            3,
+            ArgType::object("java/io/Closeable"),
+        );
+        let mut cfg = CFG::new("cleanup_straight_line_state");
+        let mut handler_block = Block::new(handler);
+        handler_block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![InsnArg::Reg(handler_value.clone())],
+        ));
+        cfg.add_block(handler_block);
+        let mut normal_block = Block::new(normal);
+        normal_block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![InsnArg::Reg(normal_value.clone())],
+        ));
+        cfg.add_block(normal_block);
+
+        let values = SsaValueGraph::default();
+        let origins = SsaOrigins::analyze(&values);
+        let handler_blocks = BTreeSet::from([handler]);
+        let rethrow_blocks = BTreeSet::from([handler]);
+        let mut proof =
+            CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
+
+        assert!(proof.compare(handler, normal).expect("cleanup proof"));
+        assert_eq!(
+            proof.value_bindings(),
+            BTreeSet::from([(
+                SsaVar::from_reg(&handler_value).expect("handler SSA value"),
+                SsaVar::from_reg(&normal_value).expect("normal SSA value"),
+            )])
+        );
     }
 }
