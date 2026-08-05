@@ -20,7 +20,7 @@ use super::{
 
 pub(super) struct RegionChildren {
     pub(super) ordinary: Vec<RegionId>,
-    pub(super) handlers: BTreeSet<RegionId>,
+    pub(super) handlers: Vec<RegionId>,
     pub(super) releases: BTreeSet<RegionId>,
 }
 
@@ -30,7 +30,11 @@ impl RegionChildren {
         graph: &RegionGraph,
         region: &StructuredRegion,
     ) -> Result<Self, StructureError> {
-        let mut handlers = BTreeSet::new();
+        // DEX handler order is semantic: a typed catch must remain before a
+        // later catch-all clause. Region ids describe construction order and
+        // cannot be used to sort catch clauses.
+        let mut handlers = Vec::new();
+        let mut seen_handlers = BTreeSet::new();
         for handler in graph.handlers_of(region.id).iter().copied() {
             if graph
                 .tree()
@@ -39,7 +43,9 @@ impl RegionChildren {
             {
                 continue;
             }
-            handlers.insert(handler);
+            if seen_handlers.insert(handler) {
+                handlers.push(handler);
+            }
         }
         let mut releases = graph
             .handlers_of(region.id)
@@ -50,7 +56,11 @@ impl RegionChildren {
         if let RegionKind::Synchronized(synchronized) = &region.kind {
             releases.extend(synchronized.release_handlers.iter().copied());
         }
-        handlers.extend(releases.iter().copied());
+        for release in releases.iter().copied() {
+            if seen_handlers.insert(release) {
+                handlers.push(release);
+            }
+        }
         let handler_reducer = HandlerReducer::new(graph);
         let handler_bodies = handlers
             .iter()
