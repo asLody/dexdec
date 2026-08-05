@@ -505,7 +505,6 @@ impl RequiredPhiValues {
         graph: &SsaValueGraph,
         root: &SemanticNode,
         constants: &BTreeMap<SsaVar, InsnArg>,
-        recovered: &BTreeSet<SsaVar>,
         contractions: &ControlContractions,
     ) -> Result<BTreeSet<SsaVar>, SourceVariableError> {
         let mut collector = Self {
@@ -520,7 +519,13 @@ impl RequiredPhiValues {
         let edge_arguments = ContractedEdgeArguments::new(cfg, graph, constants, contractions);
         while let Some(value) = pending.pop() {
             if !visited.insert(value)
-                || (recovered.contains(&value) && materialized.contains(&value))
+                // A semantic statement owns its rewritten dependencies. In
+                // particular, gated value recovery can replace a CFG move
+                // from a Phi with a Select expression while retaining the
+                // move's result identity. Following the stale CFG operand
+                // would lower that already-recovered Phi a second time and
+                // place copies before the Select's branch definitions.
+                || materialized.contains(&value)
                 || PhiCopies::canonical_constant(constants, value).is_some()
             {
                 continue;
@@ -2835,6 +2840,67 @@ mod tests {
             PhiTypeResolver::new(&cfg, &values, &types, &constants, &hierarchy, &resolved);
 
         assert_eq!(resolver.physical_type(moved_value), Some(ArgType::BOOLEAN));
+    }
+
+    #[test]
+    fn semantic_select_definition_does_not_rematerialize_its_cfg_phi() {
+        let entry = BlockId::new(0);
+        let left_block = BlockId::new(1);
+        let right_block = BlockId::new(2);
+        let join = BlockId::new(3);
+        let left = RegisterArg::new_ssa(1, 0, ArgType::INT);
+        let right = RegisterArg::new_ssa(1, 1, ArgType::INT);
+        let phi_result = RegisterArg::new_ssa(1, 2, ArgType::INT);
+        let moved = RegisterArg::new_ssa(3, 0, ArgType::INT);
+        let phi_value = SsaVar::from_reg(&phi_result).expect("phi SSA value");
+
+        let mut cfg = CFG::new("recovered_select_move");
+        cfg.entry = entry;
+        cfg.add_block(Block::new(entry));
+        let mut left_body = Block::new(left_block);
+        left_body.push(InsnNode::const_value(left.clone(), 1));
+        cfg.add_block(left_body);
+        let mut right_body = Block::new(right_block);
+        right_body.push(InsnNode::const_value(right.clone(), 2));
+        cfg.add_block(right_body);
+        let mut join_body = Block::new(join);
+        join_body.push(InsnNode::phi(
+            phi_result.clone(),
+            vec![
+                (left_block.raw(), InsnArg::Reg(left.clone())),
+                (right_block.raw(), InsnArg::Reg(right.clone())),
+            ],
+        ));
+        join_body.push(InsnNode::move_insn(moved.clone(), InsnArg::Reg(phi_result)));
+        cfg.add_block(join_body);
+        cfg.add_edge(entry, left_block, EdgeKind::True);
+        cfg.add_edge(entry, right_block, EdgeKind::False);
+        cfg.add_edge(left_block, join, EdgeKind::Normal);
+        cfg.add_edge(right_block, join, EdgeKind::Normal);
+
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let root = SemanticNode::BasicBlock(SemanticBlock {
+            id: join,
+            statements: vec![SemanticStatement::definition(
+                InstructionId::new(7),
+                moved,
+                SemanticExpression::select(
+                    crate::ir::SemanticPredicate::True,
+                    SemanticExpression::Register(left),
+                    SemanticExpression::Register(right),
+                ),
+            )],
+        });
+        let required = RequiredPhiValues::collect(
+            &cfg,
+            &values,
+            &root,
+            &BTreeMap::new(),
+            &ControlContractions::identity(),
+        )
+        .expect("required Phi analysis");
+
+        assert!(!required.contains(&phi_value));
     }
 
     #[test]

@@ -23,6 +23,13 @@ pub struct ControlContractions {
 }
 
 impl ControlContractions {
+    #[cfg(test)]
+    pub(crate) fn identity() -> Self {
+        Self {
+            domains: Vec::new(),
+        }
+    }
+
     pub fn from_regions(regions: &RegionGraph) -> Self {
         ContractionGraph::new(Self::region_relations(regions)).solve(CyclePolicy::Canonical)
     }
