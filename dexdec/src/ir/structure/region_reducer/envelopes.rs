@@ -29,7 +29,12 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
                 .filter_map(|(region, count)| (count > 1).then_some(region))
                 .collect::<Vec<_>>();
             if duplicates.is_empty() {
-                return self.merge_families(root);
+                let root = self.merge_families(root)?;
+                return ExternalMonitorHandlerPlacement::apply(
+                    self.cfg,
+                    self.regions.tree(),
+                    root,
+                );
             }
 
             let mut changed = false;
@@ -50,7 +55,12 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
                 }
             }
             if !changed {
-                return self.merge_families(root);
+                let root = self.merge_families(root)?;
+                return ExternalMonitorHandlerPlacement::apply(
+                    self.cfg,
+                    self.regions.tree(),
+                    root,
+                );
             }
         }
     }
@@ -1083,6 +1093,205 @@ impl SemanticFolder for SynchronizedEnvelopePlacement {
     }
 }
 
+/// A source-level handler outside an explicit synchronized statement runs only
+/// after the synthetic monitor-release handler has completed. Exception-region
+/// partitioning can leave such a handler attached to a try fragment nested in
+/// the recovered synchronized region. Keep the protected fragment, but move
+/// its source handler envelope outside the monitor scope.
+struct ExternalMonitorHandlerPlacement<'cfg, 'tree> {
+    cfg: &'cfg CFG,
+    tree: &'tree crate::ir::RegionTree,
+    changed: bool,
+}
+
+enum ExternalEnvelopePlan {
+    Direct,
+    Sequence(usize),
+}
+
+impl<'cfg, 'tree> ExternalMonitorHandlerPlacement<'cfg, 'tree> {
+    fn apply(
+        cfg: &'cfg CFG,
+        tree: &'tree crate::ir::RegionTree,
+        mut root: SemanticNode,
+    ) -> Result<SemanticNode, StructureError> {
+        loop {
+            let mut placement = Self {
+                cfg,
+                tree,
+                changed: false,
+            };
+            root = placement.fold_node(root)?;
+            if !placement.changed {
+                return Ok(root);
+            }
+        }
+    }
+
+    fn plan(
+        &self,
+        synchronized: RegionId,
+        body: &SemanticNode,
+    ) -> Result<Option<ExternalEnvelopePlan>, StructureError> {
+        if self.external_envelope(synchronized, body)? {
+            return Ok(Some(ExternalEnvelopePlan::Direct));
+        }
+        let SemanticNode::Sequence(nodes) = body else {
+            return Ok(None);
+        };
+        let mut candidate = None;
+        for (index, node) in nodes.iter().enumerate() {
+            if self.external_envelope(synchronized, node)? {
+                let SemanticNode::Try { finally: None, .. } = node else {
+                    return Ok(None);
+                };
+                if candidate.replace(index).is_some() {
+                    return Ok(None);
+                }
+            } else if !self.non_throwing(node) {
+                return Ok(None);
+            }
+        }
+        Ok(candidate.map(ExternalEnvelopePlan::Sequence))
+    }
+
+    fn external_envelope(
+        &self,
+        synchronized: RegionId,
+        node: &SemanticNode,
+    ) -> Result<bool, StructureError> {
+        let SemanticNode::Try {
+            region,
+            catches,
+            finally,
+            ..
+        } = node
+        else {
+            return Ok(false);
+        };
+        if !self
+            .tree
+            .is_ancestor(synchronized, *region)
+            .map_err(StructureError::from)?
+        {
+            return Ok(false);
+        }
+        let handlers = catches
+            .iter()
+            .map(|catch| catch.region)
+            .chain(finally.as_ref().map(|finally| finally.region))
+            .collect::<Vec<_>>();
+        if handlers.is_empty() {
+            return Ok(false);
+        }
+        for handler in handlers {
+            if self
+                .tree
+                .is_ancestor(synchronized, handler)
+                .map_err(StructureError::from)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn non_throwing(&self, node: &SemanticNode) -> bool {
+        match node {
+            SemanticNode::Empty => true,
+            SemanticNode::BasicBlock(block) => self.cfg.block(block.id).is_some_and(|source| {
+                source
+                    .insns
+                    .iter()
+                    .all(|instruction| !instruction.can_throw())
+                    && self
+                        .cfg
+                        .successors_with_kind(block.id)
+                        .iter()
+                        .all(|(_, kind)| !kind.is_exception())
+            }),
+            SemanticNode::Sequence(nodes) => nodes.iter().all(|node| self.non_throwing(node)),
+            _ => false,
+        }
+    }
+}
+
+impl SemanticFolder for ExternalMonitorHandlerPlacement<'_, '_> {
+    type Error = StructureError;
+
+    fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
+        let SemanticNode::Synchronized {
+            region,
+            lock,
+            method,
+            body,
+        } = node
+        else {
+            return Ok(node);
+        };
+        if method {
+            return Ok(SemanticNode::Synchronized {
+                region,
+                lock,
+                method,
+                body,
+            });
+        }
+        let Some(plan) = self.plan(region, &body)? else {
+            return Ok(SemanticNode::Synchronized {
+                region,
+                lock,
+                method,
+                body,
+            });
+        };
+
+        let (try_region, synchronized_body, catches, finally) = match (plan, *body) {
+            (
+                ExternalEnvelopePlan::Direct,
+                SemanticNode::Try {
+                    region: try_region,
+                    body: try_body,
+                    catches,
+                    finally,
+                },
+            ) => (try_region, *try_body, catches, finally),
+            (ExternalEnvelopePlan::Sequence(index), SemanticNode::Sequence(mut nodes)) => {
+                let SemanticNode::Try {
+                    region: try_region,
+                    body: try_body,
+                    catches,
+                    finally,
+                } = nodes.remove(index)
+                else {
+                    unreachable!("external envelope plan must select a try node");
+                };
+                nodes.insert(index, *try_body);
+                (
+                    try_region,
+                    SemanticNode::sequence(nodes),
+                    catches,
+                    finally,
+                )
+            }
+            _ => unreachable!("external envelope plan must match synchronized body"),
+        };
+
+        self.changed = true;
+        Ok(SemanticNode::Try {
+            region: try_region,
+            body: Box::new(SemanticNode::Synchronized {
+                region,
+                lock,
+                method,
+                body: Box::new(synchronized_body),
+            }),
+            catches,
+            finally,
+        })
+    }
+}
+
 enum EnvelopeSet {
     None,
     One(ExceptionEnvelope),
@@ -1102,7 +1311,11 @@ impl EnvelopeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{SemanticLeave, SemanticLoopKind, SemanticLoopTest, SemanticPredicate};
+    use crate::ir::{
+        ArgType, Block, CatchRegion, InsnArg, InsnNode, RegionKind, RegisterArg, SemanticBlock,
+        SemanticExpression, SemanticLeave, SemanticLoopKind, SemanticLoopTest, SemanticOperand,
+        SemanticPredicate, SynchronizedRegion,
+    };
 
     fn control_leave(region: RegionId, kind: SemanticLeaveKind) -> SemanticNode {
         SemanticNode::Leave(SemanticLeave {
@@ -1166,5 +1379,100 @@ mod tests {
         );
 
         assert!(envelope.can_wrap(&loop_node(loop_region, SemanticNode::Empty)));
+    }
+
+    fn synchronized_try_with_catch(
+        catch_inside_monitor: bool,
+    ) -> (CFG, crate::ir::RegionTree, SemanticNode) {
+        let mut tree = crate::ir::RegionTree::new(Some(crate::ir::BlockId::new(0)));
+        let root = tree.root();
+        let lock = RegisterArg::new_ssa(0, 0, ArgType::object("java/lang/Object"));
+        let prefix_value = RegisterArg::new_ssa(1, 0, ArgType::INT);
+        let prefix = crate::ir::BlockId::new(4);
+        let mut prefix_block = Block::new(prefix.raw());
+        prefix_block.push(InsnNode::const_val(prefix_value, 0, ArgType::INT));
+        let mut cfg = CFG::new("external_monitor_handler_placement");
+        cfg.entry = prefix;
+        cfg.add_block(prefix_block);
+        let synchronized = tree
+            .add_child(
+                root,
+                RegionKind::Synchronized(SynchronizedRegion {
+                    lock: InsnArg::Reg(lock.clone()),
+                    method: false,
+                    release_handlers: BTreeSet::new(),
+                }),
+                Some(crate::ir::BlockId::new(1)),
+            )
+            .unwrap();
+        let protected = tree
+            .add_child(
+                synchronized,
+                RegionKind::Try,
+                Some(crate::ir::BlockId::new(2)),
+            )
+            .unwrap();
+        let catch_parent = if catch_inside_monitor {
+            synchronized
+        } else {
+            root
+        };
+        let catch = tree
+            .add_child(
+                catch_parent,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::object("java/lang/Exception")],
+                    exception_value: None,
+                    continuation: None,
+                }),
+                Some(crate::ir::BlockId::new(3)),
+            )
+            .unwrap();
+        let node = SemanticNode::Synchronized {
+            region: synchronized,
+            lock: SemanticOperand::new(SemanticExpression::Register(lock)),
+            method: false,
+            body: Box::new(SemanticNode::Sequence(vec![
+                SemanticNode::BasicBlock(SemanticBlock {
+                    id: prefix,
+                    statements: Vec::new(),
+                }),
+                SemanticNode::Try {
+                    region: protected,
+                    body: Box::new(SemanticNode::Empty),
+                    catches: vec![SemanticCatch {
+                        region: catch,
+                        exception_types: vec![ArgType::object("java/lang/Exception")],
+                        exception_value: None,
+                        body: SemanticNode::Empty,
+                    }],
+                    finally: None,
+                },
+            ])),
+        };
+        (cfg, tree, node)
+    }
+
+    #[test]
+    fn external_catch_is_hoisted_outside_explicit_synchronization() {
+        let (cfg, tree, node) = synchronized_try_with_catch(false);
+
+        let result = ExternalMonitorHandlerPlacement::apply(&cfg, &tree, node).unwrap();
+        let SemanticNode::Try { body, catches, .. } = result else {
+            panic!("external catch must wrap the monitor scope");
+        };
+        assert_eq!(catches.len(), 1);
+        assert!(matches!(*body, SemanticNode::Synchronized { .. }));
+    }
+
+    #[test]
+    fn catch_inside_synchronization_stays_inside_monitor_scope() {
+        let (cfg, tree, node) = synchronized_try_with_catch(true);
+
+        let result = ExternalMonitorHandlerPlacement::apply(&cfg, &tree, node).unwrap();
+        let SemanticNode::Synchronized { body, .. } = result else {
+            panic!("internal catch must stay inside the monitor scope");
+        };
+        assert!(matches!(*body, SemanticNode::Sequence(_)));
     }
 }
