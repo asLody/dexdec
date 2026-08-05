@@ -8,7 +8,7 @@ use crate::ir::{
 };
 
 use super::super::{
-    continuation::{ContinuationBinding, ControlPort, ControlTransfer},
+    continuation::{ContinuationBinding, ContinuationPort, ControlPort, ControlTransfer},
     StructureError,
 };
 use super::region_cfg::RegionCfg;
@@ -169,6 +169,49 @@ struct ExceptionValueSubstitution {
     thrown: RegisterArg,
 }
 
+struct ForwardedHandlerBody {
+    port: ContinuationPort,
+    body: SemanticNode,
+    replacements: usize,
+}
+
+impl ForwardedHandlerBody {
+    fn inline(
+        adapter: SemanticNode,
+        port: ContinuationPort,
+        body: SemanticNode,
+    ) -> Result<Option<SemanticNode>, StructureError> {
+        let mut forwarding = Self {
+            port,
+            body,
+            replacements: 0,
+        };
+        let candidate = forwarding
+            .fold_node(adapter)
+            .map_err(StructureError::from)?;
+        Ok((forwarding.replacements == 1).then_some(candidate))
+    }
+}
+
+impl SemanticFolder for ForwardedHandlerBody {
+    type Error = crate::ir::SemanticFoldError;
+
+    fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
+        let SemanticNode::Leave(leave) = &node else {
+            return Ok(node);
+        };
+        let target = match &leave.kind {
+            SemanticLeaveKind::FallThrough(target) | SemanticLeaveKind::Jump(target) => *target,
+            _ => return Ok(node),
+        };
+        if leave.target != self.port.scope || target != self.port.target {
+            return Ok(node);
+        }
+        self.replacements += 1;
+        Ok(self.body.clone())
+    }
+}
+
 impl SemanticExpressionTransform for ExceptionValueSubstitution {
     fn transform_register(&mut self, register: RegisterArg) -> SemanticExpression {
         if SsaVar::from_reg(&register) == Some(self.caught) {
@@ -292,6 +335,7 @@ impl<'a> HandlerReducer<'a> {
                 RegionKind::Catch(catch) => {
                     let body_region = self.body_region(owner, *child)?;
                     let (reduction, alternate) = self.reduction(reduced, body_region)?;
+                    let reduction = self.inline_forwarded_catch(*child, reduction, reduced)?;
                     envelope.catches.push(SemanticCatch {
                         region: *child,
                         exception_types: catch.exception_types,
@@ -363,6 +407,83 @@ impl<'a> HandlerReducer<'a> {
             }
         }
         Ok(HandlerContraction { envelope, ports })
+    }
+
+    /// DEX can split one source catch into register-state adapters that enter
+    /// a shared lexical body. Once exception analysis proves that relation,
+    /// retain the adapter path but bind its sole continuation to the already
+    /// reduced ancestor catch instead of exposing the body entry to the
+    /// enclosing ordinary control-flow graph.
+    fn inline_forwarded_catch(
+        &self,
+        handler: RegionId,
+        reduction: ReducedPort,
+        reduced: &BTreeMap<RegionId, ReducedRegion>,
+    ) -> Result<ReducedPort, StructureError> {
+        let Some((target_handler, target)) = self.forwarded_catch_target(handler)? else {
+            return Ok(reduction);
+        };
+        let forwarding = ContinuationPort {
+            scope: target_handler,
+            target,
+        };
+        if reduction.continuations.ports().len() != 1
+            || !reduction.continuations.ports().contains(&forwarding)
+            || !reduction.continuations.controls().is_empty()
+        {
+            return Ok(reduction);
+        }
+        let Some(target_body) = reduced
+            .get(&target_handler)
+            .and_then(|reduction| reduction.ports.get(&target))
+        else {
+            return Ok(reduction);
+        };
+        let original = reduction.body;
+        let Some(body) =
+            ForwardedHandlerBody::inline(original.clone(), forwarding, target_body.body.clone())?
+        else {
+            return Ok(ReducedPort::new(original));
+        };
+        Ok(ReducedPort::new(body))
+    }
+
+    pub(super) fn forwarded_catch_target(
+        &self,
+        handler: RegionId,
+    ) -> Result<Option<(RegionId, crate::ir::BlockId)>, StructureError> {
+        let tree = self.regions.tree();
+        let descriptor = tree
+            .region(handler)
+            .ok_or(StructureError::UnknownRegion(handler))?;
+        let RegionKind::Catch(source_catch) = &descriptor.kind else {
+            return Ok(None);
+        };
+        let Some(entry) = descriptor.entry else {
+            return Ok(None);
+        };
+        let Some(target) = self.regions.handler_adapters().get(&entry).copied() else {
+            return Ok(None);
+        };
+        let Some(target_handler) = self.regions.owner_of(target) else {
+            return Ok(None);
+        };
+        if !tree
+            .is_ancestor(target_handler, handler)
+            .map_err(|_| StructureError::UnknownRegion(target_handler))?
+        {
+            return Ok(None);
+        }
+        let target_descriptor = tree
+            .region(target_handler)
+            .ok_or(StructureError::UnknownRegion(target_handler))?;
+        let RegionKind::Catch(target_catch) = &target_descriptor.kind else {
+            return Ok(None);
+        };
+        Ok((target_descriptor.entry == Some(target)
+            && source_catch.exception_types == target_catch.exception_types
+            && source_catch.exception_value == target_catch.exception_value)
+            .then_some((target_handler, target)))
     }
 
     fn source_finally_body(
@@ -543,5 +664,75 @@ impl<'a> HandlerReducer<'a> {
         }
         .ok_or(StructureError::MissingControlTarget(port.target))?;
         Ok(Some((port, target)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{ForwardedHandlerBody, SemanticNode};
+    use crate::ir::structure::continuation::{ContinuationFacts, ContinuationPort};
+    use crate::ir::{BlockId, RegionId, SemanticBlock, SemanticLeave, SemanticLeaveKind};
+
+    fn fallthrough(scope: RegionId, target: BlockId) -> SemanticNode {
+        SemanticNode::Leave(SemanticLeave {
+            site: None,
+            condition: None,
+            kind: SemanticLeaveKind::FallThrough(target),
+            edge: None,
+            origin: None,
+            source: scope,
+            destination: scope,
+            target: scope,
+            cleanup: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn forwarded_handler_body_replaces_the_adapter_continuation() {
+        let handler = RegionId::new(5);
+        let enclosing = RegionId::new(0);
+        let entry = BlockId::new(65);
+        let continuation = BlockId::new(70);
+        let port = ContinuationPort {
+            scope: handler,
+            target: entry,
+        };
+        let adapter = SemanticNode::sequence([
+            SemanticNode::BasicBlock(SemanticBlock {
+                id: BlockId::new(58),
+                statements: Vec::new(),
+            }),
+            fallthrough(handler, entry),
+        ]);
+        let body = SemanticNode::sequence([
+            SemanticNode::BasicBlock(SemanticBlock {
+                id: entry,
+                statements: Vec::new(),
+            }),
+            fallthrough(enclosing, continuation),
+        ]);
+
+        let inlined = ForwardedHandlerBody::inline(adapter.clone(), port, body)
+            .expect("forwarding rewrite")
+            .expect("one matching adapter continuation");
+        assert_eq!(
+            ContinuationFacts::analyze(&inlined).ports(),
+            &BTreeSet::from([ContinuationPort {
+                scope: enclosing,
+                target: continuation,
+            }])
+        );
+        assert!(ForwardedHandlerBody::inline(
+            adapter,
+            ContinuationPort {
+                scope: handler,
+                target: BlockId::new(66),
+            },
+            SemanticNode::Empty,
+        )
+        .expect("non-matching rewrite")
+        .is_none());
     }
 }

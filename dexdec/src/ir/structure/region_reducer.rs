@@ -103,13 +103,23 @@ impl<'a> RegionReducer<'a> {
             pending.push((region, true));
             let children = RegionChildren::classify(self.cfg, self.regions, descriptor)?;
             let mut dependencies = children.ordinary;
-            dependencies.extend(
-                children
-                    .handlers
-                    .into_iter()
-                    .map(|handler| handlers.body_region(region, handler))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            for handler in children.handlers {
+                dependencies.push(handlers.body_region(region, handler)?);
+                if let Some((target, _)) = handlers.forwarded_catch_target(handler)? {
+                    // A split handler can be reduced before the shared catch
+                    // body it forwards into. Make that body an explicit
+                    // dependency unless it lexically contains this owner,
+                    // which would create a region cycle.
+                    if !self
+                        .regions
+                        .tree()
+                        .is_ancestor(target, region)
+                        .map_err(|_| StructureError::UnknownRegion(target))?
+                    {
+                        dependencies.push(target);
+                    }
+                }
+            }
             dependencies.sort();
             dependencies.dedup();
             pending.extend(dependencies.into_iter().rev().map(|child| (child, false)));
