@@ -934,14 +934,7 @@ impl SynchronizationPlacement {
         // source body. Nested release handlers remain lexically enclosed by
         // every outer synchronization, even though their inner owner elides
         // them during semantic lowering.
-        let own_release_blocks = release_handlers
-            .iter()
-            .flat_map(|handler| {
-                tree.region(*handler)
-                    .into_iter()
-                    .flat_map(|region| region.blocks.iter().copied())
-            })
-            .collect::<BTreeSet<_>>();
+        let own_release_blocks = Self::region_subtree_blocks(tree, &release_handlers)?;
         let user_handlers = handlers
             .iter()
             .copied()
@@ -1002,7 +995,7 @@ impl SynchronizationPlacement {
     }
 
     fn apply(
-        self,
+        mut self,
         tree: &mut RegionTree,
         cfg: &CFG,
         region_handlers: &BTreeMap<RegionId, Vec<RegionId>>,
@@ -1014,6 +1007,12 @@ impl SynchronizationPlacement {
         let handler_splits = self.preserve_user_handlers(tree, cfg, region_handlers)?;
         self.partition_handler_regions(tree, cfg)?;
         let splits = self.partition_try_regions(tree, cfg)?;
+        // Closing over a loop or switch can temporarily pull a synthetic
+        // release subtree back into the recovered source body. Once handler
+        // boundaries have been partitioned, exclude the final release tree so
+        // monitor-exit retries remain represented by `synchronized` itself.
+        let release_blocks = Self::region_subtree_blocks(tree, &self.release_handlers)?;
+        self.blocks.retain(|block| !release_blocks.contains(block));
         self.place_owner(tree)?;
         self.reparent_contained_regions(tree)?;
         self.mark_release_handlers(tree)?;
@@ -1035,6 +1034,26 @@ impl SynchronizationPlacement {
             splits,
             handler_splits,
         })
+    }
+
+    fn region_subtree_blocks(
+        tree: &RegionTree,
+        roots: &BTreeSet<RegionId>,
+    ) -> Result<BTreeSet<BlockId>, RegionInvariantError> {
+        let mut blocks = BTreeSet::new();
+        let mut pending = roots.iter().copied().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(region_id) = pending.pop() {
+            if !visited.insert(region_id) {
+                continue;
+            }
+            let region = tree
+                .region(region_id)
+                .ok_or(RegionInvariantError::UnknownRegion(region_id))?;
+            blocks.extend(region.blocks.iter().copied());
+            pending.extend(region.children.iter().copied());
+        }
+        Ok(blocks)
     }
 
     fn preserve_user_handlers(
@@ -1999,6 +2018,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(placement.blocks, blocks([1, 2, 3, 6, 7]));
+    }
+
+    #[test]
+    fn synchronization_excludes_release_blocks_reintroduced_by_control_closure() {
+        let mut cfg = CFG::new("synchronized_release_retry_loop");
+        for id in 0..=4 {
+            cfg.add_block(Block::new(id));
+        }
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let owner = add_region(&mut tree, root, RegionKind::Try, 1, [1, 2, 3, 4]);
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4],
+        );
+        let retry_loop = add_region(
+            &mut tree,
+            root,
+            RegionKind::Loop(LoopRegion {
+                follow: None,
+                latches: blocks([4]),
+            }),
+            3,
+            [3, 4],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::new(),
+            owner,
+            &[release],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3, 4]),
+            &blocks([4]),
+            &BTreeSet::from([retry_loop]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(tree.region(owner).unwrap().blocks, blocks([1, 2, 3]));
+        assert_eq!(tree.region(release).unwrap().blocks, blocks([4]));
+        tree.verify(&cfg).unwrap();
     }
 
     #[test]
