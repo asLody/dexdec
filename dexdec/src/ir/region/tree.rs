@@ -1267,7 +1267,7 @@ impl SynchronizationPlacement {
         // non-throwing closure can still pull those tails into an enclosing
         // try, which then only partially overlaps the recovered synchronized
         // body. Drop them before looking for a lexical cut.
-        Self::strip_external_handler_continuations(tree, &self.blocks)?;
+        Self::strip_external_handler_continuations(tree, cfg, &self.blocks)?;
         let mut candidates = tree
             .regions
             .values()
@@ -1397,8 +1397,10 @@ impl SynchronizationPlacement {
 
     fn strip_external_handler_continuations(
         tree: &mut RegionTree,
+        cfg: &CFG,
         sync_blocks: &BTreeSet<BlockId>,
     ) -> Result<(), RegionInvariantError> {
+        let predecessors = cfg.normal_predecessor_snapshot();
         let tries = tree
             .regions
             .values()
@@ -1435,10 +1437,34 @@ impl SynchronizationPlacement {
             if external.is_empty() {
                 continue;
             }
-            tree.region_mut(try_region)
-                .ok_or(RegionInvariantError::UnknownRegion(try_region))?
-                .blocks
-                .retain(|block| !external.contains(block));
+            let region = tree
+                .region_mut(try_region)
+                .ok_or(RegionInvariantError::UnknownRegion(try_region))?;
+            region.blocks.retain(|block| !external.contains(block));
+            // Catch continuations that restart a surrounding loop may also be
+            // the try's lexical entry (via entry_connectors). Dropping them
+            // without repairing entry leaves `entry` outside `blocks`.
+            if let Some(entry) = region.entry {
+                if !region.blocks.contains(&entry) {
+                    let remaining = region.blocks.clone();
+                    region.entry = remaining
+                        .iter()
+                        .copied()
+                        .filter(|block| {
+                            *block == cfg.entry
+                                || predecessors
+                                    .get(block)
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|predecessor| !remaining.contains(predecessor))
+                        })
+                        .min_by_key(|block| {
+                            cfg.block(*block)
+                                .map(|block| (block.offset, block.id.raw()))
+                                .unwrap_or((u32::MAX, block.raw()))
+                        });
+                }
+            }
         }
         Ok(())
     }
@@ -1971,10 +1997,7 @@ mod tests {
         let placement = SynchronizationPlacement {
             owner,
             enter: BlockId::new(0),
-            lock: InsnArg::Reg(RegisterArg::new(
-                0,
-                ArgType::object("java/lang/Object"),
-            )),
+            lock: InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object"))),
             entry: BlockId::new(1),
             blocks: blocks([1, 2]),
             release_handlers: BTreeSet::new(),
@@ -1989,7 +2012,10 @@ mod tests {
         assert_eq!(tree.region(outer_try).unwrap().parent, Some(root));
         assert_eq!(tree.region(owner).unwrap().parent, Some(outer_try));
         assert_eq!(tree.region(contained).unwrap().parent, Some(owner));
-        assert_eq!(tree.parent_chain(owner).unwrap(), vec![owner, outer_try, root]);
+        assert_eq!(
+            tree.parent_chain(owner).unwrap(),
+            vec![owner, outer_try, root]
+        );
     }
 
     #[test]
@@ -2149,7 +2175,11 @@ mod tests {
             Some(RegionKind::Synchronized(_))
         ));
         assert_eq!(tree.region(nested).unwrap().blocks, blocks([2, 3]));
-        assert!(!tree.region(nested).unwrap().blocks.contains(&BlockId::new(4)));
+        assert!(!tree
+            .region(nested)
+            .unwrap()
+            .blocks
+            .contains(&BlockId::new(4)));
     }
 
     #[test]
