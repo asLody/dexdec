@@ -30,11 +30,7 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
                 .collect::<Vec<_>>();
             if duplicates.is_empty() {
                 let root = self.merge_families(root)?;
-                return ExternalMonitorHandlerPlacement::apply(
-                    self.cfg,
-                    self.regions.tree(),
-                    root,
-                );
+                return self.finalize(root);
             }
 
             let mut changed = false;
@@ -56,13 +52,14 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
             }
             if !changed {
                 let root = self.merge_families(root)?;
-                return ExternalMonitorHandlerPlacement::apply(
-                    self.cfg,
-                    self.regions.tree(),
-                    root,
-                );
+                return self.finalize(root);
             }
         }
+    }
+
+    fn finalize(&self, root: SemanticNode) -> Result<SemanticNode, StructureError> {
+        let root = ExternalMonitorHandlerPlacement::apply(self.cfg, self.regions.tree(), root)?;
+        HandlerCleanupEnvelopePlacement::apply(self.regions, root)
     }
 
     fn merge_families(&self, mut root: SemanticNode) -> Result<SemanticNode, StructureError> {
@@ -1292,6 +1289,156 @@ impl SemanticFolder for ExternalMonitorHandlerPlacement<'_, '_> {
     }
 }
 
+/// A cleanup clause repeated around typed catch bodies is an outer lexical
+/// protection scope, not a sibling catch. Region reduction keeps the complete
+/// handler bodies here; nesting after envelope canonicalization prevents a
+/// shared coroutine handler tail from being moved outside the cleanup.
+struct HandlerCleanupEnvelopePlacement<'a> {
+    regions: &'a RegionGraph,
+}
+
+impl<'a> HandlerCleanupEnvelopePlacement<'a> {
+    fn apply(regions: &'a RegionGraph, root: SemanticNode) -> Result<SemanticNode, StructureError> {
+        Self { regions }.fold_node(root)
+    }
+
+    fn protects(&self, cleanup: RegionId, handler: RegionId) -> Result<bool, StructureError> {
+        for owner in self.regions.handler_owners(cleanup) {
+            if owner == handler
+                || self
+                    .regions
+                    .tree()
+                    .is_ancestor(handler, owner)
+                    .map_err(StructureError::from)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn nest(
+        region: RegionId,
+        body: Box<SemanticNode>,
+        mut catches: Vec<SemanticCatch>,
+        finally: Option<SemanticFinally>,
+    ) -> Result<SemanticNode, StructureError> {
+        let cleanup = catches
+            .pop()
+            .expect("outer cleanup nesting requires one cleanup clause");
+        let cleanup_key = EnvelopeKey {
+            catches: vec![cleanup.region],
+            finally: None,
+        };
+        Self::strip_redundant_cleanup(&mut catches, &cleanup_key)?;
+        let inner = SemanticNode::Try {
+            region,
+            body,
+            catches,
+            finally: None,
+        };
+        Ok(SemanticNode::Try {
+            region,
+            body: Box::new(inner),
+            catches: vec![cleanup],
+            finally,
+        })
+    }
+
+    fn strip_redundant_cleanup(
+        catches: &mut [SemanticCatch],
+        cleanup_key: &EnvelopeKey,
+    ) -> Result<(), StructureError> {
+        for catch in catches {
+            catch.body = StripEnvelopeFamily {
+                key: cleanup_key,
+            }
+            .fold_node(std::mem::replace(&mut catch.body, SemanticNode::Empty))?;
+        }
+        Ok(())
+    }
+}
+
+impl SemanticFolder for HandlerCleanupEnvelopePlacement<'_> {
+    type Error = StructureError;
+
+    fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
+        let SemanticNode::Try {
+            region,
+            mut body,
+            catches,
+            finally,
+        } = node
+        else {
+            return Ok(node);
+        };
+        let Some(cleanup) = catches.last().map(|catch| catch.region) else {
+            return Ok(SemanticNode::Try {
+                region,
+                body,
+                catches,
+                finally,
+            });
+        };
+        let cleanup_kind = self
+            .regions
+            .tree()
+            .region(cleanup)
+            .ok_or(StructureError::UnknownRegion(cleanup))?;
+        if finally.is_none()
+            && catches.len() == 1
+            && matches!(&cleanup_kind.kind, crate::ir::RegionKind::Cleanup(_))
+        {
+            if let SemanticNode::Try {
+                catches: inner_catches,
+                ..
+            } = body.as_mut()
+            {
+                let cleanup_key = EnvelopeKey {
+                    catches: vec![cleanup],
+                    finally: None,
+                };
+                Self::strip_redundant_cleanup(inner_catches, &cleanup_key)?;
+            }
+            return Ok(SemanticNode::Try {
+                region,
+                body,
+                catches,
+                finally,
+            });
+        }
+        if finally.is_some()
+            || !matches!(&cleanup_kind.kind, crate::ir::RegionKind::Cleanup(_))
+            || catches.len() < 2
+        {
+            return Ok(SemanticNode::Try {
+                region,
+                body,
+                catches,
+                finally,
+            });
+        }
+        for catch in &catches[..catches.len() - 1] {
+            let kind = self
+                .regions
+                .tree()
+                .region(catch.region)
+                .ok_or(StructureError::UnknownRegion(catch.region))?;
+            if !matches!(&kind.kind, crate::ir::RegionKind::Catch(_))
+                || !self.protects(cleanup, catch.region)?
+            {
+                return Ok(SemanticNode::Try {
+                    region,
+                    body,
+                    catches,
+                    finally,
+                });
+            }
+        }
+        Self::nest(region, body, catches, finally)
+    }
+}
+
 enum EnvelopeSet {
     None,
     One(ExceptionEnvelope),
@@ -1379,6 +1526,51 @@ mod tests {
         );
 
         assert!(envelope.can_wrap(&loop_node(loop_region, SemanticNode::Empty)));
+    }
+
+    #[test]
+    fn repeated_handler_cleanup_wraps_typed_catches() {
+        let region = RegionId::new(1);
+        let typed = RegionId::new(2);
+        let cleanup = RegionId::new(3);
+        let catches = vec![
+            SemanticCatch {
+                region: typed,
+                exception_types: vec![ArgType::object("java/lang/Exception")],
+                exception_value: None,
+                body: envelope(cleanup, SemanticNode::Empty)
+                    .attach(RegionId::new(4), SemanticNode::Empty),
+            },
+            SemanticCatch {
+                region: cleanup,
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                body: SemanticNode::Empty,
+            },
+        ];
+
+        let nested = HandlerCleanupEnvelopePlacement::nest(
+            region,
+            Box::new(SemanticNode::Empty),
+            catches,
+            None,
+        )
+        .unwrap();
+
+        let SemanticNode::Try {
+            body,
+            catches: outer,
+            ..
+        } = nested
+        else {
+            panic!("cleanup must form an outer try");
+        };
+        assert_eq!(outer[0].region, cleanup);
+        let SemanticNode::Try { catches: inner, .. } = *body else {
+            panic!("typed catches must remain on the inner try");
+        };
+        assert_eq!(inner[0].region, typed);
+        assert!(matches!(inner[0].body, SemanticNode::Empty));
     }
 
     fn synchronized_try_with_catch(
