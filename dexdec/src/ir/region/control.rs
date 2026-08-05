@@ -40,6 +40,12 @@ impl ControlCandidate {
         let closure = ControlRegionClosure::new(cfg, facts, tree, handlers, entry, &domain);
         let blocks = closure.close(&blocks, matches!(&kind, RegionKind::Loop(_)))?;
         Self::refresh_loop_follow(cfg, facts, &mut kind, &blocks);
+        // Domain clipping can drop the header when it sits outside the lexical
+        // owner of the body (e.g. loop header above a nested try). Inserting
+        // that truncated region would leave `entry` outside `blocks`.
+        if !blocks.contains(&entry) {
+            return Ok(());
+        }
         if Self::already_inserted(tree, &kind, entry, &blocks) {
             return Ok(());
         }
@@ -55,6 +61,9 @@ impl ControlCandidate {
                 let closure = ControlRegionClosure::new(cfg, facts, tree, handlers, entry, &domain);
                 let core = closure.close(&core, matches!(&kind, RegionKind::Loop(_)))?;
                 Self::refresh_loop_follow(cfg, facts, &mut kind, &core);
+                if !core.contains(&entry) {
+                    return Ok(());
+                }
                 let placement = if Self::foreign_entries(facts, entry, &core).is_empty() {
                     tree.insert_laminar_region(kind, entry, core)?
                 } else {

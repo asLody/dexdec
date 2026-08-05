@@ -1462,6 +1462,13 @@ impl SynchronizationPlacement {
                             cfg.block(*block)
                                 .map(|block| (block.offset, block.id.raw()))
                                 .unwrap_or((u32::MAX, block.raw()))
+                        })
+                        .or_else(|| {
+                            remaining.iter().copied().min_by_key(|block| {
+                                cfg.block(*block)
+                                    .map(|block| (block.offset, block.id.raw()))
+                                    .unwrap_or((u32::MAX, block.raw()))
+                            })
                         });
                 }
             }
