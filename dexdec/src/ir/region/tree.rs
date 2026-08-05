@@ -743,6 +743,39 @@ impl RegionTree {
             .ok_or(RegionInvariantError::MissingOwner(block))
     }
 
+    /// Region entered when control transfers from `source` to `block`.
+    ///
+    /// Prefer the outermost loop/switch under `source` that uses `block` as its
+    /// entry. Nested tries frequently share a loop header; entering the try
+    /// would skip the loop and leave later continue/break transfers inactive.
+    pub(super) fn enter_destination(
+        &self,
+        source: RegionId,
+        block: BlockId,
+    ) -> Result<RegionId, RegionInvariantError> {
+        let innermost = self.owner(block)?;
+        if source != innermost && !self.is_ancestor(source, innermost)? {
+            return Ok(innermost);
+        }
+        let mut preferred = innermost;
+        let mut current = Some(innermost);
+        while let Some(region_id) = current {
+            if region_id == source {
+                break;
+            }
+            let region = self
+                .region(region_id)
+                .ok_or(RegionInvariantError::UnknownRegion(region_id))?;
+            if matches!(&region.kind, RegionKind::Loop(_) | RegionKind::Switch(_))
+                && region.entry == Some(block)
+            {
+                preferred = region_id;
+            }
+            current = region.parent;
+        }
+        Ok(preferred)
+    }
+
     pub(super) fn verify(&self, cfg: &CFG) -> Result<(), RegionInvariantError> {
         let root = self
             .region(self.root)

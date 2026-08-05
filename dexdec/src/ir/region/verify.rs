@@ -116,9 +116,10 @@ impl<'a> RegionGraphVerifier<'a> {
                 actual: transfer.target_region,
             });
         }
-        let destination = self.graph.owner_of(transfer.destination_block).ok_or(
-            RegionInvariantError::MissingOwner(transfer.destination_block),
-        )?;
+        let destination = self
+            .graph
+            .tree
+            .enter_destination(transfer.source_region, transfer.destination_block)?;
         if destination != transfer.destination_region {
             return Err(RegionInvariantError::TransferTargetMismatch {
                 block: transfer.destination_block,

@@ -254,7 +254,9 @@ impl<'a> RegionExitAnalysis<'a> {
                     self.cleanup_representatives,
                     target_block,
                 );
-                let destination_region = self.tree.owner(destination_block)?;
+                let destination_region = self
+                    .tree
+                    .enter_destination(source_region, destination_block)?;
                 let kind = self.transfer_kind(source_region, destination_region)?;
                 let mut transfer = RegionTransfer {
                     source_block,
@@ -830,6 +832,67 @@ impl InstructionTransform for LocalValueSubstitution<'_> {
 mod tests {
     use super::*;
     use crate::ir::{ArgType, Block, CatchRegion, InsnArg, InsnNode, RegisterArg};
+
+    #[test]
+    fn enters_loop_when_header_is_shared_with_nested_try() {
+        // Parent → loop-header/try-entry must Enter the loop, not the nested try.
+        // Otherwise continue leaves inside the loop body target an inactive control.
+        let header = BlockId::new(1);
+        let body = BlockId::new(2);
+        let mut cfg = CFG::new("shared_loop_try_entry");
+        for id in 0..=2 {
+            cfg.add_block(Block::new(id));
+        }
+        cfg.add_edge(BlockId::new(0), header, EdgeKind::Normal);
+        cfg.add_edge(header, body, EdgeKind::Normal);
+        cfg.add_edge(body, header, EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let loop_region = tree
+            .add_child(
+                root,
+                RegionKind::Loop(crate::ir::LoopRegion {
+                    follow: None,
+                    latches: BTreeSet::from([body]),
+                }),
+                Some(header),
+            )
+            .unwrap();
+        tree.region_mut(loop_region).unwrap().blocks = BTreeSet::from([header, body]);
+        let nested_try = tree
+            .add_child(loop_region, RegionKind::Try, Some(header))
+            .unwrap();
+        tree.region_mut(nested_try).unwrap().blocks = BTreeSet::from([header]);
+
+        let control_flow = ControlFlowFacts::analyze(&cfg).unwrap();
+        let elisions = InstructionElisions::default();
+        let handlers = BTreeMap::new();
+        let facts = RegionExitAnalysis::new(
+            &cfg,
+            &tree,
+            &elisions,
+            &control_flow,
+            &BTreeMap::new(),
+            &handlers,
+        )
+        .analyze()
+        .unwrap();
+        let enter = facts
+            .transfers
+            .iter()
+            .find(|transfer| {
+                transfer.source_block == BlockId::new(0)
+                    && transfer.destination_block == header
+                    && transfer.kind == RegionTransferKind::Enter
+            })
+            .expect("enter transfer to shared header");
+        assert_eq!(
+            enter.destination_region, loop_region,
+            "shared loop/try header must enter the loop control region"
+        );
+    }
 
     #[test]
     fn cleanup_forwarding_to_enclosing_finally_is_a_rethrow() {
