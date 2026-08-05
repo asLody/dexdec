@@ -214,7 +214,8 @@ impl<'a> JavaTypeRelations<'a> {
                 .or_else(|| {
                     self.hierarchy
                         .and_then(|hierarchy| hierarchy.erasure_of(ty))
-                }),
+                })
+                .or_else(|| Self::synthesized_class_erasure(class)),
             JavaType::Variable(variable) => self
                 .variable_erasures
                 .get(variable)
@@ -225,6 +226,34 @@ impl<'a> JavaTypeRelations<'a> {
                 .iter()
                 .find_map(|(erased, source)| (source == ty).then(|| erased.clone())),
         }
+    }
+
+    /// Recover a DEX binary name for a raw class that never entered `source_types`.
+    ///
+    /// Platform interfaces reached only through check-cast / select targets are
+    /// often present as `JavaType::Class` without an indexed erasure. Package
+    /// segments with plain source identifiers map back to `a/b/C` binary names.
+    fn synthesized_class_erasure(class: &JavaClassType) -> Option<ArgType> {
+        if class.segments.is_empty()
+            || class
+                .segments
+                .iter()
+                .any(|segment| !segment.arguments.is_empty())
+        {
+            return None;
+        }
+        let mut path = String::new();
+        for (index, segment) in class.segments.iter().enumerate() {
+            let name = segment.name.as_str();
+            if name.is_empty() || name.starts_with("$dex$") {
+                return None;
+            }
+            if index > 0 {
+                path.push('/');
+            }
+            path.push_str(name);
+        }
+        Some(ArgType::object(&path))
     }
 
     pub(super) fn is_assignable(&self, source: &JavaType, target: &JavaType) -> bool {
@@ -5865,6 +5894,19 @@ mod tests {
                 None,
             ),
             Some(JavaTypeArgument::Any),
+        );
+    }
+
+    #[test]
+    fn unindexed_platform_interface_synthesizes_class_erasure() {
+        let source_types = BTreeMap::new();
+        let variables = BTreeMap::new();
+        let relations = JavaTypeRelations::new(&source_types, &variables, None);
+        let ty = JavaType::source_class("android.content.ComponentCallbacks2");
+
+        assert_eq!(
+            relations.erasure_of(&ty),
+            Some(ArgType::object("android/content/ComponentCallbacks2"))
         );
     }
 
