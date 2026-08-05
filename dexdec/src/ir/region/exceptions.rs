@@ -1724,10 +1724,9 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
             .cloned()
             .unwrap_or_default()
         {
-            let merged_kind = self
-                .tree
-                .region(region)
-                .and_then(|existing| Self::merge_handler_kind(&existing.kind, kind));
+            let merged_kind = self.tree.region(region).and_then(|existing| {
+                Self::merge_handler_kind(&existing.kind, kind, existing.blocks == *blocks)
+            });
             let Some(merged_kind) = merged_kind else {
                 continue;
             };
@@ -1754,7 +1753,7 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
                     .region(region)
                     .ok_or(RegionInvariantError::UnknownRegion(region))?;
                 (existing.blocks == *blocks)
-                    .then(|| Self::merge_handler_kind(&existing.kind, kind))
+                    .then(|| Self::merge_handler_kind(&existing.kind, kind, true))
                     .flatten()
             };
             let Some(merged_kind) = merged_kind else {
@@ -1769,16 +1768,36 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
         Ok(None)
     }
 
-    fn merge_handler_kind(left: &RegionKind, right: &RegionKind) -> Option<RegionKind> {
+    fn merge_handler_kind(
+        left: &RegionKind,
+        right: &RegionKind,
+        same_component: bool,
+    ) -> Option<RegionKind> {
         match (left, right) {
             (RegionKind::Finally, RegionKind::Finally)
             | (RegionKind::Finally, RegionKind::Cleanup(_))
             | (RegionKind::Cleanup(_), RegionKind::Finally) => Some(RegionKind::Finally),
-            (RegionKind::Catch(left), RegionKind::Catch(right)) => (left.exception_types
-                == right.exception_types
-                && left.exception_value == right.exception_value
-                && left.continuation == right.continuation)
-                .then(|| RegionKind::Catch(left.clone())),
+            (RegionKind::Catch(left), RegionKind::Catch(right))
+                if left.exception_types == right.exception_types
+                    && left.exception_value == right.exception_value =>
+            {
+                let continuation = match (left.continuation, right.continuation) {
+                    (left, right) if left == right => left,
+                    // DEX may route nested fallback catches to the same
+                    // physical body. A protection-relative analysis can see
+                    // the body's ordinary re-entry as a continuation for one
+                    // range but not the other. Identical owned components
+                    // prove that the present continuation is the shared
+                    // lexical boundary rather than context-specific code.
+                    (Some(continuation), None) | (None, Some(continuation)) if same_component => {
+                        Some(continuation)
+                    }
+                    _ => return None,
+                };
+                let mut merged = left.clone();
+                merged.continuation = continuation;
+                Some(RegionKind::Catch(merged))
+            }
             (RegionKind::Cleanup(left), RegionKind::Cleanup(right)) => (left.exception_types
                 == right.exception_types
                 && left.exception_value == right.exception_value
@@ -2422,6 +2441,38 @@ mod tests {
             .expect("shared-suffix nesting");
 
         assert_eq!(builder.tree.region(fragment).unwrap().parent, Some(root));
+    }
+
+    #[test]
+    fn same_catch_component_preserves_present_continuation() {
+        let continuation = BlockId::new(7);
+        let catch = |continuation| {
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![crate::ir::ArgType::object("java/lang/NoSuchFieldException")],
+                exception_value: None,
+                continuation,
+            })
+        };
+
+        let merged = ExceptionRegionTreeBuilder::merge_handler_kind(
+            &catch(Some(continuation)),
+            &catch(None),
+            true,
+        )
+        .expect("same physical catch component");
+        assert!(matches!(
+            merged,
+            RegionKind::Catch(CatchRegion {
+                continuation: Some(actual),
+                ..
+            }) if actual == continuation
+        ));
+        assert!(ExceptionRegionTreeBuilder::merge_handler_kind(
+            &catch(Some(continuation)),
+            &catch(None),
+            false,
+        )
+        .is_none());
     }
 
     #[test]
