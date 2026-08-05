@@ -250,11 +250,10 @@ impl<'a> RegionExitAnalysis<'a> {
                     continue;
                 }
                 let target_region = self.tree.owner(target_block)?;
-                let destination_block = self
-                    .cleanup_representatives
-                    .get(&target_block)
-                    .copied()
-                    .unwrap_or(target_block);
+                let destination_block = Self::terminal_cleanup_representative(
+                    self.cleanup_representatives,
+                    target_block,
+                );
                 let destination_region = self.tree.owner(destination_block)?;
                 let kind = self.transfer_kind(source_region, destination_region)?;
                 let mut transfer = RegionTransfer {
@@ -477,6 +476,26 @@ impl<'a> RegionExitAnalysis<'a> {
         } else {
             RegionTransferKind::Leave
         })
+    }
+
+    fn terminal_cleanup_representative(
+        representatives: &BTreeMap<BlockId, BlockId>,
+        target: BlockId,
+    ) -> BlockId {
+        let mut current = target;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) {
+                // Cleanup proofs are expected to point toward a completion.
+                // Preserve the physical target if malformed input ever
+                // introduces a cycle instead of choosing an arbitrary member.
+                return target;
+            }
+            let Some(next) = representatives.get(&current).copied() else {
+                return current;
+            };
+            current = next;
+        }
     }
 
     fn exit_kind(
@@ -926,6 +945,72 @@ mod tests {
         let facts = ControlFlowFacts::analyze(&cfg).unwrap();
 
         assert_eq!(facts.continuation(BlockId::new(1)), BlockId::new(2));
+    }
+
+    #[test]
+    fn follows_nested_cleanup_contractions_to_the_terminal_representative() {
+        let source = BlockId::new(0);
+        let first = BlockId::new(1);
+        let second = BlockId::new(2);
+        let terminal = BlockId::new(3);
+        let representatives = BTreeMap::from([(first, second), (second, terminal)]);
+
+        let lock = InsnArg::reg_ssa(0, 0, ArgType::object("java/lang/Object"));
+        let result = RegisterArg::new_ssa(1, 0, ArgType::INT);
+        let mut cfg = CFG::new("nested_cleanup_return");
+        let mut entry = Block::new(source.raw());
+        entry.push(InsnNode::goto(1));
+        cfg.add_block(entry);
+        let mut first_cleanup = Block::new(first.raw());
+        first_cleanup.push(InsnNode::monitor_exit(lock.clone()));
+        first_cleanup.push(InsnNode::goto(2));
+        cfg.add_block(first_cleanup);
+        let mut second_cleanup = Block::new(second.raw());
+        second_cleanup.push(InsnNode::monitor_exit(lock));
+        second_cleanup.push(InsnNode::goto(3));
+        cfg.add_block(second_cleanup);
+        let mut completion = Block::new(terminal.raw());
+        completion.push(InsnNode::const_val(result.clone(), 1, ArgType::INT));
+        let mut return_value = InsnNode::new(InsnType::Return, 1);
+        return_value.add_arg(InsnArg::Reg(result));
+        completion.push(return_value);
+        cfg.add_block(completion);
+        cfg.add_edge(source, first, EdgeKind::Normal);
+        cfg.add_edge(first, second, EdgeKind::Normal);
+        cfg.add_edge(second, terminal, EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(source));
+        tree.cover_method(&cfg).unwrap();
+        let control_flow = ControlFlowFacts::analyze(&cfg).unwrap();
+        let elisions = InstructionElisions::default();
+        let handlers = BTreeMap::new();
+        let facts = RegionExitAnalysis::new(
+            &cfg,
+            &tree,
+            &elisions,
+            &control_flow,
+            &representatives,
+            &handlers,
+        )
+        .analyze()
+        .unwrap();
+        let transfer = facts
+            .transfers
+            .iter()
+            .find(|transfer| transfer.source_block == source)
+            .expect("entry transfer");
+        assert_eq!(transfer.destination_block, terminal);
+        assert_eq!(transfer.exit_kind, RegionExitKind::Return);
+        assert!(facts.leaves.iter().any(|leave| {
+            leave.leave.source_block == Some(source)
+                && matches!(leave.leave.exit, RegionExit::Return(Some(_)))
+        }));
+
+        let cyclic = BTreeMap::from([(first, second), (second, first)]);
+        assert_eq!(
+            RegionExitAnalysis::terminal_cleanup_representative(&cyclic, first),
+            first
+        );
     }
 
     #[test]
