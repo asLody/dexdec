@@ -43,6 +43,19 @@ impl RegionChildren {
             {
                 continue;
             }
+            let handler_kind = &graph
+                .tree()
+                .region(handler)
+                .ok_or(StructureError::UnknownRegion(handler))?
+                .kind;
+            // A catch clause with no exceptional ingress cannot affect this
+            // protected fragment. Finally and cleanup handlers may still be
+            // required on normal completion, so retain those unconditionally.
+            if matches!(handler_kind, RegionKind::Catch(_))
+                && !Self::reaches_handler(cfg, graph, region, handler)?
+            {
+                continue;
+            }
             if seen_handlers.insert(handler) {
                 handlers.push(handler);
             }
@@ -119,6 +132,46 @@ impl RegionChildren {
             handlers,
             releases,
         })
+    }
+
+    fn reaches_handler(
+        cfg: &CFG,
+        graph: &RegionGraph,
+        region: &StructuredRegion,
+        handler: RegionId,
+    ) -> Result<bool, StructureError> {
+        let handler_region = graph
+            .tree()
+            .region(handler)
+            .ok_or(StructureError::UnknownRegion(handler))?;
+        for source in &region.blocks {
+            for (target, kind) in cfg.successors_with_kind(*source) {
+                if !kind.is_exception() {
+                    continue;
+                }
+                for entry in
+                    std::iter::once(*target).chain(graph.handler_adapters().get(target).copied())
+                {
+                    if handler_region.entry.is_none()
+                        && handler_region.kind.continuation() == Some(entry)
+                    {
+                        return Ok(true);
+                    }
+                    let Some(owner) = graph.owner_of(entry) else {
+                        continue;
+                    };
+                    if owner == handler
+                        || graph
+                            .tree()
+                            .is_ancestor(handler, owner)
+                            .map_err(|_| StructureError::UnknownRegion(owner))?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn externally_entered(
@@ -562,6 +615,122 @@ impl OpenFlowCompletion {
                 cleanup: Vec::new(),
             }),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::analysis::SsaValueGraph;
+    use crate::ir::exception::{CatchHandler, ExceptionAnalysis, TryRegion};
+    use crate::ir::{
+        ArgType, Block, HandlerKind, InsnNode, RegionGraphBuilder, RegionKind, RegisterArg,
+    };
+
+    #[test]
+    fn ignores_handler_dependency_without_exception_ingress() {
+        let (cfg, graph, owner) = graph_with_handler(false, HandlerKind::Catch);
+        let region = graph.tree().region(owner).expect("try region");
+        let children = RegionChildren::classify(&cfg, &graph, region).expect("children");
+
+        assert!(children.handlers.is_empty());
+    }
+
+    #[test]
+    fn retains_handler_dependency_with_exception_ingress() {
+        let (cfg, graph, owner) = graph_with_handler(true, HandlerKind::Catch);
+        let region = graph.tree().region(owner).expect("try region");
+        let children = RegionChildren::classify(&cfg, &graph, region).expect("children");
+
+        assert_eq!(children.handlers.len(), 1);
+    }
+
+    #[test]
+    fn retains_finally_dependency_without_exception_ingress() {
+        let (cfg, graph, owner) = graph_with_handler(false, HandlerKind::Finally);
+        let region = graph.tree().region(owner).expect("try region");
+        let children = RegionChildren::classify(&cfg, &graph, region).expect("children");
+
+        assert_eq!(children.handlers.len(), 1);
+    }
+
+    fn graph_with_handler(reachable: bool, kind: HandlerKind) -> (CFG, RegionGraph, RegionId) {
+        let entry = BlockId::new(0);
+        let protected = BlockId::new(1);
+        let completion = BlockId::new(2);
+        let handler = BlockId::new(3);
+        let mut cfg = CFG::new("handler_ingress");
+        let mut entry_block = Block::new(entry.raw());
+        entry_block.push(InsnNode::goto(protected.raw() as i32));
+        cfg.add_block(entry_block);
+        let mut protected_block = Block::new(protected.raw());
+        protected_block.push(InsnNode::goto(completion.raw() as i32));
+        cfg.add_block(protected_block);
+        let mut completion_block = Block::new(completion.raw());
+        completion_block.push(InsnNode::return_void());
+        cfg.add_block(completion_block);
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let mut handler_block = Block::new(handler.raw());
+        handler_block.push(InsnNode::move_exception(caught.clone()));
+        handler_block.push(InsnNode::return_void());
+        cfg.add_block(handler_block);
+        cfg.add_edge(entry, protected, crate::ir::EdgeKind::Normal);
+        cfg.add_edge(protected, completion, crate::ir::EdgeKind::Normal);
+        if reachable {
+            cfg.add_edge(protected, handler, crate::ir::EdgeKind::Exception);
+        } else {
+            cfg.add_edge(entry, handler, crate::ir::EdgeKind::Exception);
+        }
+
+        let catch = CatchHandler {
+            id: handler.raw(),
+            catch_type: (kind == HandlerKind::Catch).then(ArgType::throwable),
+            handler_offset: handler.raw(),
+            entry_blocks: BTreeSet::from([handler]),
+            handler_block: handler,
+            semantic_entry: handler,
+            canonical_entry: handler,
+            adapter_blocks: BTreeSet::new(),
+            blocks: vec![handler],
+            semantic_blocks: vec![handler],
+            lexical_blocks: vec![handler],
+            continuation: None,
+            exception_value: Some(caught.clone()),
+            canonical_exception_value: Some(caught),
+            rethrow_blocks: BTreeSet::new(),
+            kind,
+        };
+        let analysis = ExceptionAnalysis {
+            regions: vec![TryRegion {
+                id: 7,
+                start_offset: protected.raw(),
+                end_offset: completion.raw(),
+                blocks: vec![protected],
+                handlers: vec![catch],
+                parent: None,
+                children: Vec::new(),
+                normal_exit_blocks: vec![protected],
+            }],
+            ..ExceptionAnalysis::default()
+        };
+        let values = SsaValueGraph::build(&cfg).expect("SSA values");
+        let graph = RegionGraphBuilder::new(&cfg, &analysis, &values)
+            .build()
+            .expect("region graph");
+        let owner = graph
+            .exception_regions()
+            .get(&7)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|region| {
+                graph
+                    .tree()
+                    .region(*region)
+                    .is_some_and(|region| matches!(region.kind, RegionKind::Try))
+            })
+            .expect("source try region");
+        (cfg, graph, owner)
     }
 }
 
