@@ -204,6 +204,8 @@ impl<'a> RegionGraphBuilder<'a> {
             &mut exception_handlers,
         )?;
         ExceptionRegionCanonicalizer::apply(
+            analysis,
+            cfg,
             &mut tree,
             &mut exception_region_map,
             &mut exception_handlers,
