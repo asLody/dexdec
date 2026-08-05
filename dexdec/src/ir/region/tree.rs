@@ -1271,10 +1271,22 @@ impl SynchronizationPlacement {
                 // synchronized methods whose enter stays on the method entry).
                 // Close that try over the recovered synchronized scope instead
                 // of demanding an impossible lexical cut.
-                tree.region_mut(candidate)
-                    .ok_or(RegionInvariantError::UnknownRegion(candidate))?
-                    .blocks
-                    .extend(self.blocks.iter().copied());
+                //
+                // Also realign the try entry onto the synchronized body entry.
+                // After monitor-enter splitting the try often still points at a
+                // later body block (e.g. B1 while sync enters at B724). Leaving
+                // that stale entry creates a second synchronized port and emits
+                // an empty `synchronized` prefix before the real monitor body.
+                let closed = tree
+                    .region_mut(candidate)
+                    .ok_or(RegionInvariantError::UnknownRegion(candidate))?;
+                closed.blocks.extend(self.blocks.iter().copied());
+                if closed
+                    .entry
+                    .is_some_and(|entry| entry != self.entry && self.blocks.contains(&entry))
+                {
+                    closed.entry = Some(self.entry);
+                }
                 continue;
             }
             let entry = region
@@ -2223,6 +2235,11 @@ mod tests {
             .unwrap()
             .blocks
             .is_superset(&blocks([1, 2, 3])));
+        assert_eq!(
+            tree.region(outer).and_then(|region| region.entry),
+            Some(BlockId::new(1)),
+            "enclosing try must enter at the synchronized body entry after split"
+        );
     }
 
     #[test]
