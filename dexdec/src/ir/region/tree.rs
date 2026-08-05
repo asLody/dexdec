@@ -1262,7 +1262,15 @@ impl SynchronizationPlacement {
                 .region(candidate)
                 .cloned()
                 .ok_or(RegionInvariantError::UnknownRegion(candidate))?;
-            if region.blocks.contains(&self.enter) || region.blocks.contains(&self.entry) {
+            if region.blocks.contains(&self.enter)
+                || region.blocks.contains(&self.entry)
+                || tree.is_ancestor(candidate, self.owner)?
+            {
+                // An enclosing try of the synchronization owner may omit the
+                // post-monitor-enter split block (especially for declared-
+                // synchronized methods whose enter stays on the method entry).
+                // Close that try over the recovered synchronized scope instead
+                // of demanding an impossible lexical cut.
                 tree.region_mut(candidate)
                     .ok_or(RegionInvariantError::UnknownRegion(candidate))?
                     .blocks
@@ -2156,6 +2164,65 @@ mod tests {
             Some(RegionKind::Synchronized(_))
         ));
         assert_eq!(tree.region(synchronization).unwrap().blocks, scope);
+    }
+
+    #[test]
+    fn synchronization_closes_ancestor_try_missing_split_entry() {
+        let mut cfg = CFG::new("declared_synchronized_split_entry");
+        for id in 0..=5 {
+            cfg.add_block(Block::new(id));
+        }
+        for (source, target) in [(0, 1), (1, 2), (2, 3)] {
+            cfg.add_edge(BlockId::new(source), BlockId::new(target), EdgeKind::Normal);
+        }
+        for source in 1..=2 {
+            cfg.add_edge(BlockId::new(source), BlockId::new(4), EdgeKind::Exception);
+        }
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        // Outer try owns the original body but not the post-enter split block.
+        let outer = add_region(&mut tree, root, RegionKind::Try, 2, [2, 3, 4]);
+        let owner = add_region(&mut tree, outer, RegionKind::Try, 2, [2, 3]);
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4, 5],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::from([(owner, vec![release])]),
+            owner,
+            &[release],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3]),
+            &blocks([4]),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tree.region(owner).map(|region| &region.kind),
+            Some(RegionKind::Synchronized(_))
+        ));
+        assert!(tree
+            .region(outer)
+            .unwrap()
+            .blocks
+            .is_superset(&blocks([1, 2, 3])));
     }
 
     #[test]
