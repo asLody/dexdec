@@ -43,7 +43,7 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
                 };
                 let candidate = canonicalizer.fold_node(root)?;
                 let region_changed = canonicalizer.changed;
-                if region_changed && LexicalLabels::escaped_loop(&candidate).is_some() {
+                if region_changed && escapes_structured_control(&candidate) {
                     root = original;
                 } else {
                     root = candidate;
@@ -76,7 +76,7 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
                 let original = root.clone();
                 let mut family_changed = false;
                 let candidate = self.merge_family(root, family, &mut family_changed)?;
-                if family_changed && LexicalLabels::escaped_loop(&candidate).is_some() {
+                if family_changed && escapes_structured_control(&candidate) {
                     root = original;
                 } else {
                     root = candidate;
@@ -344,7 +344,7 @@ impl<'a> ExceptionEnvelopeCanonicalizer<'a> {
         let body = self.strip(node, target)?;
         let region = self.envelope_owner(target, &envelope)?;
         let candidate = self.place_envelope(body, region, envelope)?;
-        if LexicalLabels::escaped_loop(&candidate).is_some() {
+        if escapes_structured_control(&candidate) {
             return Ok(original);
         }
         *changed = true;
@@ -639,7 +639,7 @@ impl SemanticFolder for MergeEnvelopeFamily<'_, '_, '_, '_> {
         let original = node.clone();
         let body = self.canonicalizer.strip_family(node, &self.family.key)?;
         let candidate = self.canonicalizer.place_envelope(body, region, envelope)?;
-        if LexicalLabels::escaped_loop(&candidate).is_some() {
+        if escapes_structured_control(&candidate) {
             return Ok(SemanticFoldControl::Descend(original));
         }
 
@@ -841,6 +841,12 @@ impl ExceptionEnvelope {
                 })
             && self.finally.as_ref().map(|finally| finally.region)
                 == other.finally.as_ref().map(|finally| finally.region)
+            // Catch/finally continuations are part of envelope identity. A loop
+            // may rewrite BreakLabel into Break(region) inside its body; merging
+            // that rewritten catch onto a try outside the loop leaves the break
+            // targeting inactive control.
+            && self.label_dependencies() == other.label_dependencies()
+            && self.control_dependencies() == other.control_dependencies()
     }
 
     fn can_wrap(&self, node: &SemanticNode) -> bool {
@@ -1017,6 +1023,14 @@ struct FreeControlDependencies {
     free: BTreeSet<RegionId>,
 }
 
+impl FreeControlDependencies {
+    fn collect(node: &SemanticNode) -> BTreeSet<RegionId> {
+        let mut dependencies = Self::default();
+        dependencies.visit_node(node);
+        dependencies.free
+    }
+}
+
 impl SemanticVisitor for FreeControlDependencies {
     fn enter_node(&mut self, node: &SemanticNode) {
         if let Some(region) = ControlBindings::binding(node) {
@@ -1045,6 +1059,14 @@ impl SemanticVisitor for FreeControlDependencies {
             self.active.remove(&region);
         }
     }
+}
+
+/// True when a candidate envelope placement leaves a loop label or region
+/// break/continue without an active binder — the same class of defect as
+/// `LexicalLabels::escaped_loop`, for region-controlled loops.
+fn escapes_structured_control(root: &SemanticNode) -> bool {
+    LexicalLabels::escaped_loop(root).is_some()
+        || !FreeControlDependencies::collect(root).is_empty()
 }
 
 struct SynchronizedEnvelopePlacement {
@@ -1264,12 +1286,7 @@ impl SemanticFolder for ExternalMonitorHandlerPlacement<'_, '_> {
                     unreachable!("external envelope plan must select a try node");
                 };
                 nodes.insert(index, *try_body);
-                (
-                    try_region,
-                    SemanticNode::sequence(nodes),
-                    catches,
-                    finally,
-                )
+                (try_region, SemanticNode::sequence(nodes), catches, finally)
             }
             _ => unreachable!("external envelope plan must match synchronized body"),
         };
@@ -1350,10 +1367,8 @@ impl<'a> HandlerCleanupEnvelopePlacement<'a> {
         cleanup_key: &EnvelopeKey,
     ) -> Result<(), StructureError> {
         for catch in catches {
-            catch.body = StripEnvelopeFamily {
-                key: cleanup_key,
-            }
-            .fold_node(std::mem::replace(&mut catch.body, SemanticNode::Empty))?;
+            catch.body = StripEnvelopeFamily { key: cleanup_key }
+                .fold_node(std::mem::replace(&mut catch.body, SemanticNode::Empty))?;
         }
         Ok(())
     }
@@ -1511,6 +1526,42 @@ mod tests {
 
         assert!(!envelope.can_wrap(&loop_node(loop_region, SemanticNode::Empty)));
         assert!(envelope.can_wrap(&loop_node(RegionId::new(3), SemanticNode::Empty,)));
+    }
+
+    #[test]
+    fn envelope_shape_includes_handler_control_dependencies() {
+        let loop_region = RegionId::new(1);
+        let handler_region = RegionId::new(2);
+        let label = SemanticLabel::block(RegionId::new(4), crate::ir::BlockId::new(88));
+        let with_break = envelope(
+            handler_region,
+            control_leave(loop_region, SemanticLeaveKind::Break),
+        );
+        let with_break_label = envelope(
+            handler_region,
+            SemanticNode::Leave(SemanticLeave {
+                site: None,
+                condition: None,
+                kind: SemanticLeaveKind::BreakLabel(label),
+                edge: None,
+                origin: None,
+                source: handler_region,
+                destination: RegionId::new(4),
+                target: RegionId::new(4),
+                cleanup: Vec::new(),
+            }),
+        );
+
+        assert!(!with_break.same_shape(&with_break_label));
+        assert!(escapes_structured_control(
+            &with_break
+                .clone()
+                .attach(RegionId::new(5), SemanticNode::Empty,)
+        ));
+        assert!(!escapes_structured_control(&loop_node(
+            loop_region,
+            with_break.attach(RegionId::new(5), SemanticNode::Empty),
+        )));
     }
 
     #[test]
