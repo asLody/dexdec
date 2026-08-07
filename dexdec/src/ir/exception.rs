@@ -103,6 +103,58 @@ impl TryRegion {
     }
 }
 
+/// Canonical handler entries referenced by more than one protected region.
+fn shared_handler_entries(handlers: impl IntoIterator<Item = (u32, BlockId)>) -> BTreeSet<BlockId> {
+    let mut owners = BTreeMap::<BlockId, BTreeSet<u32>>::new();
+    for (region, entry) in handlers {
+        owners.entry(entry).or_default().insert(region);
+    }
+    owners
+        .into_iter()
+        .filter_map(|(entry, regions)| (regions.len() > 1).then_some(entry))
+        .collect()
+}
+
+/// Catch entries shared by try regions that do not share a cleanup identity.
+///
+/// Split fragments of one source `try` reuse the same catch and finally
+/// entries; those must still recover structured `finally`. Two independent
+/// tries that only share a catch tail must not elide that tail on behalf of
+/// one region.
+fn conflicting_shared_catch_entries(regions: &[TryRegion]) -> BTreeSet<BlockId> {
+    let mut owners = BTreeMap::<BlockId, BTreeSet<(u32, Option<BlockId>)>>::new();
+    for region in regions {
+        let cleanup = region
+            .handlers
+            .iter()
+            .find(|handler| handler.kind != HandlerKind::Catch)
+            .map(|handler| handler.canonical_entry);
+        for handler in region.catch_handlers() {
+            owners
+                .entry(handler.canonical_entry)
+                .or_default()
+                .insert((region.id, cleanup));
+        }
+    }
+    owners
+        .into_iter()
+        .filter_map(|(entry, identities)| {
+            let region_count = identities
+                .iter()
+                .map(|(region, _)| *region)
+                .collect::<BTreeSet<_>>()
+                .len();
+            let cleanup_identities = identities
+                .iter()
+                .map(|(_, cleanup)| *cleanup)
+                .collect::<BTreeSet<_>>();
+            let conflicting_cleanup =
+                cleanup_identities.len() > 1 || cleanup_identities == BTreeSet::from([None]);
+            (region_count > 1 && conflicting_cleanup).then_some(entry)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct CleanupContraction {
     pub entry: BlockId,
@@ -409,6 +461,7 @@ impl<'a> ExceptionAnalyzer<'a> {
         HandlerDomains::assign(self.cfg, &mut regions);
         let nested_handlers = NestedHandlerDomains::analyze(&regions);
         let recovery_order = Self::cleanup_recovery_order(&regions);
+        let shared_handler_entries = conflicting_shared_catch_entries(&regions);
 
         let mut elided_instructions = BTreeSet::new();
         let mut cleanup_contractions = Vec::new();
@@ -422,7 +475,13 @@ impl<'a> ExceptionAnalyzer<'a> {
                 .ok_or(ExceptionInvariantError::MissingExceptionScope(region_id))?;
             let nested_cleanup = nested_handlers.cleanup(region.id);
             let nested_all = nested_handlers.all(region.id);
-            let cleanup = CleanupRecovery::new(self.cfg, self.values, &normal_dominators).recover(
+            let cleanup = CleanupRecovery::new(
+                self.cfg,
+                self.values,
+                &normal_dominators,
+                &shared_handler_entries,
+            )
+            .recover(
                 region,
                 &nested_cleanup,
                 &nested_all,
@@ -4340,6 +4399,43 @@ mod tests {
             children: Vec::new(),
             normal_exit_blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn identifies_handler_entry_shared_across_protected_regions() {
+        let shared = BlockId::new(7);
+        let private = BlockId::new(8);
+        let entries = shared_handler_entries([(1, shared), (1, shared), (2, shared), (2, private)]);
+
+        assert_eq!(entries, BTreeSet::from([shared]));
+    }
+
+    #[test]
+    fn split_try_fragments_that_share_finally_are_not_conflicting_catches() {
+        let mut cleanup = catch_handler(4, &[4]);
+        cleanup.kind = HandlerKind::Cleanup;
+        let left = try_region(
+            1,
+            0,
+            4,
+            &[0, 1],
+            vec![catch_handler(3, &[3]), cleanup.clone()],
+        );
+        let right = try_region(2, 4, 8, &[2], vec![catch_handler(3, &[3]), cleanup]);
+
+        assert!(conflicting_shared_catch_entries(&[left, right]).is_empty());
+    }
+
+    #[test]
+    fn independent_tries_sharing_only_a_catch_are_conflicting() {
+        let catch = BlockId::new(3);
+        let left = try_region(1, 0, 4, &[0], vec![catch_handler(3, &[3])]);
+        let right = try_region(2, 4, 8, &[1], vec![catch_handler(3, &[3])]);
+
+        assert_eq!(
+            conflicting_shared_catch_entries(&[left, right]),
+            BTreeSet::from([catch])
+        );
     }
 
     #[test]
