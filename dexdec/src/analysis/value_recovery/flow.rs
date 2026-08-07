@@ -217,6 +217,17 @@ impl SsaCopyFlow {
         value
     }
 
+    fn omitted_source(&self, mut value: SsaVar) -> SsaVar {
+        let mut visited = BTreeSet::new();
+        while self.omitted.contains(&value) && visited.insert(value) {
+            let Some(source) = self.sources.get(&value).copied() else {
+                break;
+            };
+            value = source;
+        }
+        value
+    }
+
     fn argument(&self, value: SsaVar) -> InsnArg {
         InsnArg::reg_ssa(
             value.reg_num,
@@ -431,8 +442,13 @@ impl<'ir> ValueFlowGraph<'ir> {
             };
             for input in &phi.inputs {
                 self.retained_phi_inputs.insert(input.value);
+                let source = self.copies.omitted_source(input.value);
+                self.retained_phi_inputs.insert(source);
                 if excluded.contains_key(&input.value) {
                     pending.push(input.value);
+                }
+                if source != input.value && excluded.contains_key(&source) {
+                    pending.push(source);
                 }
             }
         }
@@ -800,35 +816,52 @@ impl<'ir> ValueFlowGraph<'ir> {
     }
 
     fn required_phi_inputs(&self) -> BTreeSet<SsaVar> {
-        let phis = self
-            .phis
-            .iter()
-            .map(|phi| (phi.result, phi))
-            .collect::<BTreeMap<_, _>>();
-        let mut pending = self
+        let pending = self
             .phis
             .iter()
             .filter(|phi| self.has_reaching_use(phi.result))
             .map(|phi| phi.result)
             .collect::<Vec<_>>();
-        let mut required = self.retained_phi_inputs.clone();
-        let mut visited = BTreeSet::new();
-        while let Some(result) = pending.pop() {
-            if !visited.insert(result) {
-                continue;
+        required_phi_input_closure(
+            &self.phis,
+            &self.copies,
+            pending,
+            self.retained_phi_inputs.clone(),
+        )
+    }
+}
+
+fn required_phi_input_closure(
+    phis: &[PhiMerge],
+    copies: &SsaCopyFlow,
+    mut pending: Vec<SsaVar>,
+    mut required: BTreeSet<SsaVar>,
+) -> BTreeSet<SsaVar> {
+    let phis = phis
+        .iter()
+        .map(|phi| (phi.result, phi))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    while let Some(result) = pending.pop() {
+        if !visited.insert(result) {
+            continue;
+        }
+        let Some(phi) = phis.get(&result) else {
+            continue;
+        };
+        for input in &phi.inputs {
+            required.insert(input.value);
+            let source = copies.omitted_source(input.value);
+            required.insert(source);
+            if phis.contains_key(&input.value) {
+                pending.push(input.value);
             }
-            let Some(phi) = phis.get(&result) else {
-                continue;
-            };
-            for input in &phi.inputs {
-                required.insert(input.value);
-                if phis.contains_key(&input.value) {
-                    pending.push(input.value);
-                }
+            if source != input.value && phis.contains_key(&source) {
+                pending.push(source);
             }
         }
-        required
     }
+    required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -875,8 +908,10 @@ impl SemanticVisitor for ControlSymbolClosure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::analysis::PhiInput;
     use crate::ir::{
-        InsnNode, InsnType, InstructionId, RegionId, SemanticCatch, SemanticExpression,
+        BlockId, EdgeKind, InsnNode, InsnType, InstructionId, RegionId, SemanticCatch,
+        SemanticExpression,
     };
 
     fn operation(
@@ -944,5 +979,39 @@ mod tests {
             ValueFlowGraph::build_source(&SemanticNode::Empty, &BTreeSet::from([binding])).unwrap();
 
         assert!(graph.is_bound(binding));
+    }
+
+    #[test]
+    fn required_phi_inputs_retain_transitive_copy_sources() {
+        let headers = SsaVar::new(12, 1);
+        let handler_copy = SsaVar::new(13, 3);
+        let null = SsaVar::new(13, 0);
+        let merged = SsaVar::new(13, 4);
+        let phis = vec![PhiMerge {
+            block: BlockId::new(113),
+            instruction: InstructionId::new(200),
+            result: merged,
+            inputs: vec![
+                PhiInput {
+                    predecessor: BlockId::new(108),
+                    edge_kind: EdgeKind::Normal,
+                    value: handler_copy,
+                },
+                PhiInput {
+                    predecessor: BlockId::new(110),
+                    edge_kind: EdgeKind::Normal,
+                    value: null,
+                },
+            ],
+        }];
+        let mut copies = SsaCopyFlow::default();
+        copies.sources.insert(handler_copy, headers);
+        copies.omitted.insert(handler_copy);
+
+        let required = required_phi_input_closure(&phis, &copies, vec![merged], BTreeSet::new());
+
+        assert!(required.contains(&handler_copy));
+        assert!(required.contains(&headers));
+        assert!(required.contains(&null));
     }
 }
