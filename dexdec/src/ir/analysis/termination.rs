@@ -80,7 +80,9 @@ impl MethodTermination {
 
     fn is_no_return_call(&self, instruction: &InsnNode) -> bool {
         self.exact_internal_target(instruction)
-            .is_some_and(|target| self.no_return.contains(target))
+            .is_some_and(|target| {
+                self.no_return.contains(target) && !preserves_source_continuation(target)
+            })
     }
 
     fn exact_internal_target<'a>(
@@ -160,8 +162,22 @@ impl<'a> ReturnReachability<'a> {
         let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() else {
             return false;
         };
-        self.members.contains(target) && !self.may_return.contains(target)
+        self.members.contains(target)
+            && !self.may_return.contains(target)
+            && !preserves_source_continuation(target)
     }
+}
+
+/// Kotlin emits these calls as compiler markers around code that is expected
+/// to be inlined. Their runtime implementations deliberately throw, but the
+/// bytecode following the marker is still the source-level continuation that
+/// a decompiler must preserve.
+fn preserves_source_continuation(target: &MethodReference) -> bool {
+    target.owner.as_object() == Some("kotlin/jvm/internal/Intrinsics")
+        && matches!(
+            target.name.as_str(),
+            "reifiedOperationMarker" | "needClassReification"
+        )
 }
 
 #[cfg(test)]
@@ -258,5 +274,57 @@ mod tests {
         let summary = MethodTermination::analyze([&left, &right]);
         assert!(summary.apply(&mut left));
         assert!(summary.apply(&mut right));
+    }
+
+    #[test]
+    fn kotlin_reification_markers_preserve_source_continuation() {
+        let marker = MethodReference {
+            owner: ArgType::object("kotlin/jvm/internal/Intrinsics"),
+            name: "reifiedOperationMarker".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: vec![ArgType::INT, ArgType::object("java/lang/String")],
+                return_type: ArgType::VOID,
+            },
+        };
+        assert!(preserves_source_continuation(&marker));
+        let mut class_reification = marker.clone();
+        class_reification.name = "needClassReification".to_string();
+        assert!(preserves_source_continuation(&class_reification));
+        let mut explicit_throw = marker.clone();
+        explicit_throw.name = "throwUndefinedForReified".to_string();
+        assert!(!preserves_source_continuation(&explicit_throw));
+
+        let mut marker_body = CFG::with_method(MethodContext::new(
+            marker.owner.clone(),
+            marker.name.clone(),
+            marker.descriptor.clone(),
+            true,
+        ));
+        let mut marker_entry = Block::new(0);
+        marker_entry.push(InsnNode::throw(crate::ir::InsnArg::lit(
+            0,
+            ArgType::object("java/lang/Throwable"),
+        )));
+        marker_body.add_block(marker_entry);
+
+        let mut caller = graph("caller");
+        let mut entry = Block::new(0);
+        let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        invoke.payload.reference = Some(MemberReference::Method(marker));
+        entry.push(invoke);
+        entry.push(InsnNode::goto(1));
+        caller.add_block(entry);
+        let mut normal = Block::new(1);
+        normal.push(InsnNode::return_void());
+        caller.add_block(normal);
+        caller.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+
+        let summary = MethodTermination::analyze([&marker_body, &caller]);
+        assert!(!summary.apply(&mut caller));
+        assert_eq!(caller.block(BlockId::new(0)).expect("entry").insns.len(), 2);
+        assert_eq!(
+            caller.successors_with_kind(BlockId::new(0)),
+            &[(BlockId::new(1), EdgeKind::Normal)]
+        );
     }
 }
