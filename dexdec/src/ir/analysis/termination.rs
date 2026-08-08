@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::{EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG};
+use crate::ir::{
+    ArgType, EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MethodTermination {
@@ -168,22 +170,26 @@ impl<'a> ReturnReachability<'a> {
     }
 }
 
-/// Kotlin emits these calls as compiler markers around code that is expected
-/// to be inlined. Their runtime implementations deliberately throw, but the
-/// bytecode following the marker is still the source-level continuation that
-/// a decompiler must preserve.
+/// Preserves bytecode continuations that still carry source-level meaning.
+///
+/// A non-void invocation can feed a `move-result` even when its implementation
+/// never returns at runtime. Removing that continuation loses the original
+/// expression or return value. Kotlin reification calls are void compiler
+/// markers with the same property: their throwing runtime implementations are
+/// placeholders for code expected to be inlined.
 fn preserves_source_continuation(target: &MethodReference) -> bool {
-    target.owner.as_object() == Some("kotlin/jvm/internal/Intrinsics")
-        && matches!(
-            target.name.as_str(),
-            "reifiedOperationMarker" | "needClassReification"
-        )
+    target.descriptor.return_type != ArgType::VOID
+        || (target.owner.as_object() == Some("kotlin/jvm/internal/Intrinsics")
+            && matches!(
+                target.name.as_str(),
+                "reifiedOperationMarker" | "needClassReification"
+            ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{ArgType, Block, BlockId, MethodContext, MethodDescriptor};
+    use crate::ir::{Block, BlockId, MethodContext, MethodDescriptor};
 
     fn reference(name: &str) -> MethodReference {
         MethodReference {
@@ -320,6 +326,50 @@ mod tests {
         caller.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
 
         let summary = MethodTermination::analyze([&marker_body, &caller]);
+        assert!(!summary.apply(&mut caller));
+        assert_eq!(caller.block(BlockId::new(0)).expect("entry").insns.len(), 2);
+        assert_eq!(
+            caller.successors_with_kind(BlockId::new(0)),
+            &[(BlockId::new(1), EdgeKind::Normal)]
+        );
+    }
+
+    #[test]
+    fn non_void_no_return_call_preserves_result_continuation() {
+        let target = MethodReference {
+            owner: ArgType::object("example/Test"),
+            name: "failWithValue".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::object("java/lang/Object"),
+            },
+        };
+        let mut target_body = CFG::with_method(MethodContext::new(
+            target.owner.clone(),
+            target.name.clone(),
+            target.descriptor.clone(),
+            true,
+        ));
+        let mut target_entry = Block::new(0);
+        target_entry.push(InsnNode::throw(crate::ir::InsnArg::lit(
+            0,
+            ArgType::object("java/lang/Throwable"),
+        )));
+        target_body.add_block(target_entry);
+
+        let mut caller = graph("caller");
+        let mut entry = Block::new(0);
+        let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        invoke.payload.reference = Some(MemberReference::Method(target));
+        entry.push(invoke);
+        entry.push(InsnNode::goto(1));
+        caller.add_block(entry);
+        let mut normal = Block::new(1);
+        normal.push(InsnNode::return_void());
+        caller.add_block(normal);
+        caller.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+
+        let summary = MethodTermination::analyze([&target_body, &caller]);
         assert!(!summary.apply(&mut caller));
         assert_eq!(caller.block(BlockId::new(0)).expect("entry").insns.len(), 2);
         assert_eq!(
