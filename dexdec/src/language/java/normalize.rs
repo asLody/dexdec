@@ -327,6 +327,7 @@ impl JavaAstNormalizer {
                 child => flattened.push(child),
             }
         }
+        changed |= StringSwitchRecovery::apply(&mut flattened);
         changed |= ConditionalResultJoin::apply(&mut flattened);
         changed |= SwitchResultReturn::apply(&mut flattened);
         changed |= TerminalBranchLinearizer::apply(&mut flattened);
@@ -837,6 +838,265 @@ impl JavaAstRewriter for NameWriteDetector<'_> {
             self.found = true;
         }
         statement
+    }
+}
+
+/// Reconstructs the two-switch lowering used for Java string switches.
+///
+/// `javac`/D8 first switches on `value.hashCode()`, stores a synthetic integer
+/// selector after an `equals` check, and then switches on that selector.  The
+/// source form is both shorter and single-evaluates the string selector.  This
+/// recovery accepts only the canonical one-string-per-hash shape and verifies
+/// every hash and fallback assignment before removing the synthetic local.
+struct StringSwitchRecovery;
+
+impl StringSwitchRecovery {
+    fn apply(statements: &mut Vec<JavaStmt>) -> bool {
+        let mut changed = false;
+        let mut index = 0usize;
+        while index + 2 < statements.len() {
+            let Some((synthetic, replacement)) =
+                Self::candidate(&statements[index..index + 3])
+            else {
+                index += 1;
+                continue;
+            };
+            let used_outside = statements[..index]
+                .iter()
+                .chain(&statements[index + 3..])
+                .any(|statement| SwitchResultReturn::statement_uses(statement, &synthetic));
+            if used_outside {
+                index += 1;
+                continue;
+            }
+            statements.splice(index..index + 3, std::iter::once(replacement));
+            changed = true;
+            index += 1;
+        }
+        changed
+    }
+
+    fn candidate(window: &[JavaStmt]) -> Option<(JavaIdentifier, JavaStmt)> {
+        let [
+            JavaStmt::Variable {
+                ty: JavaType::Primitive(JavaPrimitiveType::Int),
+                name: synthetic,
+                value: Some(JavaExpr::Literal(JavaLiteral::Integer(initial))),
+            },
+            JavaStmt::Switch {
+                label: None,
+                selector: hash_selector,
+                cases: hash_cases,
+            },
+            JavaStmt::Switch {
+                label: None,
+                selector: JavaExpr::Name(action_selector),
+                cases: action_cases,
+            },
+        ] = window
+        else {
+            return None;
+        };
+        if action_selector != synthetic {
+            return None;
+        }
+        let source = Self::hash_receiver(hash_selector)?;
+        if hash_cases.iter().filter(|case| case.is_default).count() != 1 {
+            return None;
+        }
+        let default_case = hash_cases.iter().find(|case| case.is_default)?;
+        if !default_case.labels.is_empty() {
+            return None;
+        }
+        let fallback = Self::fallback_selector(&default_case.body, synthetic)?;
+
+        let mut mappings = Vec::new();
+        for case in hash_cases.iter().filter(|case| !case.is_default) {
+            let [JavaExpr::Literal(JavaLiteral::Integer(hash))] = case.labels.as_slice() else {
+                return None;
+            };
+            let (literal, selected, rejected) =
+                Self::hash_case(&case.body, synthetic, source, *initial)?;
+            if rejected != fallback
+                || Self::string_hash(literal.as_utf16()) != *hash
+                || selected == fallback
+                || mappings
+                    .iter()
+                    .any(|(existing, _): &(i32, JavaLiteral)| existing == &selected)
+            {
+                return None;
+            }
+            mappings.push((selected, JavaLiteral::String(literal.clone())));
+        }
+        if mappings.is_empty() {
+            return None;
+        }
+
+        let mut recovered_cases = Vec::with_capacity(action_cases.len());
+        for case in action_cases {
+            if case
+                .body
+                .iter()
+                .any(|statement| SwitchResultReturn::statement_uses(statement, synthetic))
+            {
+                return None;
+            }
+            if case.is_default {
+                if !case.labels.is_empty() {
+                    return None;
+                }
+                recovered_cases.push(case.clone());
+                continue;
+            }
+            let mut labels = Vec::new();
+            for label in &case.labels {
+                let JavaExpr::Literal(JavaLiteral::Integer(selected)) = label else {
+                    return None;
+                };
+                let Some((_, literal)) = mappings
+                    .iter()
+                    .find(|(candidate, _)| candidate == selected)
+                else {
+                    return None;
+                };
+                labels.push(JavaExpr::Literal(literal.clone()));
+            }
+            if labels.is_empty() {
+                return None;
+            }
+            recovered_cases.push(JavaSwitchCase {
+                labels,
+                body: case.body.clone(),
+                is_default: false,
+            });
+        }
+
+        Some((
+            synthetic.clone(),
+            JavaStmt::Switch {
+                label: None,
+                selector: JavaExpr::Name(source.clone()),
+                cases: recovered_cases,
+            },
+        ))
+    }
+
+    fn hash_receiver(selector: &JavaExpr) -> Option<&JavaIdentifier> {
+        let JavaExpr::Call {
+            receiver: Some(receiver),
+            owner: None,
+            type_arguments,
+            method,
+            args,
+        } = selector
+        else {
+            return None;
+        };
+        if !type_arguments.is_empty() || method.as_str() != "hashCode" || !args.is_empty() {
+            return None;
+        }
+        let JavaExpr::Name(source) = receiver.as_ref() else {
+            return None;
+        };
+        Some(source)
+    }
+
+    fn hash_case<'a>(
+        body: &'a [JavaStmt],
+        synthetic: &JavaIdentifier,
+        source: &JavaIdentifier,
+        initial: i32,
+    ) -> Option<(&'a crate::ir::Utf16String, i32, i32)> {
+        let [
+            JavaStmt::If {
+                condition,
+                then_stmt,
+                else_stmt: None,
+            },
+            JavaStmt::Assign {
+                target: JavaExpr::Name(rejected_target),
+                op: JavaAssignOp::Assign,
+                value: JavaExpr::Literal(JavaLiteral::Integer(rejected)),
+            },
+            JavaStmt::Break(None),
+        ] = body
+        else {
+            return None;
+        };
+        if rejected_target != synthetic {
+            return None;
+        }
+        let literal = Self::equals_literal(condition, source)?;
+        let selected = Self::selected_value(then_stmt, synthetic, initial)?;
+        Some((literal, selected, *rejected))
+    }
+
+    fn equals_literal<'a>(
+        condition: &'a JavaExpr,
+        source: &JavaIdentifier,
+    ) -> Option<&'a crate::ir::Utf16String> {
+        let JavaExpr::Call {
+            receiver: Some(receiver),
+            owner: None,
+            type_arguments,
+            method,
+            args,
+        } = condition
+        else {
+            return None;
+        };
+        let [JavaExpr::Literal(JavaLiteral::String(literal))] = args.as_slice() else {
+            return None;
+        };
+        (type_arguments.is_empty()
+            && method.as_str() == "equals"
+            && matches!(receiver.as_ref(), JavaExpr::Name(candidate) if candidate == source))
+        .then_some(literal)
+    }
+
+    fn selected_value(
+        statement: &JavaStmt,
+        synthetic: &JavaIdentifier,
+        initial: i32,
+    ) -> Option<i32> {
+        let statements = match statement {
+            JavaStmt::Block(statements) => statements.as_slice(),
+            JavaStmt::Break(None) => return Some(initial),
+            _ => return None,
+        };
+        match statements {
+            [JavaStmt::Break(None)] => Some(initial),
+            [
+                JavaStmt::Assign {
+                    target: JavaExpr::Name(target),
+                    op: JavaAssignOp::Assign,
+                    value: JavaExpr::Literal(JavaLiteral::Integer(value)),
+                },
+                JavaStmt::Break(None),
+            ] if target == synthetic => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn fallback_selector(body: &[JavaStmt], synthetic: &JavaIdentifier) -> Option<i32> {
+        let [
+            JavaStmt::Assign {
+                target: JavaExpr::Name(target),
+                op: JavaAssignOp::Assign,
+                value: JavaExpr::Literal(JavaLiteral::Integer(value)),
+            },
+            JavaStmt::Break(None),
+        ] = body
+        else {
+            return None;
+        };
+        (target == synthetic).then_some(*value)
+    }
+
+    fn string_hash(units: &[u16]) -> i32 {
+        units.iter().fold(0i32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(i32::from(*unit))
+        })
     }
 }
 
@@ -1872,6 +2132,169 @@ mod tests {
 
         assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
         assert_eq!(body.root, original.root);
+    }
+
+    fn assign_integer(name: &JavaIdentifier, value: i32) -> JavaStmt {
+        JavaStmt::Assign {
+            target: JavaExpr::Name(name.clone()),
+            op: JavaAssignOp::Assign,
+            value: JavaExpr::Literal(JavaLiteral::Integer(value)),
+        }
+    }
+
+    fn string_call(receiver: &JavaIdentifier, method: &str, args: Vec<JavaExpr>) -> JavaExpr {
+        JavaExpr::Call {
+            receiver: Some(Box::new(JavaExpr::Name(receiver.clone()))),
+            owner: None,
+            type_arguments: Vec::new(),
+            method: JavaIdentifier::from_dex(method),
+            args,
+        }
+    }
+
+    fn lowered_string_switch() -> JavaMethodBody {
+        let source = JavaIdentifier::from_dex("source");
+        let synthetic = JavaIdentifier::from_dex("selector");
+        let hash_case = |literal: &str, selected: i32| JavaSwitchCase {
+            labels: vec![JavaExpr::Literal(JavaLiteral::Integer(
+                StringSwitchRecovery::string_hash(
+                    &literal.encode_utf16().collect::<Vec<_>>(),
+                ),
+            ))],
+            body: vec![
+                JavaStmt::If {
+                    condition: string_call(
+                        &source,
+                        "equals",
+                        vec![JavaExpr::Literal(JavaLiteral::String(literal.into()))],
+                    ),
+                    then_stmt: Box::new(JavaStmt::Block(if selected == 0 {
+                        vec![JavaStmt::Break(None)]
+                    } else {
+                        vec![assign_integer(&synthetic, selected), JavaStmt::Break(None)]
+                    })),
+                    else_stmt: None,
+                },
+                assign_integer(&synthetic, -1),
+                JavaStmt::Break(None),
+            ],
+            is_default: false,
+        };
+        JavaMethodBody {
+            root: JavaStmt::Block(vec![
+                JavaStmt::Variable {
+                    ty: JavaType::Primitive(JavaPrimitiveType::Int),
+                    name: synthetic.clone(),
+                    value: Some(JavaExpr::Literal(JavaLiteral::Integer(0))),
+                },
+                JavaStmt::Switch {
+                    label: None,
+                    selector: string_call(&source, "hashCode", Vec::new()),
+                    cases: vec![
+                        hash_case("alpha", 0),
+                        hash_case("beta", 1),
+                        JavaSwitchCase {
+                            labels: Vec::new(),
+                            body: vec![
+                                assign_integer(&synthetic, -1),
+                                JavaStmt::Break(None),
+                            ],
+                            is_default: true,
+                        },
+                    ],
+                },
+                JavaStmt::Switch {
+                    label: None,
+                    selector: JavaExpr::Name(synthetic),
+                    cases: vec![
+                        JavaSwitchCase {
+                            labels: vec![JavaExpr::Literal(JavaLiteral::Integer(0))],
+                            body: vec![marker("first"), JavaStmt::Break(None)],
+                            is_default: false,
+                        },
+                        JavaSwitchCase {
+                            labels: vec![JavaExpr::Literal(JavaLiteral::Integer(1))],
+                            body: vec![marker("second"), JavaStmt::Break(None)],
+                            is_default: false,
+                        },
+                        JavaSwitchCase {
+                            labels: Vec::new(),
+                            body: vec![marker("fallback"), JavaStmt::Break(None)],
+                            is_default: true,
+                        },
+                    ],
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn reconstructs_verified_string_switch() {
+        let mut body = lowered_string_switch();
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let [JavaStmt::Switch {
+            selector: JavaExpr::Name(source),
+            cases,
+            ..
+        }] = statements.as_slice()
+        else {
+            panic!("expected recovered string switch");
+        };
+        assert_eq!(source.as_str(), "source");
+        assert!(matches!(
+            cases[0].labels.as_slice(),
+            [JavaExpr::Literal(JavaLiteral::String(value))] if value.to_string_lossy() == "alpha"
+        ));
+        assert!(matches!(
+            cases[1].labels.as_slice(),
+            [JavaExpr::Literal(JavaLiteral::String(value))] if value.to_string_lossy() == "beta"
+        ));
+        assert!(cases[2].is_default);
+    }
+
+    #[test]
+    fn keeps_string_switch_lowering_when_hash_is_not_verified() {
+        let mut body = lowered_string_switch();
+        let JavaStmt::Block(statements) = &mut body.root else {
+            unreachable!();
+        };
+        let JavaStmt::Switch { cases, .. } = &mut statements[1] else {
+            unreachable!();
+        };
+        cases[0].labels[0] = JavaExpr::Literal(JavaLiteral::Integer(0));
+
+        JavaAstNormalizer.apply(&mut body).unwrap();
+        let JavaStmt::Block(statements) = &body.root else {
+            unreachable!();
+        };
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| matches!(statement, JavaStmt::Switch { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn keeps_string_switch_selector_when_used_after_dispatch() {
+        let mut body = lowered_string_switch();
+        let JavaStmt::Block(statements) = &mut body.root else {
+            unreachable!();
+        };
+        statements.push(JavaStmt::Expression(JavaExpr::Name(
+            JavaIdentifier::from_dex("selector"),
+        )));
+
+        JavaAstNormalizer.apply(&mut body).unwrap();
+        let JavaStmt::Block(statements) = &body.root else {
+            unreachable!();
+        };
+        assert!(matches!(statements.first(), Some(JavaStmt::Variable { .. })));
     }
 
     fn result_switch(has_default: bool, initializer: Option<JavaExpr>) -> JavaMethodBody {
