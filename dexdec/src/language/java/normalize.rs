@@ -327,6 +327,18 @@ impl JavaAstNormalizer {
                 child => flattened.push(child),
             }
         }
+        let before = flattened.len();
+        flattened.retain(|statement| {
+            !matches!(
+                statement,
+                JavaStmt::If {
+                    condition,
+                    then_stmt,
+                    else_stmt: None,
+                } if Self::is_empty(then_stmt) && Self::pure_condition(condition)
+            )
+        });
+        changed |= flattened.len() != before;
         changed |= StringSwitchRecovery::apply(&mut flattened);
         changed |= ConditionalResultJoin::apply(&mut flattened);
         changed |= SwitchResultReturn::apply(&mut flattened);
@@ -599,6 +611,49 @@ impl JavaAstNormalizer {
             || matches!(statement, JavaStmt::Block(statements) if statements.is_empty())
     }
 
+    fn pure_condition(expression: &JavaExpr) -> bool {
+        match expression {
+            JavaExpr::This
+            | JavaExpr::QualifiedThis(_)
+            | JavaExpr::Super
+            | JavaExpr::Name(_)
+            | JavaExpr::Literal(_)
+            | JavaExpr::ClassLiteral(_) => true,
+            JavaExpr::Unary {
+                op: JavaUnaryOp::LogicalNot,
+                operand,
+            }
+            | JavaExpr::InstanceOf { value: operand, .. } => Self::pure_condition(operand),
+            JavaExpr::Binary { left, op, right } => {
+                !matches!(op, JavaBinaryOp::Divide | JavaBinaryOp::Remainder)
+                    && Self::pure_condition(left)
+                    && Self::pure_condition(right)
+            }
+            JavaExpr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                Self::pure_condition(condition)
+                    && Self::pure_condition(when_true)
+                    && Self::pure_condition(when_false)
+            }
+            JavaExpr::Cast { .. }
+            | JavaExpr::Field { .. }
+            | JavaExpr::ArrayAccess { .. }
+            | JavaExpr::Call { .. }
+            | JavaExpr::MethodReference { .. }
+            | JavaExpr::Lambda { .. }
+            | JavaExpr::BlockLambda { .. }
+            | JavaExpr::New { .. }
+            | JavaExpr::NewArray { .. }
+            | JavaExpr::StaticField { .. }
+            | JavaExpr::Update { .. }
+            | JavaExpr::Assignment { .. }
+            | JavaExpr::Unary { .. } => false,
+        }
+    }
+
     fn strip_terminal_void_return(statement: &mut JavaStmt) -> bool {
         match statement {
             JavaStmt::Return(None) => {
@@ -646,39 +701,32 @@ impl ConditionalResultJoin {
     }
 
     fn candidate(window: &[JavaStmt]) -> Option<JavaStmt> {
-        let [
-            JavaStmt::Variable {
-                ty: JavaType::Primitive(JavaPrimitiveType::Boolean),
-                name,
-                value: Some(JavaExpr::Literal(JavaLiteral::Boolean(false))),
-            },
-            JavaStmt::If {
-                condition: guard,
-                then_stmt: guarded,
-                else_stmt: None,
-            },
-            JavaStmt::If {
-                condition: complement,
-                then_stmt: fallback,
-                else_stmt: None,
-            },
-        ] = window
+        let [JavaStmt::Variable {
+            ty: JavaType::Primitive(JavaPrimitiveType::Boolean),
+            name,
+            value: Some(JavaExpr::Literal(JavaLiteral::Boolean(false))),
+        }, JavaStmt::If {
+            condition: guard,
+            then_stmt: guarded,
+            else_stmt: None,
+        }, JavaStmt::If {
+            condition: complement,
+            then_stmt: fallback,
+            else_stmt: None,
+        }] = window
         else {
             return None;
         };
         let guarded = Self::statements(guarded)?;
-        let [
-            JavaStmt::Assign {
-                target: JavaExpr::Name(assigned),
-                op: JavaAssignOp::Assign,
-                value,
-            },
-            JavaStmt::If {
-                condition: JavaExpr::Name(tested),
-                then_stmt: success,
-                else_stmt: None,
-            },
-        ] = guarded
+        let [JavaStmt::Assign {
+            target: JavaExpr::Name(assigned),
+            op: JavaAssignOp::Assign,
+            value,
+        }, JavaStmt::If {
+            condition: JavaExpr::Name(tested),
+            then_stmt: success,
+            else_stmt: None,
+        }] = guarded
         else {
             return None;
         };
@@ -723,11 +771,7 @@ impl ConditionalResultJoin {
         }
     }
 
-    fn is_complement(
-        expression: &JavaExpr,
-        guard: &JavaExpr,
-        result: &JavaIdentifier,
-    ) -> bool {
+    fn is_complement(expression: &JavaExpr, guard: &JavaExpr, result: &JavaIdentifier) -> bool {
         let JavaExpr::Binary {
             left,
             op: JavaBinaryOp::LogicalOr,
@@ -771,11 +815,7 @@ impl ConditionalResultJoin {
                     condition,
                     when_true,
                     when_false,
-                } => pending.extend([
-                    condition.as_ref(),
-                    when_true.as_ref(),
-                    when_false.as_ref(),
-                ]),
+                } => pending.extend([condition.as_ref(), when_true.as_ref(), when_false.as_ref()]),
                 JavaExpr::Field { .. }
                 | JavaExpr::StaticField { .. }
                 | JavaExpr::ArrayAccess { .. }
@@ -792,7 +832,10 @@ impl ConditionalResultJoin {
         true
     }
 
-    fn collect_names(expression: &JavaExpr, names: &mut std::collections::BTreeSet<JavaIdentifier>) {
+    fn collect_names(
+        expression: &JavaExpr,
+        names: &mut std::collections::BTreeSet<JavaIdentifier>,
+    ) {
         struct Collector<'a>(&'a mut std::collections::BTreeSet<JavaIdentifier>);
         impl JavaAstRewriter for Collector<'_> {
             fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
@@ -855,8 +898,7 @@ impl StringSwitchRecovery {
         let mut changed = false;
         let mut index = 0usize;
         while index + 2 < statements.len() {
-            let Some((synthetic, replacement)) =
-                Self::candidate(&statements[index..index + 3])
+            let Some((synthetic, replacement)) = Self::candidate(&statements[index..index + 3])
             else {
                 index += 1;
                 continue;
@@ -877,23 +919,19 @@ impl StringSwitchRecovery {
     }
 
     fn candidate(window: &[JavaStmt]) -> Option<(JavaIdentifier, JavaStmt)> {
-        let [
-            JavaStmt::Variable {
-                ty: JavaType::Primitive(JavaPrimitiveType::Int),
-                name: synthetic,
-                value: Some(JavaExpr::Literal(JavaLiteral::Integer(initial))),
-            },
-            JavaStmt::Switch {
-                label: None,
-                selector: hash_selector,
-                cases: hash_cases,
-            },
-            JavaStmt::Switch {
-                label: None,
-                selector: JavaExpr::Name(action_selector),
-                cases: action_cases,
-            },
-        ] = window
+        let [JavaStmt::Variable {
+            ty: JavaType::Primitive(JavaPrimitiveType::Int),
+            name: synthetic,
+            value: Some(JavaExpr::Literal(JavaLiteral::Integer(initial))),
+        }, JavaStmt::Switch {
+            label: None,
+            selector: hash_selector,
+            cases: hash_cases,
+        }, JavaStmt::Switch {
+            label: None,
+            selector: JavaExpr::Name(action_selector),
+            cases: action_cases,
+        }] = window
         else {
             return None;
         };
@@ -953,9 +991,8 @@ impl StringSwitchRecovery {
                 let JavaExpr::Literal(JavaLiteral::Integer(selected)) = label else {
                     return None;
                 };
-                let Some((_, literal)) = mappings
-                    .iter()
-                    .find(|(candidate, _)| candidate == selected)
+                let Some((_, literal)) =
+                    mappings.iter().find(|(candidate, _)| candidate == selected)
                 else {
                     return None;
                 };
@@ -1007,19 +1044,15 @@ impl StringSwitchRecovery {
         source: &JavaIdentifier,
         initial: i32,
     ) -> Option<(&'a crate::ir::Utf16String, i32, i32)> {
-        let [
-            JavaStmt::If {
-                condition,
-                then_stmt,
-                else_stmt: None,
-            },
-            JavaStmt::Assign {
-                target: JavaExpr::Name(rejected_target),
-                op: JavaAssignOp::Assign,
-                value: JavaExpr::Literal(JavaLiteral::Integer(rejected)),
-            },
-            JavaStmt::Break(None),
-        ] = body
+        let [JavaStmt::If {
+            condition,
+            then_stmt,
+            else_stmt: None,
+        }, JavaStmt::Assign {
+            target: JavaExpr::Name(rejected_target),
+            op: JavaAssignOp::Assign,
+            value: JavaExpr::Literal(JavaLiteral::Integer(rejected)),
+        }, JavaStmt::Break(None)] = body
         else {
             return None;
         };
@@ -1066,27 +1099,25 @@ impl StringSwitchRecovery {
         };
         match statements {
             [JavaStmt::Break(None)] => Some(initial),
-            [
-                JavaStmt::Assign {
-                    target: JavaExpr::Name(target),
-                    op: JavaAssignOp::Assign,
-                    value: JavaExpr::Literal(JavaLiteral::Integer(value)),
-                },
-                JavaStmt::Break(None),
-            ] if target == synthetic => Some(*value),
+            [JavaStmt::Assign {
+                target: JavaExpr::Name(target),
+                op: JavaAssignOp::Assign,
+                value: JavaExpr::Literal(JavaLiteral::Integer(value)),
+            }, JavaStmt::Break(None)]
+                if target == synthetic =>
+            {
+                Some(*value)
+            }
             _ => None,
         }
     }
 
     fn fallback_selector(body: &[JavaStmt], synthetic: &JavaIdentifier) -> Option<i32> {
-        let [
-            JavaStmt::Assign {
-                target: JavaExpr::Name(target),
-                op: JavaAssignOp::Assign,
-                value: JavaExpr::Literal(JavaLiteral::Integer(value)),
-            },
-            JavaStmt::Break(None),
-        ] = body
+        let [JavaStmt::Assign {
+            target: JavaExpr::Name(target),
+            op: JavaAssignOp::Assign,
+            value: JavaExpr::Literal(JavaLiteral::Integer(value)),
+        }, JavaStmt::Break(None)] = body
         else {
             return None;
         };
@@ -1127,27 +1158,21 @@ impl SwitchResultReturn {
     }
 
     fn candidate(window: &[JavaStmt]) -> Option<JavaStmt> {
-        let [
-            JavaStmt::Variable {
-                name,
-                value: initializer,
-                ..
-            },
-            JavaStmt::Switch {
-                label: None,
-                selector,
-                cases,
-            },
-            terminal,
-        ] = window
+        let [JavaStmt::Variable {
+            name,
+            value: initializer,
+            ..
+        }, JavaStmt::Switch {
+            label: None,
+            selector,
+            cases,
+        }, terminal] = window
         else {
             return None;
         };
         let projection = match terminal {
             JavaStmt::Return(Some(JavaExpr::Name(returned))) if returned == name => None,
-            JavaStmt::Return(Some(JavaExpr::Cast { ty, value }))
-                if matches!(value.as_ref(), JavaExpr::Name(returned) if returned == name) =>
-            {
+            JavaStmt::Return(Some(JavaExpr::Cast { ty, value })) if matches!(value.as_ref(), JavaExpr::Name(returned) if returned == name) => {
                 Some(ty)
             }
             _ => return None,
@@ -1990,7 +2015,10 @@ mod tests {
         let JavaStmt::Block(statements) = &body.root else {
             panic!("expected method block");
         };
-        let JavaStmt::Variable { value: Some(value), .. } = &statements[0] else {
+        let JavaStmt::Variable {
+            value: Some(value), ..
+        } = &statements[0]
+        else {
             panic!("expected variable initializer");
         };
         assert_eq!(
@@ -2022,10 +2050,60 @@ mod tests {
         let JavaStmt::Block(statements) = &body.root else {
             panic!("expected method block");
         };
-        let JavaStmt::Variable { value: Some(value), .. } = &statements[0] else {
+        let JavaStmt::Variable {
+            value: Some(value), ..
+        } = &statements[0]
+        else {
             panic!("expected variable initializer");
         };
         assert_eq!(value, &expression);
+    }
+
+    #[test]
+    fn removes_pure_empty_if() {
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![
+                JavaStmt::If {
+                    condition: JavaExpr::Binary {
+                        left: Box::new(JavaExpr::Name(JavaIdentifier::from_dex("ready"))),
+                        op: JavaBinaryOp::Equal,
+                        right: Box::new(JavaExpr::Literal(JavaLiteral::Boolean(true))),
+                    },
+                    then_stmt: Box::new(JavaStmt::Empty),
+                    else_stmt: None,
+                },
+                marker("work"),
+            ]),
+        };
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        assert!(matches!(
+            body.root,
+            JavaStmt::Block(statements)
+                if statements.len() == 1
+                    && matches!(&statements[0], JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "work")
+        ));
+    }
+
+    #[test]
+    fn keeps_effectful_empty_if() {
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::If {
+                condition: JavaExpr::Call {
+                    receiver: None,
+                    owner: None,
+                    type_arguments: Vec::new(),
+                    method: JavaIdentifier::from_dex("ready"),
+                    args: Vec::new(),
+                },
+                then_stmt: Box::new(JavaStmt::Empty),
+                else_stmt: None,
+            }]),
+        };
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
     }
 
     #[test]
@@ -2202,8 +2280,12 @@ mod tests {
             } if left.as_ref() == &guard
                 && matches!(right.as_ref(), JavaExpr::Name(name) if name.as_str() == "predicate")
         ));
-        assert!(matches!(then_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "success"));
-        assert!(matches!(else_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "fallback"));
+        assert!(
+            matches!(then_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "success")
+        );
+        assert!(
+            matches!(else_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "fallback")
+        );
     }
 
     #[test]
@@ -2271,9 +2353,7 @@ mod tests {
         let synthetic = JavaIdentifier::from_dex("selector");
         let hash_case = |literal: &str, selected: i32| JavaSwitchCase {
             labels: vec![JavaExpr::Literal(JavaLiteral::Integer(
-                StringSwitchRecovery::string_hash(
-                    &literal.encode_utf16().collect::<Vec<_>>(),
-                ),
+                StringSwitchRecovery::string_hash(&literal.encode_utf16().collect::<Vec<_>>()),
             ))],
             body: vec![
                 JavaStmt::If {
@@ -2309,10 +2389,7 @@ mod tests {
                         hash_case("beta", 1),
                         JavaSwitchCase {
                             labels: Vec::new(),
-                            body: vec![
-                                assign_integer(&synthetic, -1),
-                                JavaStmt::Break(None),
-                            ],
+                            body: vec![assign_integer(&synthetic, -1), JavaStmt::Break(None)],
                             is_default: true,
                         },
                     ],
@@ -2408,7 +2485,10 @@ mod tests {
         let JavaStmt::Block(statements) = &body.root else {
             unreachable!();
         };
-        assert!(matches!(statements.first(), Some(JavaStmt::Variable { .. })));
+        assert!(matches!(
+            statements.first(),
+            Some(JavaStmt::Variable { .. })
+        ));
     }
 
     fn result_switch(has_default: bool, initializer: Option<JavaExpr>) -> JavaMethodBody {
