@@ -2168,8 +2168,9 @@ impl AnonymousInstance {
             values: captures,
             identity: candidate.identity.as_ref(),
             value_types,
+            substitute_this: true,
         }
-        .rewrite_anonymous_body(&mut body);
+        .rewrite_root_anonymous_body(&mut body);
         if let Some(identity) = candidate.identity.as_ref() {
             AnonymousIdentitySubstitution { identity }.rewrite_anonymous_body(&mut body);
         }
@@ -2655,9 +2656,19 @@ struct CaptureSubstitution<'a> {
     values: BTreeMap<JavaIdentifier, JavaExpr>,
     identity: Option<&'a JavaType>,
     value_types: &'a BTreeMap<JavaIdentifier, LexicalValueType>,
+    // A nested anonymous body's `this` owns a separate field namespace. Its
+    // explicit QualifiedThis references can still target this capture owner.
+    substitute_this: bool,
 }
 
 impl JavaAstRewriter for CaptureSubstitution<'_> {
+    fn rewrite_anonymous_body(&mut self, body: &mut JavaAnonymousClassBody) {
+        let substitute_this = self.substitute_this;
+        self.substitute_this = false;
+        self.rewrite_anonymous_members(body);
+        self.substitute_this = substitute_this;
+    }
+
     fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
         match expression {
             JavaExpr::Cast { ty, value }
@@ -2668,7 +2679,7 @@ impl JavaAstRewriter for CaptureSubstitution<'_> {
                 *value
             }
             JavaExpr::Field { owner, name }
-                if matches!(owner.as_ref(), JavaExpr::This)
+                if self.substitute_this && matches!(owner.as_ref(), JavaExpr::This)
                     || matches!(
                         (owner.as_ref(), self.identity),
                         (JavaExpr::QualifiedThis(owner), Some(identity)) if owner == identity
@@ -2685,6 +2696,36 @@ impl JavaAstRewriter for CaptureSubstitution<'_> {
 }
 
 impl CaptureSubstitution<'_> {
+    fn rewrite_root_anonymous_body(&mut self, body: &mut JavaAnonymousClassBody) {
+        self.rewrite_anonymous_members(body);
+    }
+
+    fn rewrite_anonymous_members(&mut self, body: &mut JavaAnonymousClassBody) {
+        for field in &mut body.fields {
+            self.rewrite_annotations(&mut field.annotations);
+            field.initializer = field
+                .initializer
+                .take()
+                .map(|value| self.rewrite_expression(value));
+        }
+        for method in &mut body.methods {
+            self.rewrite_annotations(&mut method.annotations);
+            for parameter in &mut method.parameters {
+                self.rewrite_annotations(&mut parameter.annotations);
+            }
+            if let Some(body) = &mut method.body {
+                self.rewrite_body(body);
+            }
+        }
+        let substitute_this = self.substitute_this;
+        self.substitute_this = false;
+        for nested in &mut body.nested {
+            self.rewrite_type_declaration(nested);
+        }
+        self.substitute_this = substitute_this;
+        self.finish_anonymous_body(body);
+    }
+
     fn capture_type(&self, expression: &JavaExpr) -> Option<&LexicalValueType> {
         match expression {
             JavaExpr::Name(name) if self.values.values().any(|captured| captured == expression) => {
@@ -2703,5 +2744,82 @@ impl CaptureSubstitution<'_> {
             (JavaType::Variable(left), JavaType::Variable(right)) => left == right,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_substitution_tests {
+    use super::*;
+    use crate::language::java::JavaFieldDeclaration;
+
+    fn field(name: &str, initializer: JavaExpr) -> JavaFieldDeclaration {
+        JavaFieldDeclaration {
+            annotations: Vec::new(),
+            modifiers: Vec::new(),
+            ty: JavaType::Class(JavaClassType::from_source("java.lang.Object")),
+            name: JavaIdentifier::from_dex(name),
+            initializer: Some(initializer),
+        }
+    }
+
+    #[test]
+    fn captured_field_substitution_stops_at_nested_anonymous_body() {
+        let captured = JavaIdentifier::from_dex("captured");
+        let direct_reference = JavaExpr::Field {
+            owner: Box::new(JavaExpr::This),
+            name: captured.clone(),
+        };
+        let nested_reference = direct_reference.clone();
+        let identity = JavaType::Class(JavaClassType::from_source("example.ParentAnonymous"));
+        let enclosing_reference = JavaExpr::Field {
+            owner: Box::new(JavaExpr::QualifiedThis(identity.clone())),
+            name: captured.clone(),
+        };
+        let nested_body = JavaAnonymousClassBody {
+            fields: vec![
+                field("nestedUse", nested_reference.clone()),
+                field("enclosingUse", enclosing_reference),
+            ],
+            methods: Vec::new(),
+            nested: Vec::new(),
+        };
+        let mut body = JavaAnonymousClassBody {
+            fields: vec![
+                field("directUse", direct_reference),
+                field(
+                    "nested",
+                    JavaExpr::New {
+                        enclosing: None,
+                        ty: JavaType::Class(JavaClassType::from_source("example.Listener")),
+                        target_type: None,
+                        args: Vec::new(),
+                        anonymous_body: Some(Box::new(nested_body)),
+                    },
+                ),
+            ],
+            methods: Vec::new(),
+            nested: Vec::new(),
+        };
+        let replacement = JavaExpr::Name(JavaIdentifier::from_dex("value"));
+        let value_types = BTreeMap::new();
+
+        CaptureSubstitution {
+            values: BTreeMap::from([(captured, replacement.clone())]),
+            identity: Some(&identity),
+            value_types: &value_types,
+            substitute_this: true,
+        }
+        .rewrite_root_anonymous_body(&mut body);
+
+        assert_eq!(body.fields[0].initializer, Some(replacement.clone()));
+        let Some(JavaExpr::New {
+            anonymous_body: Some(nested),
+            ..
+        }) = body.fields[1].initializer.as_ref()
+        else {
+            panic!("expected nested anonymous body");
+        };
+        assert_eq!(nested.fields[0].initializer, Some(nested_reference));
+        assert_eq!(nested.fields[1].initializer, Some(replacement));
     }
 }

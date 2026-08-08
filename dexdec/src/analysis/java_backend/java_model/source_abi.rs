@@ -63,6 +63,10 @@ pub(in crate::analysis::java_backend) struct OuterInstanceField {
 }
 
 impl OuterInstanceField {
+    pub(in crate::analysis::java_backend) fn reference(&self) -> &FieldReference {
+        &self.reference
+    }
+
     /// Proves the enclosing-instance field from constructor def-use rather
     /// than field names or type uniqueness. This is required for local and
     /// anonymous classes, where another captured value can have the same type
