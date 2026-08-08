@@ -1,5 +1,5 @@
 use super::{
-    JavaAstRewriter, JavaBinaryOp, JavaCatch, JavaExpr, JavaIdentifier, JavaLiteral,
+    JavaAssignOp, JavaAstRewriter, JavaBinaryOp, JavaCatch, JavaExpr, JavaIdentifier, JavaLiteral,
     JavaMethodBody, JavaPrimitiveType, JavaStmt, JavaSwitchCase, JavaType,
 };
 
@@ -244,6 +244,7 @@ impl JavaAstNormalizer {
                 child => flattened.push(child),
             }
         }
+        changed |= SwitchResultReturn::apply(&mut flattened);
         changed |= TerminalBranchLinearizer::apply(&mut flattened);
         (flattened, changed)
     }
@@ -531,6 +532,152 @@ impl JavaAstNormalizer {
             JavaStmt::Synchronized { body, .. } => Self::strip_terminal_void_return(body),
             _ => false,
         }
+    }
+}
+
+/// Replaces a synthetic result local around a total switch with direct returns.
+///
+/// DEX has no expression-valued switch, so value recovery can naturally produce
+/// `T result = null; switch (...) { case ...: result = value; break; } return result;`.
+/// Once every switch entry is known to terminate, keeping the accumulator only
+/// obscures the original source shape. This rewrite is deliberately conservative:
+/// it requires a side-effect-free initializer, a default case, and no other use
+/// of the local.
+struct SwitchResultReturn;
+
+impl SwitchResultReturn {
+    fn apply(statements: &mut Vec<JavaStmt>) -> bool {
+        let mut changed = false;
+        let mut index = 0usize;
+        while index + 2 < statements.len() {
+            let Some(replacement) = Self::candidate(&statements[index..index + 3]) else {
+                index += 1;
+                continue;
+            };
+            statements.splice(index..index + 3, std::iter::once(replacement));
+            changed = true;
+            index += 1;
+        }
+        changed
+    }
+
+    fn candidate(window: &[JavaStmt]) -> Option<JavaStmt> {
+        let [
+            JavaStmt::Variable {
+                name,
+                value: initializer,
+                ..
+            },
+            JavaStmt::Switch {
+                label: None,
+                selector,
+                cases,
+            },
+            terminal,
+        ] = window
+        else {
+            return None;
+        };
+        let projection = match terminal {
+            JavaStmt::Return(Some(JavaExpr::Name(returned))) if returned == name => None,
+            JavaStmt::Return(Some(JavaExpr::Cast { ty, value }))
+                if matches!(value.as_ref(), JavaExpr::Name(returned) if returned == name) =>
+            {
+                Some(ty)
+            }
+            _ => return None,
+        };
+        if !initializer
+            .as_ref()
+            .is_none_or(|value| matches!(value, JavaExpr::Literal(_)))
+            || !cases.iter().any(|case| case.is_default)
+            || Self::expression_uses(selector, name)
+        {
+            return None;
+        }
+
+        let mut cases = cases.clone();
+        for case in &mut cases {
+            if case
+                .labels
+                .iter()
+                .any(|label| Self::expression_uses(label, name))
+                || !Self::rewrite_case(&mut case.body, name, projection)
+            {
+                return None;
+            }
+        }
+        if TerminalBranchLinearizer::switch_can_complete_normally(None, &cases) {
+            return None;
+        }
+        Some(JavaStmt::Switch {
+            label: None,
+            selector: selector.clone(),
+            cases,
+        })
+    }
+
+    fn rewrite_case(
+        body: &mut Vec<JavaStmt>,
+        target: &JavaIdentifier,
+        projection: Option<&JavaType>,
+    ) -> bool {
+        if body.is_empty() {
+            // An empty case falls through to the next case. The final completion
+            // check below proves that it still reaches a terminal case body.
+            return true;
+        }
+
+        if matches!(body.last(), Some(JavaStmt::Return(_) | JavaStmt::Throw(_))) {
+            return !body
+                .iter()
+                .any(|statement| Self::statement_uses(statement, target));
+        }
+
+        let Some(JavaStmt::Break(None)) = body.last() else {
+            return false;
+        };
+        let Some(JavaStmt::Assign {
+            target: JavaExpr::Name(assigned),
+            op: JavaAssignOp::Assign,
+            value,
+        }) = body.get(body.len().saturating_sub(2))
+        else {
+            return false;
+        };
+        if assigned != target
+            || Self::expression_uses(value, target)
+            || body[..body.len() - 2]
+                .iter()
+                .any(|statement| Self::statement_uses(statement, target))
+        {
+            return false;
+        }
+
+        let value = match projection {
+            Some(ty) if !matches!(value, JavaExpr::Cast { ty: cast, .. } if cast == ty) => {
+                JavaExpr::Cast {
+                    ty: ty.clone(),
+                    value: Box::new(value.clone()),
+                }
+            }
+            _ => value.clone(),
+        };
+        body.truncate(body.len() - 2);
+        body.push(JavaStmt::Return(Some(value)));
+        true
+    }
+
+    fn expression_uses(expression: &JavaExpr, target: &JavaIdentifier) -> bool {
+        let mut counter = NameUseCounter { target, count: 0 };
+        counter.rewrite_expression(expression.clone());
+        counter.count != 0
+    }
+
+    fn statement_uses(statement: &JavaStmt, target: &JavaIdentifier) -> bool {
+        let mut counter = NameUseCounter { target, count: 0 };
+        counter.rewrite_statement(statement.clone());
+        counter.count != 0
     }
 }
 
@@ -1197,6 +1344,135 @@ impl JavaAstRewriter for NameUseCounter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result_switch(has_default: bool, initializer: Option<JavaExpr>) -> JavaMethodBody {
+        let result = JavaIdentifier::from_dex("result");
+        JavaMethodBody {
+            root: JavaStmt::Block(vec![
+                JavaStmt::Variable {
+                    ty: JavaType::Variable(JavaIdentifier::from_dex("T")),
+                    name: result.clone(),
+                    value: initializer,
+                },
+                JavaStmt::Switch {
+                    label: None,
+                    selector: JavaExpr::Name(JavaIdentifier::from_dex("selector")),
+                    cases: vec![
+                        JavaSwitchCase {
+                            labels: vec![JavaExpr::Literal(JavaLiteral::Integer(0))],
+                            body: vec![
+                                JavaStmt::Assign {
+                                    target: JavaExpr::Name(result.clone()),
+                                    op: JavaAssignOp::Assign,
+                                    value: JavaExpr::Name(JavaIdentifier::from_dex("first")),
+                                },
+                                JavaStmt::Break(None),
+                            ],
+                            is_default: false,
+                        },
+                        JavaSwitchCase {
+                            labels: Vec::new(),
+                            body: vec![JavaStmt::Throw(JavaExpr::Name(JavaIdentifier::from_dex(
+                                "invalid",
+                            )))],
+                            is_default: has_default,
+                        },
+                    ],
+                },
+                JavaStmt::Return(Some(JavaExpr::Name(result))),
+            ]),
+        }
+    }
+
+    #[test]
+    fn total_switch_returns_values_directly() {
+        let mut body = result_switch(true, Some(JavaExpr::Literal(JavaLiteral::Null)));
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let [JavaStmt::Switch { cases, .. }] = statements.as_slice() else {
+            panic!("expected direct switch");
+        };
+        assert!(matches!(
+            cases[0].body.as_slice(),
+            [JavaStmt::Return(Some(JavaExpr::Name(value)))] if value.as_str() == "first"
+        ));
+        assert!(matches!(cases[1].body.as_slice(), [JavaStmt::Throw(_)]));
+    }
+
+    #[test]
+    fn total_switch_preserves_final_result_cast() {
+        let mut body = result_switch(true, Some(JavaExpr::Literal(JavaLiteral::Null)));
+        let JavaStmt::Block(statements) = &mut body.root else {
+            unreachable!();
+        };
+        statements[2] = JavaStmt::Return(Some(JavaExpr::Cast {
+            ty: JavaType::Variable(JavaIdentifier::from_dex("R")),
+            value: Box::new(JavaExpr::Name(JavaIdentifier::from_dex("result"))),
+        }));
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let [JavaStmt::Switch { cases, .. }] = statements.as_slice() else {
+            panic!("expected direct switch");
+        };
+        assert!(matches!(
+            cases[0].body.as_slice(),
+            [JavaStmt::Return(Some(JavaExpr::Cast { ty: JavaType::Variable(ty), value }))]
+                if ty.as_str() == "R"
+                    && matches!(value.as_ref(), JavaExpr::Name(name) if name.as_str() == "first")
+        ));
+    }
+
+    #[test]
+    fn switch_result_local_is_kept_without_default_case() {
+        let mut body = result_switch(false, Some(JavaExpr::Literal(JavaLiteral::Null)));
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
+
+    #[test]
+    fn switch_result_local_is_kept_when_initializer_has_effects() {
+        let mut body = result_switch(
+            true,
+            Some(JavaExpr::Call {
+                receiver: None,
+                owner: None,
+                type_arguments: Vec::new(),
+                method: JavaIdentifier::from_dex("initialize"),
+                args: Vec::new(),
+            }),
+        );
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
+
+    #[test]
+    fn switch_result_local_is_kept_when_a_case_reads_it() {
+        let mut body = result_switch(true, Some(JavaExpr::Literal(JavaLiteral::Null)));
+        let JavaStmt::Block(statements) = &mut body.root else {
+            unreachable!();
+        };
+        let JavaStmt::Switch { cases, .. } = &mut statements[1] else {
+            unreachable!();
+        };
+        let JavaStmt::Assign { value, .. } = &mut cases[0].body[0] else {
+            unreachable!();
+        };
+        *value = JavaExpr::Name(JavaIdentifier::from_dex("result"));
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
 
     #[test]
     fn removes_try_with_only_an_empty_finally() {
