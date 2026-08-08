@@ -3,7 +3,7 @@ use crate::ir::{ty::ArgType, CFG};
 use crate::language::java::{
     AggregateInitializer, DefiniteAssignment, JavaAstNormalizer, JavaAstTransform, JavaIdentifier,
     JavaInitializerExitLowering, JavaLowerer, JavaMethodCompletion, JavaModifier, JavaType,
-    LexicalDeclarationPlacement,
+    JavaVoidTailLinearizer, LexicalDeclarationPlacement,
 };
 
 use super::super::method_pipeline::MethodBodyAnalysis;
@@ -324,6 +324,15 @@ impl JavaMethodBody {
                 .apply(&mut ast)
                 .map_err(crate::language::java::JavaLoweringError::from)
         })?;
+        if !class_initializer && self.return_type.as_ref() == Some(&ArgType::VOID) {
+            let mut tail = JavaVoidTailLinearizer;
+            crate::profile_scope!("java_backend.method_lower.void_tail", {
+                match tail.apply(&mut ast) {
+                    Ok(_) => {}
+                    Err(never) => match never {},
+                }
+            });
+        }
         if semantically_terminal {
             if let Some(return_type) = completion_type {
                 let mut completion = JavaMethodCompletion::new(return_type);

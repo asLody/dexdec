@@ -87,6 +87,89 @@ impl JavaAstTransform for JavaInitializerExitLowering {
     }
 }
 
+/// Flattens a materially larger terminal branch in a void method by returning
+/// from the smaller branch first.
+#[derive(Debug, Default)]
+pub struct JavaVoidTailLinearizer;
+
+impl JavaAstTransform for JavaVoidTailLinearizer {
+    type Error = std::convert::Infallible;
+
+    fn apply(&mut self, body: &mut JavaMethodBody) -> Result<bool, Self::Error> {
+        let JavaStmt::Block(statements) = &mut body.root else {
+            return Ok(false);
+        };
+        let Some(JavaStmt::If {
+            condition,
+            then_stmt,
+            else_stmt: Some(else_stmt),
+        }) = statements.last()
+        else {
+            return Ok(false);
+        };
+
+        let then_cost = TerminalBranchLinearizer::statement_cost(then_stmt);
+        let else_cost = TerminalBranchLinearizer::statement_cost(else_stmt);
+        let then_terminal = !TerminalBranchLinearizer::can_complete_normally(then_stmt);
+        let else_terminal = !TerminalBranchLinearizer::can_complete_normally(else_stmt);
+        let materially_unbalanced = then_cost.max(else_cost)
+            >= then_cost
+                .min(else_cost)
+                .saturating_add(TerminalBranchLinearizer::NESTING_PENALTY);
+        if !then_terminal && !else_terminal && !materially_unbalanced {
+            return Ok(false);
+        }
+
+        let condition = condition.clone();
+        let choose_then = if then_terminal != else_terminal {
+            then_terminal
+        } else {
+            then_cost <= else_cost
+        };
+        let Some(JavaStmt::If {
+            then_stmt,
+            else_stmt: Some(else_stmt),
+            ..
+        }) = statements.pop()
+        else {
+            unreachable!("void tail candidate changed before rewrite");
+        };
+        let (condition, early, trailing) = if choose_then {
+            (condition, *then_stmt, *else_stmt)
+        } else {
+            (condition.negated(), *else_stmt, *then_stmt)
+        };
+        let early = Self::with_return(early);
+        statements.push(JavaStmt::If {
+            condition,
+            then_stmt: Box::new(early),
+            else_stmt: None,
+        });
+        match trailing {
+            JavaStmt::Block(trailing) => statements.extend(trailing),
+            JavaStmt::Empty => {}
+            statement => statements.push(statement),
+        }
+        Ok(true)
+    }
+}
+
+impl JavaVoidTailLinearizer {
+    fn with_return(statement: JavaStmt) -> JavaStmt {
+        if !TerminalBranchLinearizer::can_complete_normally(&statement) {
+            return statement;
+        }
+        match statement {
+            JavaStmt::Block(mut statements) => {
+                statements.push(JavaStmt::Return(None));
+                JavaStmt::Block(statements)
+            }
+            JavaStmt::Empty => JavaStmt::Block(vec![JavaStmt::Return(None)]),
+            statement => JavaStmt::Block(vec![statement, JavaStmt::Return(None)]),
+        }
+    }
+}
+
 impl JavaAstNormalizer {
     fn normalize(root: JavaStmt) -> Result<(JavaStmt, bool), super::JavaStructuralError> {
         let mut pending = vec![SyntaxTask::Visit(root)];
@@ -1566,6 +1649,109 @@ impl JavaAstRewriter for NameUseCounter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker(name: &str) -> JavaStmt {
+        JavaStmt::Expression(JavaExpr::Name(JavaIdentifier::from_dex(name)))
+    }
+
+    #[test]
+    fn void_tail_returns_from_small_then_branch() {
+        let condition = JavaExpr::Name(JavaIdentifier::from_dex("skip"));
+        let trailing = (0..8)
+            .map(|index| marker(&format!("work{index}")))
+            .collect::<Vec<_>>();
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::If {
+                condition: condition.clone(),
+                then_stmt: Box::new(JavaStmt::Block(vec![marker("skipWork")])),
+                else_stmt: Some(Box::new(JavaStmt::Block(trailing.clone()))),
+            }]),
+        };
+
+        assert!(JavaVoidTailLinearizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let JavaStmt::If {
+            condition: actual,
+            then_stmt,
+            else_stmt: None,
+        } = &statements[0]
+        else {
+            panic!("expected guard return");
+        };
+        assert_eq!(actual, &condition);
+        assert!(matches!(
+            then_stmt.as_ref(),
+            JavaStmt::Block(branch) if matches!(branch.last(), Some(JavaStmt::Return(None)))
+        ));
+        assert_eq!(&statements[1..], trailing.as_slice());
+    }
+
+    #[test]
+    fn void_tail_inverts_condition_for_small_else_branch() {
+        let condition = JavaExpr::Name(JavaIdentifier::from_dex("ready"));
+        let trailing = (0..8)
+            .map(|index| marker(&format!("work{index}")))
+            .collect::<Vec<_>>();
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::If {
+                condition: condition.clone(),
+                then_stmt: Box::new(JavaStmt::Block(trailing.clone())),
+                else_stmt: Some(Box::new(JavaStmt::Block(vec![marker("fallback")]))),
+            }]),
+        };
+
+        assert!(JavaVoidTailLinearizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        assert!(matches!(
+            &statements[0],
+            JavaStmt::If { condition: actual, else_stmt: None, .. }
+                if actual == &condition.clone().negated()
+        ));
+        assert_eq!(&statements[1..], trailing.as_slice());
+    }
+
+    #[test]
+    fn void_tail_keeps_balanced_if_else() {
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::If {
+                condition: JavaExpr::Name(JavaIdentifier::from_dex("condition")),
+                then_stmt: Box::new(marker("left")),
+                else_stmt: Some(Box::new(marker("right"))),
+            }]),
+        };
+        let original = body.clone();
+
+        assert!(!JavaVoidTailLinearizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
+
+    #[test]
+    fn void_tail_does_not_duplicate_existing_return() {
+        let trailing = (0..8)
+            .map(|index| marker(&format!("work{index}")))
+            .collect::<Vec<_>>();
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::If {
+                condition: JavaExpr::Name(JavaIdentifier::from_dex("done")),
+                then_stmt: Box::new(JavaStmt::Return(None)),
+                else_stmt: Some(Box::new(JavaStmt::Block(trailing))),
+            }]),
+        };
+
+        assert!(JavaVoidTailLinearizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        assert!(matches!(
+            &statements[0],
+            JavaStmt::If { then_stmt, else_stmt: None, .. }
+                if matches!(then_stmt.as_ref(), JavaStmt::Return(None))
+        ));
+    }
 
     fn complementary_condition(guard: JavaExpr) -> JavaMethodBody {
         let result = JavaIdentifier::from_dex("condition");
