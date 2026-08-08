@@ -1,6 +1,6 @@
 use super::{
     JavaAssignOp, JavaAstRewriter, JavaBinaryOp, JavaCatch, JavaExpr, JavaIdentifier, JavaLiteral,
-    JavaMethodBody, JavaPrimitiveType, JavaStmt, JavaSwitchCase, JavaType,
+    JavaMethodBody, JavaPrimitiveType, JavaStmt, JavaSwitchCase, JavaType, JavaUnaryOp,
 };
 
 pub trait JavaAstTransform {
@@ -244,6 +244,7 @@ impl JavaAstNormalizer {
                 child => flattened.push(child),
             }
         }
+        changed |= ConditionalResultJoin::apply(&mut flattened);
         changed |= SwitchResultReturn::apply(&mut flattened);
         changed |= TerminalBranchLinearizer::apply(&mut flattened);
         (flattened, changed)
@@ -532,6 +533,227 @@ impl JavaAstNormalizer {
             JavaStmt::Synchronized { body, .. } => Self::strip_terminal_void_return(body),
             _ => false,
         }
+    }
+}
+
+/// Joins the two complementary uses of a synthetic boolean result.
+///
+/// Value recovery can spell a short-circuit branch as:
+/// `boolean c = false; if (a) { c = b; if (c) x; } if (!a || !c) y;`.
+/// When `a` is stable across the sequence, this is exactly
+/// `if (a && b) x; else y;`. Keeping the rewrite narrow is important because
+/// calls and field reads in `a` may intentionally be evaluated twice.
+struct ConditionalResultJoin;
+
+impl ConditionalResultJoin {
+    fn apply(statements: &mut Vec<JavaStmt>) -> bool {
+        let mut changed = false;
+        let mut index = 0usize;
+        while index + 2 < statements.len() {
+            let Some(replacement) = Self::candidate(&statements[index..index + 3]) else {
+                index += 1;
+                continue;
+            };
+            statements.splice(index..index + 3, std::iter::once(replacement));
+            changed = true;
+            index += 1;
+        }
+        changed
+    }
+
+    fn candidate(window: &[JavaStmt]) -> Option<JavaStmt> {
+        let [
+            JavaStmt::Variable {
+                ty: JavaType::Primitive(JavaPrimitiveType::Boolean),
+                name,
+                value: Some(JavaExpr::Literal(JavaLiteral::Boolean(false))),
+            },
+            JavaStmt::If {
+                condition: guard,
+                then_stmt: guarded,
+                else_stmt: None,
+            },
+            JavaStmt::If {
+                condition: complement,
+                then_stmt: fallback,
+                else_stmt: None,
+            },
+        ] = window
+        else {
+            return None;
+        };
+        let guarded = Self::statements(guarded)?;
+        let [
+            JavaStmt::Assign {
+                target: JavaExpr::Name(assigned),
+                op: JavaAssignOp::Assign,
+                value,
+            },
+            JavaStmt::If {
+                condition: JavaExpr::Name(tested),
+                then_stmt: success,
+                else_stmt: None,
+            },
+        ] = guarded
+        else {
+            return None;
+        };
+        if assigned != name
+            || tested != name
+            || !Self::is_complement(complement, guard, name)
+            || !Self::stable(guard)
+            || SwitchResultReturn::expression_uses(value, name)
+            || SwitchResultReturn::statement_uses(success, name)
+            || SwitchResultReturn::statement_uses(fallback, name)
+        {
+            return None;
+        }
+
+        let mut guard_names = std::collections::BTreeSet::new();
+        Self::collect_names(guard, &mut guard_names);
+        let mut writes = NameWriteDetector {
+            targets: &guard_names,
+            found: false,
+        };
+        writes.rewrite_expression(value.clone());
+        writes.rewrite_statement(success.as_ref().clone());
+        if writes.found {
+            return None;
+        }
+
+        Some(JavaStmt::If {
+            condition: JavaExpr::Binary {
+                left: Box::new(guard.clone()),
+                op: JavaBinaryOp::LogicalAnd,
+                right: Box::new(value.clone()),
+            },
+            then_stmt: Box::new(success.as_ref().clone()),
+            else_stmt: Some(Box::new(fallback.as_ref().clone())),
+        })
+    }
+
+    fn statements(statement: &JavaStmt) -> Option<&[JavaStmt]> {
+        match statement {
+            JavaStmt::Block(statements) => Some(statements),
+            _ => None,
+        }
+    }
+
+    fn is_complement(
+        expression: &JavaExpr,
+        guard: &JavaExpr,
+        result: &JavaIdentifier,
+    ) -> bool {
+        let JavaExpr::Binary {
+            left,
+            op: JavaBinaryOp::LogicalOr,
+            right,
+        } = expression
+        else {
+            return false;
+        };
+        let not_guard = guard.clone().negated();
+        (left.as_ref() == &not_guard && Self::is_negated_name(right, result))
+            || (right.as_ref() == &not_guard && Self::is_negated_name(left, result))
+    }
+
+    fn is_negated_name(expression: &JavaExpr, target: &JavaIdentifier) -> bool {
+        matches!(
+            expression,
+            JavaExpr::Unary {
+                op: JavaUnaryOp::LogicalNot,
+                operand,
+            } if matches!(operand.as_ref(), JavaExpr::Name(name) if name == target)
+        )
+    }
+
+    fn stable(expression: &JavaExpr) -> bool {
+        let mut pending = vec![expression];
+        while let Some(expression) = pending.pop() {
+            match expression {
+                JavaExpr::This
+                | JavaExpr::QualifiedThis(_)
+                | JavaExpr::Super
+                | JavaExpr::Name(_)
+                | JavaExpr::Literal(_)
+                | JavaExpr::ClassLiteral(_) => {}
+                JavaExpr::Unary { operand, .. }
+                | JavaExpr::Cast { value: operand, .. }
+                | JavaExpr::InstanceOf { value: operand, .. } => pending.push(operand),
+                JavaExpr::Binary { left, right, .. } => {
+                    pending.extend([left.as_ref(), right.as_ref()]);
+                }
+                JavaExpr::Conditional {
+                    condition,
+                    when_true,
+                    when_false,
+                } => pending.extend([
+                    condition.as_ref(),
+                    when_true.as_ref(),
+                    when_false.as_ref(),
+                ]),
+                JavaExpr::Field { .. }
+                | JavaExpr::StaticField { .. }
+                | JavaExpr::ArrayAccess { .. }
+                | JavaExpr::Call { .. }
+                | JavaExpr::MethodReference { .. }
+                | JavaExpr::Lambda { .. }
+                | JavaExpr::BlockLambda { .. }
+                | JavaExpr::New { .. }
+                | JavaExpr::NewArray { .. }
+                | JavaExpr::Update { .. }
+                | JavaExpr::Assignment { .. } => return false,
+            }
+        }
+        true
+    }
+
+    fn collect_names(expression: &JavaExpr, names: &mut std::collections::BTreeSet<JavaIdentifier>) {
+        struct Collector<'a>(&'a mut std::collections::BTreeSet<JavaIdentifier>);
+        impl JavaAstRewriter for Collector<'_> {
+            fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
+                if let JavaExpr::Name(name) = &expression {
+                    self.0.insert(name.clone());
+                }
+                expression
+            }
+        }
+        Collector(names).rewrite_expression(expression.clone());
+    }
+}
+
+struct NameWriteDetector<'a> {
+    targets: &'a std::collections::BTreeSet<JavaIdentifier>,
+    found: bool,
+}
+
+impl JavaAstRewriter for NameWriteDetector<'_> {
+    fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
+        let target = match &expression {
+            JavaExpr::Update { target, .. } | JavaExpr::Assignment { target, .. } => {
+                Some(target.as_ref())
+            }
+            _ => None,
+        };
+        if matches!(target, Some(JavaExpr::Name(name)) if self.targets.contains(name)) {
+            self.found = true;
+        }
+        expression
+    }
+
+    fn finish_statement(&mut self, statement: JavaStmt) -> JavaStmt {
+        let target = match &statement {
+            JavaStmt::Variable { name, .. } => Some(name),
+            JavaStmt::Assign {
+                target: JavaExpr::Name(name),
+                ..
+            } => Some(name),
+            _ => None,
+        };
+        if target.is_some_and(|name| self.targets.contains(name)) {
+            self.found = true;
+        }
+        statement
     }
 }
 
@@ -1344,6 +1566,127 @@ impl JavaAstRewriter for NameUseCounter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complementary_condition(guard: JavaExpr) -> JavaMethodBody {
+        let result = JavaIdentifier::from_dex("condition");
+        JavaMethodBody {
+            root: JavaStmt::Block(vec![
+                JavaStmt::Variable {
+                    ty: JavaType::boolean(),
+                    name: result.clone(),
+                    value: Some(JavaExpr::Literal(JavaLiteral::Boolean(false))),
+                },
+                JavaStmt::If {
+                    condition: guard.clone(),
+                    then_stmt: Box::new(JavaStmt::Block(vec![
+                        JavaStmt::Assign {
+                            target: JavaExpr::Name(result.clone()),
+                            op: JavaAssignOp::Assign,
+                            value: JavaExpr::Name(JavaIdentifier::from_dex("predicate")),
+                        },
+                        JavaStmt::If {
+                            condition: JavaExpr::Name(result.clone()),
+                            then_stmt: Box::new(JavaStmt::Expression(JavaExpr::Name(
+                                JavaIdentifier::from_dex("success"),
+                            ))),
+                            else_stmt: None,
+                        },
+                    ])),
+                    else_stmt: None,
+                },
+                JavaStmt::If {
+                    condition: JavaExpr::Binary {
+                        left: Box::new(guard.negated()),
+                        op: JavaBinaryOp::LogicalOr,
+                        right: Box::new(JavaExpr::Unary {
+                            op: JavaUnaryOp::LogicalNot,
+                            operand: Box::new(JavaExpr::Name(result)),
+                        }),
+                    },
+                    then_stmt: Box::new(JavaStmt::Expression(JavaExpr::Name(
+                        JavaIdentifier::from_dex("fallback"),
+                    ))),
+                    else_stmt: None,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn joins_complementary_boolean_result_branches() {
+        let guard = JavaExpr::Binary {
+            left: Box::new(JavaExpr::Name(JavaIdentifier::from_dex("flags"))),
+            op: JavaBinaryOp::Equal,
+            right: Box::new(JavaExpr::Literal(JavaLiteral::Integer(2))),
+        };
+        let mut body = complementary_condition(guard.clone());
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let [JavaStmt::If {
+            condition,
+            then_stmt,
+            else_stmt: Some(else_stmt),
+        }] = statements.as_slice()
+        else {
+            panic!("expected joined branch");
+        };
+        assert!(matches!(
+            condition,
+            JavaExpr::Binary {
+                left,
+                op: JavaBinaryOp::LogicalAnd,
+                right,
+            } if left.as_ref() == &guard
+                && matches!(right.as_ref(), JavaExpr::Name(name) if name.as_str() == "predicate")
+        ));
+        assert!(matches!(then_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "success"));
+        assert!(matches!(else_stmt.as_ref(), JavaStmt::Expression(JavaExpr::Name(name)) if name.as_str() == "fallback"));
+    }
+
+    #[test]
+    fn keeps_complementary_result_when_guard_may_have_effects() {
+        let mut body = complementary_condition(JavaExpr::Call {
+            receiver: None,
+            owner: None,
+            type_arguments: Vec::new(),
+            method: JavaIdentifier::from_dex("guard"),
+            args: Vec::new(),
+        });
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
+
+    #[test]
+    fn keeps_complementary_result_when_success_rewrites_guard_input() {
+        let guard_name = JavaIdentifier::from_dex("guard");
+        let mut body = complementary_condition(JavaExpr::Name(guard_name.clone()));
+        let JavaStmt::Block(statements) = &mut body.root else {
+            unreachable!();
+        };
+        let JavaStmt::If { then_stmt, .. } = &mut statements[1] else {
+            unreachable!();
+        };
+        let JavaStmt::Block(guarded) = then_stmt.as_mut() else {
+            unreachable!();
+        };
+        let JavaStmt::If { then_stmt, .. } = &mut guarded[1] else {
+            unreachable!();
+        };
+        **then_stmt = JavaStmt::Assign {
+            target: JavaExpr::Name(guard_name),
+            op: JavaAssignOp::Assign,
+            value: JavaExpr::Literal(JavaLiteral::Boolean(false)),
+        };
+        let original = body.clone();
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, original.root);
+    }
 
     fn result_switch(has_default: bool, initializer: Option<JavaExpr>) -> JavaMethodBody {
         let result = JavaIdentifier::from_dex("result");
