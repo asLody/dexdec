@@ -1,6 +1,6 @@
 //! Source generation for one method, selected classes, or a complete archive.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -76,6 +76,7 @@ impl DecompileCommand {
         let requested = classes.len();
         let mut results = Vec::with_capacity(requested);
         let mut failures = Vec::new();
+        let mut output_paths = SourceOutputPaths::default();
         for (index, class) in classes.iter().enumerate() {
             context.progress(&format!(
                 "[{}/{}] decompile {}",
@@ -108,7 +109,7 @@ impl DecompileCommand {
                 Err(error) => return Err(error.into()),
             };
             let output_path = if let Some(directory) = request.output_dir.as_deref() {
-                let path = prepare_file_path(&directory.join(&unit.path));
+                let path = prepare_file_path(&directory.join(output_paths.claim(&unit.path)));
                 match context.host_mut().write(&path, unit.source.as_bytes()) {
                     Ok(()) => Some(path),
                     Err(error) if !request.fail_fast => {
@@ -284,6 +285,48 @@ impl DecompileCommand {
     }
 }
 
+#[derive(Default)]
+struct SourceOutputPaths {
+    exact: BTreeMap<PathBuf, PathBuf>,
+    portable: BTreeSet<String>,
+}
+
+impl SourceOutputPaths {
+    fn claim(&mut self, requested: &Path) -> PathBuf {
+        if let Some(path) = self.exact.get(requested) {
+            return path.clone();
+        }
+        let portable = Self::portable_key(requested);
+        if self.portable.insert(portable) {
+            let path = requested.to_path_buf();
+            self.exact.insert(path.clone(), path.clone());
+            return path;
+        }
+        let Some(file_name) = requested.file_name() else {
+            return requested.to_path_buf();
+        };
+        let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+        for discriminator in 2usize.. {
+            let candidate = parent
+                .join(format!("__dexdec_case_conflict_{discriminator}"))
+                .join(file_name);
+            if self.portable.insert(Self::portable_key(&candidate)) {
+                self.exact
+                    .insert(requested.to_path_buf(), candidate.clone());
+                return candidate;
+            }
+        }
+        unreachable!("unbounded output path discriminator");
+    }
+
+    fn portable_key(path: &Path) -> String {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
 struct SelectionResolver<'a> {
     catalog: &'a crate::ArchiveCatalog,
 }
@@ -343,5 +386,31 @@ impl ClassFile {
             )));
         }
         Ok(selectors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceOutputPaths;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn case_insensitive_source_paths_do_not_overwrite_each_other() {
+        let mut paths = SourceOutputPaths::default();
+        let upper = paths.claim(Path::new("example/C.java"));
+        let duplicate = paths.claim(Path::new("example/C.java"));
+        let lower = paths.claim(Path::new("example/c.java"));
+
+        assert_eq!(upper, PathBuf::from("example/C.java"));
+        assert_eq!(duplicate, upper);
+        assert_eq!(lower.file_name().unwrap(), "c.java");
+        assert_eq!(
+            lower,
+            PathBuf::from("example/__dexdec_case_conflict_2/c.java")
+        );
+        assert_ne!(
+            SourceOutputPaths::portable_key(&upper),
+            SourceOutputPaths::portable_key(&lower)
+        );
     }
 }
