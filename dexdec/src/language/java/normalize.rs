@@ -1691,8 +1691,11 @@ impl JavaAstTransform for JavaAstNormalizer {
     type Error = super::JavaStructuralError;
 
     fn apply(&mut self, body: &mut JavaMethodBody) -> Result<bool, Self::Error> {
-        let (mut root, mut changed) =
+        let (root, mut changed) =
             Self::normalize(std::mem::replace(&mut body.root, JavaStmt::Empty))?;
+        let mut conditional_simplifier = ConditionalExpressionSimplifier::default();
+        let mut root = conditional_simplifier.rewrite_statement(root);
+        changed |= conditional_simplifier.changed;
         if let JavaStmt::Block(statements) = &mut root {
             if let Some(last) = statements.last_mut() {
                 changed |= Self::strip_terminal_void_return(last);
@@ -1703,6 +1706,52 @@ impl JavaAstTransform for JavaAstNormalizer {
         }
         body.root = root;
         Ok(changed)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConditionalExpressionSimplifier {
+    changed: bool,
+}
+
+impl JavaAstRewriter for ConditionalExpressionSimplifier {
+    fn finish_expression(&mut self, expression: JavaExpr) -> JavaExpr {
+        let JavaExpr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } = expression
+        else {
+            return expression;
+        };
+        let JavaExpr::Conditional {
+            condition: nested_condition,
+            when_true: nested_true,
+            when_false: nested_false,
+        } = when_false.as_ref()
+        else {
+            return JavaExpr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            };
+        };
+        if condition.as_ref() != nested_condition.as_ref()
+            || when_true.as_ref() != nested_true.as_ref()
+            || !ConditionalResultJoin::stable(condition.as_ref())
+        {
+            return JavaExpr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            };
+        }
+        self.changed = true;
+        JavaExpr::Conditional {
+            condition,
+            when_true,
+            when_false: nested_false.clone(),
+        }
     }
 }
 
@@ -1912,6 +1961,71 @@ mod tests {
 
     fn marker(name: &str) -> JavaStmt {
         JavaStmt::Expression(JavaExpr::Name(JavaIdentifier::from_dex(name)))
+    }
+
+    fn repeated_conditional(condition: JavaExpr) -> JavaExpr {
+        JavaExpr::Conditional {
+            condition: Box::new(condition.clone()),
+            when_true: Box::new(JavaExpr::Literal(JavaLiteral::Integer(1))),
+            when_false: Box::new(JavaExpr::Conditional {
+                condition: Box::new(condition),
+                when_true: Box::new(JavaExpr::Literal(JavaLiteral::Integer(1))),
+                when_false: Box::new(JavaExpr::Literal(JavaLiteral::Integer(0))),
+            }),
+        }
+    }
+
+    #[test]
+    fn simplifies_repeated_stable_conditional_branch() {
+        let condition = JavaExpr::Name(JavaIdentifier::from_dex("enabled"));
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::Variable {
+                ty: JavaType::int(),
+                name: JavaIdentifier::from_dex("value"),
+                value: Some(repeated_conditional(condition.clone())),
+            }]),
+        };
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let JavaStmt::Variable { value: Some(value), .. } = &statements[0] else {
+            panic!("expected variable initializer");
+        };
+        assert_eq!(
+            value,
+            &JavaExpr::Conditional {
+                condition: Box::new(condition),
+                when_true: Box::new(JavaExpr::Literal(JavaLiteral::Integer(1))),
+                when_false: Box::new(JavaExpr::Literal(JavaLiteral::Integer(0))),
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_repeated_effectful_conditional_branch() {
+        let condition = JavaExpr::Field {
+            owner: Box::new(JavaExpr::This),
+            name: JavaIdentifier::from_dex("enabled"),
+        };
+        let expression = repeated_conditional(condition);
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Block(vec![JavaStmt::Variable {
+                ty: JavaType::int(),
+                name: JavaIdentifier::from_dex("value"),
+                value: Some(expression.clone()),
+            }]),
+        };
+
+        assert!(!JavaAstNormalizer.apply(&mut body).unwrap());
+        let JavaStmt::Block(statements) = &body.root else {
+            panic!("expected method block");
+        };
+        let JavaStmt::Variable { value: Some(value), .. } = &statements[0] else {
+            panic!("expected variable initializer");
+        };
+        assert_eq!(value, &expression);
     }
 
     #[test]
