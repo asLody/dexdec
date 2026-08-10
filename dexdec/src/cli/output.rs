@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -10,6 +10,80 @@ use super::error::{CliError, CliResult};
 use super::model::{OutputFormat, OutputOptions};
 
 pub const OUTPUT_SCHEMA: &str = "dexdec.cli/v1";
+
+/// Matches JADX `FileUtils.MAX_FILENAME_LENGTH`.
+const MAX_FILENAME_LENGTH: usize = 128;
+/// Matches JADX `FileUtils.MAX_UNIQUE_ID_LENGTH`.
+const MAX_UNIQUE_ID_LENGTH: usize = 3;
+
+/// Matches JADX `FileUtils.prepareFile`: truncate an oversized final path
+/// component and ensure parent directories exist.
+pub fn prepare_file_path(path: &Path) -> PathBuf {
+    let prepared = cut_file_name(path);
+    if let Some(parent) = prepared
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    prepared
+}
+
+/// Matches JADX `FileUtils.cutFileName`.
+pub fn cut_file_name(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_path_buf();
+    };
+    if name.chars().count() <= MAX_FILENAME_LENGTH {
+        return path.to_path_buf();
+    }
+
+    let unique_id = {
+        let hashed = java_string_hash(name).to_string();
+        if hashed.len() > MAX_UNIQUE_ID_LENGTH {
+            hashed[..MAX_UNIQUE_ID_LENGTH].to_string()
+        } else {
+            hashed
+        }
+    };
+    let chars: Vec<char> = name.chars().collect();
+    let dot_index = chars.iter().position(|character| *character == '.');
+    let length_of_suffix = match dot_index {
+        Some(index) => chars.len() - index,
+        // JADX uses `name.indexOf('.')` which is -1 when missing, then
+        // `name.length() - (-1)`.
+        None => chars.len() + 1,
+    };
+    let cut_at = MAX_FILENAME_LENGTH
+        .saturating_sub(length_of_suffix)
+        .saturating_sub(unique_id.len())
+        .saturating_sub(1);
+    let truncated = if cut_at == 0 {
+        chars
+            .iter()
+            .take(MAX_FILENAME_LENGTH.saturating_sub(1))
+            .collect::<String>()
+    } else {
+        let prefix: String = chars.iter().take(cut_at).collect();
+        let suffix: String = match dot_index {
+            Some(index) => chars[index..].iter().collect(),
+            None => String::new(),
+        };
+        format!("{prefix}{unique_id}{suffix}")
+    };
+    match path.parent() {
+        Some(parent) => parent.join(truncated),
+        None => PathBuf::from(truncated),
+    }
+}
+
+fn java_string_hash(value: &str) -> i32 {
+    let mut hash: i32 = 0;
+    for unit in value.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    hash
+}
 
 pub trait TextOutput {
     fn emit(&mut self, text: &str) -> CliResult<()>;
@@ -19,7 +93,8 @@ pub trait TextOutput {
     fn emit_or_write(&mut self, path: Option<&Path>, text: &str) -> CliResult<()> {
         match path {
             Some(path) => {
-                self.write_file(path, text)?;
+                let path = prepare_file_path(path);
+                self.write_file(&path, text)?;
                 self.note(&format!("output={}", path.display()))
             }
             None => self.emit(text),
@@ -57,13 +132,8 @@ impl TextOutput for ConsoleHost {
     }
 
     fn write_file(&mut self, path: &Path, text: &str) -> CliResult<()> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, text)?;
+        let path = prepare_file_path(path);
+        fs::write(&path, text)?;
         Ok(())
     }
 
@@ -88,13 +158,8 @@ impl FileSystem for ConsoleHost {
     }
 
     fn write(&mut self, path: &Path, contents: impl AsRef<[u8]>) -> CliResult<()> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, contents)?;
+        let path = prepare_file_path(path);
+        fs::write(&path, contents)?;
         Ok(())
     }
 
@@ -224,4 +289,31 @@ pub fn render_error(format: OutputFormat, pretty: bool, error: &CliError) -> Str
     };
     encoded.push('\n');
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cut_file_name, java_string_hash, MAX_FILENAME_LENGTH};
+    use std::path::Path;
+
+    #[test]
+    fn cut_file_name_matches_jadx_hash_truncation() {
+        let long = format!("{}{}", "LongName".repeat(30), ".java");
+        assert!(long.chars().count() > MAX_FILENAME_LENGTH);
+        let cut = cut_file_name(Path::new(&format!("pkg/{long}")));
+        let name = cut.file_name().unwrap().to_str().unwrap();
+        assert!(name.chars().count() <= MAX_FILENAME_LENGTH);
+        assert!(name.ends_with(".java"));
+        let unique = java_string_hash(&long).to_string();
+        let unique = &unique[..unique.len().min(3)];
+        assert!(name.contains(unique), "{name} should contain {unique}");
+    }
+
+    #[test]
+    fn short_file_names_are_unchanged() {
+        assert_eq!(
+            cut_file_name(Path::new("com/example/App.java")),
+            Path::new("com/example/App.java")
+        );
+    }
 }

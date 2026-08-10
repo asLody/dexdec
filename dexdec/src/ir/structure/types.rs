@@ -101,6 +101,12 @@ pub enum StructureError {
         stage: &'static str,
         label: SemanticLabel,
     },
+    SemanticItemLimit {
+        region: RegionId,
+        stage: &'static str,
+        items: usize,
+        limit: usize,
+    },
 }
 
 impl fmt::Display for StructureError {
@@ -257,6 +263,15 @@ impl fmt::Display for StructureError {
                     label.region, label.block
                 )
             }
+            Self::SemanticItemLimit {
+                region,
+                stage,
+                items,
+                limit,
+            } => write!(
+                f,
+                "semantic structure for {region} has {items} nodes and operations after {stage}, above the {limit} item safety limit"
+            ),
         }
     }
 }

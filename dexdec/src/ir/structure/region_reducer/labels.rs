@@ -26,7 +26,7 @@ impl LexicalLabels {
             .iter()
             .filter_map(|(label, count)| (*count > 1).then_some(*label))
             .collect::<BTreeSet<_>>();
-        let mut root = if duplicates.is_empty() {
+        let root = if duplicates.is_empty() {
             root
         } else {
             Self {
@@ -44,12 +44,12 @@ impl LexicalLabels {
 
         let mut unique = LabelDefinitions::default();
         unique.visit_node(&root);
-        for label in unique.counts.into_iter().filter_map(|(label, count)| {
-            (count == 1 && label.kind == SemanticLabelKind::Block).then_some(label)
-        }) {
-            root = LexicalLabelScope::repair(root, label)?;
-        }
-        Ok(root)
+        LexicalLabelScopes::repair(
+            root,
+            unique.counts.into_iter().filter_map(|(label, count)| {
+                (count == 1 && label.kind == SemanticLabelKind::Block).then_some(label)
+            }),
+        )
     }
 
     pub(super) fn escaped_loop(root: &SemanticNode) -> Option<SemanticLabel> {
@@ -150,36 +150,57 @@ impl SemanticVisitor for LoopLabelScopes {
 
 /// Places a block-label binding at the lowest semantic-tree ancestor that
 /// contains both its definition and every transfer targeting it.
+#[derive(Default)]
 struct LexicalLabelScope {
-    label: SemanticLabel,
     definition: Option<Vec<usize>>,
     references: Vec<Vec<usize>>,
 }
 
-impl LexicalLabelScope {
-    fn repair(root: SemanticNode, label: SemanticLabel) -> Result<SemanticNode, SemanticFoldError> {
-        let mut scope = Self {
-            label,
-            definition: None,
-            references: Vec::new(),
-        };
-        scope.analyze(&root);
-        let Some(definition) = scope.definition else {
+/// Repairs all block-label scopes with one analysis and one rewrite pass.
+///
+/// Running both passes once per label makes large irreducible methods quadratic
+/// in the number of labels and can effectively stall whole-file decompilation.
+struct LexicalLabelScopes {
+    scopes: BTreeMap<SemanticLabel, LexicalLabelScope>,
+}
+
+impl LexicalLabelScopes {
+    fn repair(
+        root: SemanticNode,
+        labels: impl IntoIterator<Item = SemanticLabel>,
+    ) -> Result<SemanticNode, SemanticFoldError> {
+        let scopes = labels
+            .into_iter()
+            .map(|label| (label, LexicalLabelScope::default()))
+            .collect::<BTreeMap<_, _>>();
+        if scopes.is_empty() {
             return Ok(root);
-        };
-        let mut binding = definition.clone();
-        for reference in &scope.references {
-            let common = binding
-                .iter()
-                .zip(reference)
-                .take_while(|(left, right)| left == right)
-                .count();
-            binding.truncate(common);
         }
-        LabelScopeRewrite {
-            label,
-            definition,
-            binding,
+        let mut scopes = Self { scopes };
+        scopes.analyze(&root);
+
+        let mut definitions = BTreeMap::new();
+        let mut bindings = BTreeMap::<Vec<usize>, Vec<SemanticLabel>>::new();
+        for (label, scope) in scopes.scopes {
+            let Some(definition) = scope.definition else {
+                continue;
+            };
+            let mut binding = definition.clone();
+            for reference in &scope.references {
+                let common = binding
+                    .iter()
+                    .zip(reference)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                binding.truncate(common);
+            }
+            definitions.insert(definition, label);
+            bindings.entry(binding).or_default().push(label);
+        }
+
+        LabelScopesRewrite {
+            definitions,
+            bindings,
             stack: Vec::new(),
         }
         .fold_node(root)
@@ -189,18 +210,23 @@ impl LexicalLabelScope {
         let mut pending = vec![(root, Vec::new())];
         while let Some((node, path)) = pending.pop() {
             match node {
-                SemanticNode::Label { label, .. } if *label == self.label => {
-                    self.definition = Some(path.clone());
+                SemanticNode::Label { label, .. } => {
+                    if let Some(scope) = self.scopes.get_mut(label) {
+                        scope.definition = Some(path.clone());
+                    }
                 }
-                SemanticNode::Leave(leave)
-                    if matches!(
-                        &leave.kind,
+                SemanticNode::Leave(leave) => {
+                    let label = match &leave.kind {
                         SemanticLeaveKind::BreakLabel(label)
-                            | SemanticLeaveKind::ContinueLabel(label)
-                            if *label == self.label
-                    ) =>
-                {
-                    self.references.push(path.clone());
+                        | SemanticLeaveKind::ContinueLabel(label) => label,
+                        _ => {
+                            Self::push_children(node, &path, &mut pending);
+                            continue;
+                        }
+                    };
+                    if let Some(scope) = self.scopes.get_mut(label) {
+                        scope.references.push(path.clone());
+                    }
                 }
                 _ => {}
             }
@@ -266,10 +292,9 @@ impl LexicalLabelScope {
     }
 }
 
-struct LabelScopeRewrite {
-    label: SemanticLabel,
-    definition: Vec<usize>,
-    binding: Vec<usize>,
+struct LabelScopesRewrite {
+    definitions: BTreeMap<Vec<usize>, SemanticLabel>,
+    bindings: BTreeMap<Vec<usize>, Vec<SemanticLabel>>,
     stack: Vec<PathFrame>,
 }
 
@@ -278,7 +303,7 @@ struct PathFrame {
     next_child: usize,
 }
 
-impl SemanticFolder for LabelScopeRewrite {
+impl SemanticFolder for LabelScopesRewrite {
     type Error = SemanticFoldError;
 
     fn enter_node(&mut self, _node: &SemanticNode) {
@@ -304,22 +329,25 @@ impl SemanticFolder for LabelScopeRewrite {
             .pop()
             .ok_or(SemanticFoldError::MalformedWorkStack)?
             .path;
-        let node = if path == self.definition {
+        let mut node = if let Some(definition) = self.definitions.get(&path) {
             match node {
-                SemanticNode::Label { label, body } if label == self.label => *body,
+                SemanticNode::Label { label, body } if label == *definition => *body,
                 node => node,
             }
         } else {
             node
         };
-        Ok(if path == self.binding {
-            SemanticNode::Label {
-                label: self.label,
-                body: Box::new(node),
+        if let Some(bindings) = self.bindings.get(&path) {
+            // Match the previous deterministic per-label behavior: lower
+            // labels become outer scopes when several labels share one LCA.
+            for label in bindings.iter().rev() {
+                node = SemanticNode::Label {
+                    label: *label,
+                    body: Box::new(node),
+                };
             }
-        } else {
-            node
-        })
+        }
+        Ok(node)
     }
 }
 
@@ -385,5 +413,75 @@ impl SemanticFolder for LabelReferenceRewrite {
             _ => {}
         }
         Ok(node)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LexicalLabels;
+    use crate::ir::{
+        BlockId, RegionId, SemanticLabel, SemanticLeave, SemanticLeaveKind, SemanticNode,
+    };
+
+    #[test]
+    fn block_label_scopes_are_repaired_in_one_tree_rewrite() {
+        let region = RegionId::new(0);
+        let label = SemanticLabel::block(region, BlockId::new(1));
+        let root = SemanticNode::Sequence(vec![
+            SemanticNode::Leave(SemanticLeave {
+                site: None,
+                condition: None,
+                kind: SemanticLeaveKind::BreakLabel(label),
+                edge: None,
+                origin: None,
+                source: region,
+                destination: region,
+                target: region,
+                cleanup: Vec::new(),
+            }),
+            SemanticNode::Label {
+                label,
+                body: Box::new(SemanticNode::Empty),
+            },
+        ]);
+
+        let repaired = LexicalLabels::uniquify(root).expect("label scope repair");
+
+        let SemanticNode::Label {
+            label: repaired_label,
+            body,
+        } = repaired
+        else {
+            panic!("shared scope must bind the label at the sequence root");
+        };
+        assert_eq!(repaired_label, label);
+        assert!(matches!(
+            *body,
+            SemanticNode::Sequence(ref children)
+                if matches!(children.get(1), Some(SemanticNode::Empty))
+        ));
+    }
+
+    #[test]
+    fn many_unique_block_labels_do_not_require_per_label_tree_rewrites() {
+        let region = RegionId::new(0);
+        let mut root = SemanticNode::Empty;
+        for block in 1..=1_000 {
+            root = SemanticNode::Label {
+                label: SemanticLabel::block(region, BlockId::new(block)),
+                body: Box::new(root),
+            };
+        }
+
+        let repaired = LexicalLabels::uniquify(root).expect("bulk label scope repair");
+
+        let mut labels = 0;
+        let mut cursor = &repaired;
+        while let SemanticNode::Label { body, .. } = cursor {
+            labels += 1;
+            cursor = body;
+        }
+        assert_eq!(labels, 1_000);
+        assert!(matches!(cursor, SemanticNode::Empty));
     }
 }

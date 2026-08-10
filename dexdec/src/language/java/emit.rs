@@ -8,7 +8,7 @@ use super::literals::JavaLiterals;
 use super::unit::{
     JavaAnnotation, JavaAnnotationValue, JavaAnonymousClassBody, JavaCompilationUnit,
     JavaFieldDeclaration, JavaMethodDeclaration, JavaMethodDeclarationKind, JavaModifier,
-    JavaTypeDeclaration,
+    JavaTypeDeclaration, JavaTypeDeclarationKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +257,16 @@ impl JavaPrinter {
             }
         }
         if !declaration.enum_constants.is_empty() {
+            writeln!(output, ";")?;
+            wrote_member = true;
+        } else if declaration.kind == JavaTypeDeclarationKind::Enum
+            && (!declaration.fields.is_empty()
+                || !declaration.methods.is_empty()
+                || !declaration.nested.is_empty())
+        {
+            // An enum with no recovered constants still needs the separator
+            // before ordinary members.
+            self.indent(output, depth + 1);
             writeln!(output, ";")?;
             wrote_member = true;
         }
@@ -1853,5 +1863,37 @@ mod tests {
             expression,
             "(java.lang.Object) new java.util.ArrayList<java.lang.String>()"
         );
+    }
+
+    #[test]
+    fn empty_enum_constant_list_is_separated_from_members() {
+        fn declaration(kind: JavaTypeDeclarationKind, name: &str) -> JavaTypeDeclaration {
+            JavaTypeDeclaration {
+                annotations: Vec::new(),
+                modifiers: Vec::new(),
+                kind,
+                name: JavaIdentifier::from_dex(name),
+                type_parameters: Vec::new(),
+                extends: None,
+                implements: Vec::new(),
+                enum_constants: Vec::new(),
+                fields: Vec::new(),
+                methods: Vec::new(),
+                nested: Vec::new(),
+            }
+        }
+
+        let mut root = declaration(JavaTypeDeclarationKind::Enum, "State");
+        root.nested
+            .push(declaration(JavaTypeDeclarationKind::Class, "Member"));
+        let source = JavaPrinter::default()
+            .print_compilation_unit(&JavaCompilationUnit {
+                package: None,
+                imports: Vec::new(),
+                declaration: root,
+            })
+            .expect("enum source");
+
+        assert!(source.contains("enum State {\n    ;\n\n    class Member"));
     }
 }
