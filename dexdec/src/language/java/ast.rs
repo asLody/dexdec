@@ -15,36 +15,99 @@ pub enum JavaPrimitiveType {
 pub struct JavaIdentifier(String);
 
 impl JavaIdentifier {
+    /// Sanitize a DEX name the way JADX's `NameMapper` / rename checks do for
+    /// fields and methods: keep valid printable identifiers, otherwise drop
+    /// illegal characters instead of hex-escaping them.
     pub fn from_dex(value: &str) -> Self {
-        if Self::is_source_identifier(value)
-            && !Self::is_reserved(value)
-            && !value.starts_with("$dex$")
-        {
+        if Self::is_valid_and_printable(value) {
             return Self(value.to_string());
         }
-        let mut encoded = String::from("$dex$");
-        if value.is_empty() {
-            encoded.push_str("empty");
-        } else {
-            for character in value.chars() {
-                encoded.push_str(&format!("{:X}_", character as u32));
-            }
+        let clean = Self::remove_invalid_chars(value, "C");
+        if clean.is_empty() {
+            return Self(Self::alias_fallback(value));
         }
-        Self(encoded)
+        if !Self::is_valid_identifier(&clean) {
+            return Self(format!("C{clean}"));
+        }
+        Self(clean)
     }
 
     pub fn from_hint(value: &str) -> Self {
-        if Self::is_source_identifier(value) {
-            if Self::is_reserved(value) {
-                return Self(format!("{value}Value"));
-            }
+        if Self::is_valid_and_printable(value) {
             return Self(value.to_string());
+        }
+        if Self::is_reserved(value) && Self::is_all_chars_printable(value) {
+            return Self(format!("{value}Value"));
         }
         Self::from_dex(value)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn alias_fallback(original: &str) -> String {
+        // JADX falls back to `IAliasProvider` indexes. Without a global counter,
+        // mirror `DeobfAliasProvider.prepareNamePart` for over-long names:
+        // `x` + hex(Java String.hashCode()).
+        format!("C{:x}", java_string_hash(original) as u32)
+    }
+
+    fn remove_invalid_chars_middle(name: &str) -> String {
+        if Self::is_valid_identifier(name) && Self::is_all_chars_printable(name) {
+            return name.to_string();
+        }
+        name.chars()
+            .filter(|&character| {
+                Self::is_printable_ascii(character) && Self::is_java_identifier_part(character)
+            })
+            .collect()
+    }
+
+    fn remove_invalid_chars(name: &str, prefix: &str) -> String {
+        let result = Self::remove_invalid_chars_middle(name);
+        if result.is_empty() {
+            return result;
+        }
+        let first = result.chars().next().expect("non-empty");
+        if !Self::is_java_identifier_start(first) {
+            return format!("{prefix}{result}");
+        }
+        result
+    }
+
+    fn is_printable_ascii(character: char) -> bool {
+        let code = character as u32;
+        (32..=126).contains(&code)
+    }
+
+    fn is_all_chars_printable(value: &str) -> bool {
+        value.chars().all(Self::is_printable_ascii)
+    }
+
+    fn is_java_identifier_start(character: char) -> bool {
+        // ASCII subset of `Character.isJavaIdentifierStart` under JADX's
+        // printable-ASCII rename filter.
+        character.is_ascii_alphabetic() || character == '_' || character == '$'
+    }
+
+    fn is_java_identifier_part(character: char) -> bool {
+        Self::is_java_identifier_start(character) || character.is_ascii_digit()
+    }
+
+    fn is_valid_and_printable(value: &str) -> bool {
+        Self::is_valid_identifier(value) && Self::is_all_chars_printable(value)
+    }
+
+    fn is_valid_identifier(value: &str) -> bool {
+        if value.is_empty() || Self::is_reserved(value) {
+            return false;
+        }
+        let mut characters = value.chars();
+        let Some(first) = characters.next() else {
+            return false;
+        };
+        Self::is_java_identifier_start(first) && characters.all(Self::is_java_identifier_part)
     }
 
     fn is_reserved(value: &str) -> bool {
@@ -106,17 +169,15 @@ impl JavaIdentifier {
                 | "_"
         )
     }
+}
 
-    fn is_source_identifier(value: &str) -> bool {
-        let mut characters = value.chars();
-        let Some(first) = characters.next() else {
-            return false;
-        };
-        (first == '_' || first == '$' || first.is_alphabetic())
-            && characters.all(|character| {
-                character == '_' || character == '$' || character.is_alphanumeric()
-            })
+/// Java `String.hashCode()` over UTF-16 code units.
+fn java_string_hash(value: &str) -> i32 {
+    let mut hash: i32 = 0;
+    for unit in value.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
     }
+    hash
 }
 
 impl std::fmt::Display for JavaIdentifier {
@@ -860,5 +921,29 @@ pub enum JavaStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JavaMethodBody {
     pub root: JavaStmt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JavaIdentifier;
+
+    #[test]
+    fn invalid_dex_identifiers_drop_illegal_characters_like_jadx() {
+        assert_eq!(JavaIdentifier::from_dex("measure-3").as_str(), "measure3");
+        assert_eq!(JavaIdentifier::from_dex("do").as_str(), "Cdo");
+        assert_eq!(JavaIdentifier::from_dex("1Foo").as_str(), "C1Foo");
+        assert_eq!(
+            JavaIdentifier::from_dex("$$$reportNull$$$0").as_str(),
+            "$$$reportNull$$$0"
+        );
+    }
+
+    #[test]
+    fn long_printable_identifiers_are_kept_for_cut_file_name() {
+        let name = "LongName".repeat(40);
+        let identifier = JavaIdentifier::from_dex(&name);
+        assert_eq!(identifier.as_str(), name);
+        assert!(identifier.as_str().len() > 128);
+    }
 }
 use crate::ir::Utf16String;

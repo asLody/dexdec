@@ -9,7 +9,7 @@ use crate::{ClassSelector, DecompileOptions, Decompiler, MethodRequest, SourceLa
 
 use super::error::{CliError, CliResult};
 use super::model::{DecompileRequest, ExitStatus, LanguageSelection, OutputFormat};
-use super::output::{CliHost, CommandContext};
+use super::output::{prepare_file_path, CliHost, CommandContext};
 use super::resolve::ClassResolver;
 
 #[derive(Debug, Serialize)]
@@ -108,12 +108,27 @@ impl DecompileCommand {
                 Err(error) => return Err(error.into()),
             };
             let output_path = if let Some(directory) = request.output_dir.as_deref() {
-                let path = directory.join(&unit.path);
+                let path = prepare_file_path(&directory.join(&unit.path));
+                match context.host_mut().write(&path, unit.source.as_bytes()) {
+                    Ok(()) => Some(path),
+                    Err(error) if !request.fail_fast => {
+                        // Match JADX `SaveCode.save`: log and continue instead of
+                        // aborting the remaining classes in the shard.
+                        let _ = context
+                            .host_mut()
+                            .note(&format!("Save file error: {error}"));
+                        failures.push(GenerationFailure {
+                            class: class.clone(),
+                            error: error.to_string(),
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(path) = request.output_file.as_deref() {
+                let path = prepare_file_path(path);
                 context.host_mut().write(&path, unit.source.as_bytes())?;
                 Some(path)
-            } else if let Some(path) = request.output_file.as_deref() {
-                context.host_mut().write(path, unit.source.as_bytes())?;
-                Some(path.to_path_buf())
             } else {
                 None
             };
