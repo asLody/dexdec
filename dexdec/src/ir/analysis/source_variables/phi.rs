@@ -444,6 +444,55 @@ impl<'a> SsaCopyResolver<'a> {
         }
         InsnArg::Reg(register)
     }
+
+    fn resolve_for_edge(
+        &self,
+        source: InsnArg,
+        predecessor: BlockId,
+        edge_kind: crate::ir::EdgeKind,
+        constants: &BTreeMap<SsaVar, InsnArg>,
+    ) -> Option<InsnArg> {
+        let mut source = self.resolve(source);
+        let mut visited = BTreeSet::new();
+        loop {
+            let Some(register) = source.as_register() else {
+                break;
+            };
+            let Some(value) = SsaVar::from_reg(register) else {
+                break;
+            };
+            if self.materialized.contains(&value) || !visited.insert(value) {
+                break;
+            }
+            let Some(position) = self.values.value(value).and_then(|value| value.definition) else {
+                break;
+            };
+            let Some(instruction) = self
+                .cfg
+                .block(position.block)
+                .and_then(|block| block.insns.get(position.index))
+            else {
+                break;
+            };
+            if instruction.insn_type != InsnType::Phi {
+                break;
+            }
+            let Some(index) = instruction
+                .payload
+                .phi_edges
+                .iter()
+                .position(|edge| *edge == (predecessor, edge_kind))
+            else {
+                break;
+            };
+            let Some(argument) = instruction.args.get(index) else {
+                break;
+            };
+            source = self.resolve(argument.clone());
+        }
+        let value = source.as_register().and_then(SsaVar::from_reg)?;
+        (self.materialized.contains(&value) || constants.contains_key(&value)).then_some(source)
+    }
 }
 
 pub(super) struct RequiredPhiValues {
@@ -1394,8 +1443,23 @@ impl PhiCopies {
                     let Some(value) = argument.value.into_explicit() else {
                         continue;
                     };
+                    let mut value = copy_resolver.resolve(value);
+                    if argument.edge_kind == crate::ir::EdgeKind::Exception
+                        && value
+                            .as_register()
+                            .is_some_and(|source| source.code_var == Some(destination_variable))
+                    {
+                        if let Some(resolved) = copy_resolver.resolve_for_edge(
+                            value.clone(),
+                            argument.predecessor,
+                            argument.edge_kind,
+                            constants,
+                        ) {
+                            value = resolved;
+                        }
+                    }
                     let Some(source) = Self::copy_source_arg(
-                        copy_resolver.resolve(value),
+                        value,
                         destination_variable,
                         &destination_type,
                         constants,
@@ -1936,6 +2000,7 @@ pub(super) struct PhiLowering {
     handler_blocks: BTreeSet<BlockId>,
     semantic_blocks: BTreeSet<BlockId>,
     statement_blocks: BTreeSet<BlockId>,
+    materialized_instructions: BTreeSet<InstructionId>,
     placed_exceptional: BTreeSet<InstructionId>,
     seen: BTreeSet<BlockId>,
     next_variable: u32,
@@ -2066,6 +2131,7 @@ impl PhiLowering {
             handler_blocks,
             semantic_blocks: BTreeSet::new(),
             statement_blocks: BTreeSet::new(),
+            materialized_instructions: BTreeSet::new(),
             placed_exceptional: BTreeSet::new(),
             seen: BTreeSet::new(),
             next_variable,
@@ -2079,6 +2145,8 @@ impl PhiLowering {
     pub(super) fn apply(mut self, root: &mut SemanticNode) -> Result<(), SourceVariableError> {
         self.semantic_blocks = SemanticBlocks::collect(root);
         self.statement_blocks = StatementBlocks::collect(root);
+        self.materialized_instructions =
+            EvaluationInstructions::of_node(root).into_iter().collect();
         let body = std::mem::replace(root, SemanticNode::Empty);
         *root = self.fold_node(body)?;
         if let Some(site) = self.normal.first_unplaced() {
@@ -2296,7 +2364,13 @@ impl PhiLowering {
             .unwrap_or(SemanticNode::Empty);
         let terminal_prefix = leave
             .origin
-            .and_then(|origin| self.terminal_exceptional.get(&origin).copied())
+            .and_then(|origin| {
+                terminal_exceptional_fallback(
+                    &self.terminal_exceptional,
+                    &self.materialized_instructions,
+                    origin,
+                )
+            })
             .map(|instruction| self.exceptional_prefix([instruction]))
             .unwrap_or(SemanticNode::Empty);
         let normal_prefix = leave
@@ -2382,6 +2456,17 @@ impl PhiLowering {
     }
 }
 
+fn terminal_exceptional_fallback(
+    terminal_exceptional: &BTreeMap<BlockId, InstructionId>,
+    materialized_instructions: &BTreeSet<InstructionId>,
+    origin: BlockId,
+) -> Option<InstructionId> {
+    terminal_exceptional
+        .get(&origin)
+        .copied()
+        .filter(|instruction| !materialized_instructions.contains(instruction))
+}
+
 #[derive(Default)]
 struct SemanticBlocks {
     blocks: BTreeSet<BlockId>,
@@ -2432,6 +2517,12 @@ struct EvaluationInstructions {
 }
 
 impl EvaluationInstructions {
+    fn of_node(node: &SemanticNode) -> Vec<InstructionId> {
+        let mut collector = Self::default();
+        collector.visit_node(node);
+        collector.instructions
+    }
+
     fn of_statement(statement: &crate::ir::SemanticStatement) -> Vec<InstructionId> {
         if let Some(operation) = statement.instruction_ref() {
             return Self::of_operation(operation);
@@ -2470,7 +2561,107 @@ impl SemanticVisitor for EvaluationInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{EdgeKind, LiteralArg, RegionEdge, SemanticExpression};
+    use crate::ir::{
+        Block, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, SemanticExpression,
+    };
+
+    fn source_variable(register: u32, version: u32, variable: u32) -> RegisterArg {
+        let mut value = RegisterArg::new_ssa(register, version, ArgType::INT);
+        value.code_var = Some(variable);
+        value
+    }
+
+    #[test]
+    fn copy_resolver_selects_nested_phi_value_for_exception_edge() {
+        let entry = BlockId::new(3);
+        let left_block = BlockId::new(0);
+        let right_block = BlockId::new(1);
+        let handler = BlockId::new(2);
+        let left = source_variable(1, 0, 1);
+        let right = source_variable(2, 0, 2);
+        let phi_result = source_variable(0, 1, 7);
+        let moved = source_variable(3, 0, 7);
+
+        let mut cfg = CFG::new("nested_exception_phi");
+        cfg.entry = entry;
+        cfg.add_block(Block::new(entry));
+        let mut left_body = Block::new(left_block);
+        left_body.push(InsnNode::const_value(left.clone(), 1));
+        cfg.add_block(left_body);
+        let mut right_body = Block::new(right_block);
+        right_body.push(InsnNode::const_value(right.clone(), 2));
+        cfg.add_block(right_body);
+        let mut handler_body = Block::new(handler);
+        let mut phi = InsnNode::phi(
+            phi_result.clone(),
+            vec![
+                (left_block.raw(), InsnArg::Reg(left)),
+                (right_block.raw(), InsnArg::Reg(right.clone())),
+            ],
+        );
+        for edge in &mut phi.payload.phi_edges {
+            edge.1 = EdgeKind::Exception;
+        }
+        handler_body.push(phi);
+        handler_body.push(InsnNode::move_insn(moved.clone(), InsnArg::Reg(phi_result)));
+        cfg.add_block(handler_body);
+        cfg.add_edge(entry, left_block, EdgeKind::True);
+        cfg.add_edge(entry, right_block, EdgeKind::False);
+        cfg.add_edge(left_block, handler, EdgeKind::Exception);
+        cfg.add_edge(right_block, handler, EdgeKind::Exception);
+
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let materialized = BTreeSet::from([SsaVar::from_reg(&right).expect("SSA value")]);
+        let resolver = SsaCopyResolver::new(&cfg, &values, &materialized);
+        let resolved = resolver
+            .resolve_for_edge(
+                InsnArg::Reg(moved),
+                right_block,
+                EdgeKind::Exception,
+                &BTreeMap::new(),
+            )
+            .expect("materialized edge value");
+
+        assert!(same_value(&resolved, &InsnArg::Reg(right)));
+    }
+
+    #[test]
+    fn copy_resolver_rejects_non_materialized_nested_phi_value() {
+        let predecessor = BlockId::new(0);
+        let handler = BlockId::new(1);
+        let source = source_variable(1, 0, 1);
+        let phi_result = source_variable(0, 1, 7);
+        let moved = source_variable(2, 0, 7);
+
+        let mut cfg = CFG::new("non_materialized_exception_phi");
+        cfg.entry = predecessor;
+        let mut predecessor_body = Block::new(predecessor);
+        predecessor_body.push(InsnNode::const_value(source.clone(), 1));
+        cfg.add_block(predecessor_body);
+        let mut handler_body = Block::new(handler);
+        let mut phi = InsnNode::phi(
+            phi_result.clone(),
+            vec![(predecessor.raw(), InsnArg::Reg(source))],
+        );
+        phi.payload.phi_edges[0].1 = EdgeKind::Exception;
+        handler_body.push(phi);
+        handler_body.push(InsnNode::move_insn(moved.clone(), InsnArg::Reg(phi_result)));
+        cfg.add_block(handler_body);
+        cfg.add_edge(predecessor, handler, EdgeKind::Exception);
+
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let materialized = BTreeSet::new();
+        let resolver = SsaCopyResolver::new(&cfg, &values, &materialized);
+
+        assert!(resolver
+            .resolve_for_edge(
+                InsnArg::Reg(moved),
+                predecessor,
+                EdgeKind::Exception,
+                &BTreeMap::new(),
+            )
+            .is_none());
+    }
 
     fn normal_copies() -> NormalCopies {
         let statement = SemanticStatement::definition(
@@ -2523,5 +2714,31 @@ mod tests {
             1
         );
         assert!(copies.first_unplaced().is_none());
+    }
+
+    #[test]
+    fn materialized_throwing_instruction_suppresses_terminal_copy_fallback() {
+        let block = BlockId::new(18);
+        let instruction = InstructionId::new(20);
+        let mut constructor = InsnNode::new(InsnType::Constructor, 0);
+        constructor.id = instruction;
+        constructor.set_result(RegisterArg::new(13, ArgType::object("example/Value")));
+        let root = SemanticNode::BasicBlock(SemanticBlock {
+            id: block,
+            statements: vec![SemanticStatement::instruction(constructor).unwrap()],
+        });
+        let materialized = EvaluationInstructions::of_node(&root)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let terminals = BTreeMap::from([(block, instruction)]);
+
+        assert_eq!(
+            terminal_exceptional_fallback(&terminals, &materialized, block),
+            None
+        );
+        assert_eq!(
+            terminal_exceptional_fallback(&terminals, &BTreeSet::new(), block),
+            Some(instruction)
+        );
     }
 }

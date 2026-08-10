@@ -36,6 +36,7 @@ use ssa_constants::SparseConstantPropagation;
 pub struct ValueRecovery {
     gated_control: GatedControlFlow,
     ssa_constants: BTreeMap<SsaVar, crate::ir::InsnArg>,
+    source_bindings: BTreeSet<SsaVar>,
     diagnostics: crate::ir::ValueRecoveryDiagnostics,
 }
 
@@ -172,8 +173,19 @@ impl ValueRecovery {
         Ok(Self {
             gated_control: GatedControlFlow::analyze(cfg)?,
             ssa_constants: SparseConstantPropagation::new(cfg).solve(),
+            source_bindings: BTreeSet::new(),
             diagnostics: crate::ir::ValueRecoveryDiagnostics::default(),
         })
+    }
+
+    pub(crate) fn bind_source_inputs(&mut self, cfg: &CFG) {
+        self.source_bindings.clear();
+        self.source_bindings.extend(
+            cfg.this_code_variable()
+                .into_iter()
+                .chain(cfg.parameter_code_variables().iter().flatten().copied())
+                .map(|variable| SsaVar::new(variable, 0)),
+        );
     }
 
     pub fn diagnostics(&self) -> &crate::ir::ValueRecoveryDiagnostics {
@@ -184,14 +196,18 @@ impl ValueRecovery {
         &mut self,
         method: &mut SemanticMethod<State>,
     ) -> Result<bool, ValueRecoveryError> {
-        source::SourceValueRecovery::recover(method, RecoveryMode::Full)
+        source::SourceValueRecovery::recover(method, RecoveryMode::Full, &self.source_bindings)
     }
 
     pub fn prepare_source<State: SourceVariableContext>(
         &mut self,
         method: &mut SemanticMethod<State>,
     ) -> Result<bool, ValueRecoveryError> {
-        source::SourceValueRecovery::recover(method, RecoveryMode::Structural)
+        source::SourceValueRecovery::recover(
+            method,
+            RecoveryMode::Structural,
+            &self.source_bindings,
+        )
     }
 }
 

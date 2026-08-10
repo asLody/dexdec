@@ -1165,6 +1165,41 @@ impl JavaSourceAbi {
             })
     }
 
+    /// Recovers a declaration signature from an immediate superclass or
+    /// interface when the method's own generic metadata is unusable. Distinct
+    /// inherited contracts remain unresolved instead of being guessed.
+    pub(crate) fn inherited_declaration_signature(
+        &self,
+        class: &ClassNode,
+        method: &MethodNode,
+    ) -> Option<crate::ir::generic_types::MethodSignature> {
+        let instantiated_type =
+            JvmTypeSignature::ClassType(self.owner_type(class.class_type())?.clone());
+        let mut recovered = None;
+        for parent in class.super_class.iter().chain(&class.interfaces) {
+            let reference = MethodReference {
+                owner: parent.clone(),
+                name: method.name().to_string(),
+                descriptor: crate::ir::MethodDescriptor {
+                    parameters: method.param_types().to_vec(),
+                    return_type: method.return_type().clone(),
+                },
+            };
+            let Some(candidate) = self.inherited_method_signature(&instantiated_type, &reference)
+            else {
+                continue;
+            };
+            if recovered
+                .as_ref()
+                .is_some_and(|existing| existing != &candidate)
+            {
+                return None;
+            }
+            recovered = Some(candidate);
+        }
+        recovered
+    }
+
     pub(crate) fn class_type_parameters(&self, ty: &ArgType) -> Option<Vec<TypeParameter>> {
         self.generic_hierarchy
             .as_ref()

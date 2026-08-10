@@ -230,7 +230,18 @@ impl JavaDecompiler {
             .filter(|method| !method.access_flags.is_bridge())
         {
             if method.code().is_none() {
-                let declaration = match JavaMethodDeclaration::from_method_node(class, method) {
+                let declaration = match JavaMethodDeclaration::from_method_node(
+                    class,
+                    method,
+                    self.source_abi.lexical_type_variables(class.class_type()),
+                    ((class.access_flags.is_enum() || class.access_flags.is_annotation())
+                        && method.signature.is_some())
+                    .then(|| {
+                        self.source_abi
+                            .inherited_declaration_signature(class, method)
+                    })
+                    .flatten(),
+                ) {
                     Ok(declaration) => declaration,
                     Err(error) => {
                         let failure =
@@ -414,7 +425,18 @@ impl JavaDecompiler {
         outer_instance: Option<&OuterInstanceField>,
     ) -> Result<JavaMethodModel, JavaDecompilerError> {
         let mut declaration = crate::profile_scope!("java_backend.method.declaration", {
-            JavaMethodDeclaration::from_method_node(class, method)
+            JavaMethodDeclaration::from_method_node(
+                class,
+                method,
+                self.source_abi.lexical_type_variables(class.class_type()),
+                ((class.access_flags.is_enum() || class.access_flags.is_annotation())
+                    && method.signature.is_some())
+                .then(|| {
+                    self.source_abi
+                        .inherited_declaration_signature(class, method)
+                })
+                .flatten(),
+            )
         })?;
         if declaration.throws.is_empty() {
             declaration

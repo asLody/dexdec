@@ -396,6 +396,69 @@ impl TypeArgument {
 }
 
 impl MethodSignature {
+    /// Returns whether this signature references a type variable that is not
+    /// declared by the method and is not visible from its lexical owner.
+    ///
+    /// Optimizers occasionally leave a synthetic method signature such as
+    /// `(TT;)Z` after removing the declaration that introduced `T`. Treating
+    /// that metadata as source truth creates an undeclared Java type variable.
+    pub fn has_unbound_type_variables<'a>(
+        &self,
+        lexical_variables: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        fn collect_type(ty: &JvmTypeSignature, variables: &mut std::collections::BTreeSet<String>) {
+            match ty {
+                JvmTypeSignature::TypeVariable(name) => {
+                    variables.insert(name.clone());
+                }
+                JvmTypeSignature::Array(element) => collect_type(element, variables),
+                JvmTypeSignature::ClassType(class) => {
+                    for argument in class.type_arguments.iter().chain(
+                        class
+                            .inner_segments
+                            .iter()
+                            .flat_map(|segment| &segment.type_arguments),
+                    ) {
+                        match argument {
+                            TypeArgument::Unbounded => {}
+                            TypeArgument::Extends(ty)
+                            | TypeArgument::Super(ty)
+                            | TypeArgument::Exact(ty) => collect_type(ty, variables),
+                        }
+                    }
+                }
+                JvmTypeSignature::BaseType(_) => {}
+            }
+        }
+
+        let bound = lexical_variables
+            .into_iter()
+            .map(str::to_owned)
+            .chain(
+                self.type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut referenced = std::collections::BTreeSet::new();
+        for parameter in &self.type_parameters {
+            if let Some(class_bound) = &parameter.class_bound {
+                collect_type(class_bound, &mut referenced);
+            }
+            for interface_bound in &parameter.interface_bounds {
+                collect_type(interface_bound, &mut referenced);
+            }
+        }
+        for parameter in &self.parameter_types {
+            collect_type(parameter, &mut referenced);
+        }
+        collect_type(&self.return_type, &mut referenced);
+        for exception in &self.throws {
+            collect_type(exception, &mut referenced);
+        }
+        !referenced.is_subset(&bound)
+    }
+
     pub fn parameter_erasures(&self) -> Vec<ArgType> {
         self.parameter_types
             .iter()
@@ -629,5 +692,15 @@ mod tests {
             sig.return_erasure(),
             ArgType::object("java/security/spec/KeySpec")
         );
+    }
+
+    #[test]
+    fn detects_type_variables_missing_from_method_and_lexical_scope() {
+        let orphaned = GenericSignatures::method("(TT;)Z").unwrap();
+        let declared = GenericSignatures::method("<T:Ljava/lang/Object;>(TT;)Z").unwrap();
+
+        assert!(orphaned.has_unbound_type_variables(std::iter::empty()));
+        assert!(!orphaned.has_unbound_type_variables(["T"]));
+        assert!(!declared.has_unbound_type_variables(std::iter::empty()));
     }
 }

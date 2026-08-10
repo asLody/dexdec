@@ -348,13 +348,17 @@ impl<'ir> ValueFlowGraph<'ir> {
         Ok(graph)
     }
 
-    pub(super) fn build_source(root: &'ir SemanticNode) -> Result<Self, ValueRecoveryError> {
-        Self::build_allocated(root, ValueIdentity::Source)
+    pub(super) fn build_source(
+        root: &'ir SemanticNode,
+        bindings: &BTreeSet<SsaVar>,
+    ) -> Result<Self, ValueRecoveryError> {
+        Self::build_allocated(root, ValueIdentity::Source, bindings)
     }
 
     fn build_allocated(
         root: &'ir SemanticNode,
         identity: ValueIdentity,
+        bindings: &BTreeSet<SsaVar>,
     ) -> Result<Self, ValueRecoveryError> {
         let symbols = crate::profile_scope!(
             "value.graph.control_symbols",
@@ -370,7 +374,7 @@ impl<'ir> ValueFlowGraph<'ir> {
             identity,
             logic,
             definitions: BTreeMap::new(),
-            bindings: BTreeSet::new(),
+            bindings: bindings.clone(),
             uses: BTreeMap::new(),
             phis: Vec::new(),
             copies: SsaCopyFlow::default(),
@@ -928,8 +932,17 @@ mod tests {
             finally: None,
         };
 
-        let graph = ValueFlowGraph::build_source(&root).unwrap();
+        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new()).unwrap();
 
         assert!(graph.is_bound(SsaVar::new(7, 0)));
+    }
+
+    #[test]
+    fn method_inputs_are_lexical_value_bindings() {
+        let binding = SsaVar::new(7, 0);
+        let graph =
+            ValueFlowGraph::build_source(&SemanticNode::Empty, &BTreeSet::from([binding])).unwrap();
+
+        assert!(graph.is_bound(binding));
     }
 }

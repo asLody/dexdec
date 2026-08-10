@@ -21,6 +21,7 @@ impl SourceValueRecovery {
     pub(super) fn recover<State: SourceVariableContext>(
         method: &mut SemanticMethod<State>,
         mode: RecoveryMode,
+        bindings: &std::collections::BTreeSet<crate::ir::analysis::SsaVar>,
     ) -> Result<bool, ValueRecoveryError> {
         crate::profile_scope!("value.source.normalize", method.normalize_source())?;
         let mut changed = false;
@@ -42,7 +43,7 @@ impl SourceValueRecovery {
                 )?;
                 let graph = crate::profile_scope!(
                     "value.source.graph",
-                    ValueFlowGraph::build_source(method.body())
+                    ValueFlowGraph::build_source(method.body(), bindings)
                 )?;
                 let plan = crate::profile_scope!("value.source.plan", graph.schedule(mode))?;
                 let before_schedule = crate::profile_scope!(

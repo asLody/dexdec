@@ -114,6 +114,7 @@ impl<'a> MethodBodyPipeline<'a> {
         let mut semantic = crate::profile_scope!("method_pipeline.source_variables", {
             source_variables.apply(cfg, semantic, types, self.hierarchy)
         })?;
+        value_recovery.bind_source_inputs(cfg);
         self.observe_stage(cfg, "source_apply:done")?;
         semantic.verify()?;
         self.observe_semantics(
