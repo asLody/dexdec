@@ -5,6 +5,7 @@
 //! one original CFG block.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::ir::{
     RegionId, SemanticExpression, SemanticLabel, SemanticLeave, SemanticLeaveKind,
@@ -49,7 +50,28 @@ pub struct SemanticFlowGraph {
 #[derive(Debug, Clone)]
 pub struct SemanticReachability {
     components: BTreeMap<SemanticFlowPoint, usize>,
-    reachable: Vec<DefinitionSet>,
+    store: ReachabilityStore,
+}
+
+#[derive(Debug, Clone)]
+enum ReachabilityStore {
+    Dense(Vec<DefinitionSet>),
+    Sparse(Arc<SparseReachability>),
+}
+
+#[derive(Debug)]
+struct SparseReachability {
+    successors: Vec<Vec<usize>>,
+    predecessors: Vec<Vec<usize>>,
+    topological_positions: Vec<usize>,
+    forward: Mutex<ReachabilityCache>,
+    backward: Mutex<ReachabilityCache>,
+}
+
+#[derive(Debug, Default)]
+struct ReachabilityCache {
+    order: VecDeque<usize>,
+    rows: BTreeMap<usize, Arc<DefinitionSet>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -198,6 +220,11 @@ impl SemanticReachingValues {
 
 impl SemanticReachability {
     fn analyze(graph: &SemanticFlowGraph) -> Self {
+        const MAX_DENSE_BYTES: usize = 64 * 1024 * 1024;
+        Self::analyze_with_dense_limit(graph, MAX_DENSE_BYTES)
+    }
+
+    fn analyze_with_dense_limit(graph: &SemanticFlowGraph, max_dense_bytes: usize) -> Self {
         let points = graph
             .predecessors
             .keys()
@@ -292,23 +319,49 @@ impl SemanticReachability {
         }
         debug_assert_eq!(topological.len(), component_count);
 
-        let mut reachable = (0..component_count)
-            .map(|component| {
-                let mut set = DefinitionSet::new(component_count);
-                set.insert(component);
-                set
-            })
-            .collect::<Vec<_>>();
-        for component in topological.into_iter().rev() {
-            for successor in &successors[component] {
-                let successor_reachability = reachable[*successor].clone();
-                reachable[component].union_with(&successor_reachability);
+        let words_per_row = component_count.div_ceil(u64::BITS as usize);
+        let dense_bytes = component_count
+            .saturating_mul(words_per_row)
+            .saturating_mul(std::mem::size_of::<u64>());
+        let store = if dense_bytes <= max_dense_bytes {
+            let mut reachable = (0..component_count)
+                .map(|component| {
+                    let mut set = DefinitionSet::new(component_count);
+                    set.insert(component);
+                    set
+                })
+                .collect::<Vec<_>>();
+            for component in topological.into_iter().rev() {
+                for successor in &successors[component] {
+                    let successor_reachability = reachable[*successor].clone();
+                    reachable[component].union_with(&successor_reachability);
+                }
             }
-        }
-        Self {
-            components,
-            reachable,
-        }
+            ReachabilityStore::Dense(reachable)
+        } else {
+            let successors = successors
+                .into_iter()
+                .map(|targets| targets.into_iter().collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let mut predecessors = vec![Vec::new(); component_count];
+            for (source, targets) in successors.iter().enumerate() {
+                for target in targets {
+                    predecessors[*target].push(source);
+                }
+            }
+            let mut topological_positions = vec![0; component_count];
+            for (position, component) in topological.into_iter().enumerate() {
+                topological_positions[component] = position;
+            }
+            ReachabilityStore::Sparse(Arc::new(SparseReachability {
+                successors,
+                predecessors,
+                topological_positions,
+                forward: Mutex::new(ReachabilityCache::default()),
+                backward: Mutex::new(ReachabilityCache::default()),
+            }))
+        };
+        Self { components, store }
     }
 
     pub fn reaches(&self, source: SemanticFlowPoint, target: SemanticFlowPoint) -> bool {
@@ -317,7 +370,10 @@ impl SemanticReachability {
         else {
             return false;
         };
-        self.reachable[*source].contains(*target)
+        match &self.store {
+            ReachabilityStore::Dense(reachable) => reachable[*source].contains(*target),
+            ReachabilityStore::Sparse(reachable) => reachable.reaches(*source, *target),
+        }
     }
 
     pub fn reaches_any_between(
@@ -326,9 +382,90 @@ impl SemanticReachability {
         target: SemanticFlowPoint,
         candidates: &BTreeSet<SemanticFlowPoint>,
     ) -> bool {
-        candidates
-            .iter()
-            .any(|candidate| self.reaches(source, *candidate) && self.reaches(*candidate, target))
+        match &self.store {
+            ReachabilityStore::Dense(_) => candidates.iter().any(|candidate| {
+                self.reaches(source, *candidate) && self.reaches(*candidate, target)
+            }),
+            ReachabilityStore::Sparse(reachable) => {
+                let (Some(source), Some(target)) =
+                    (self.components.get(&source), self.components.get(&target))
+                else {
+                    return false;
+                };
+                let from_source = reachable.forward_row(*source);
+                let to_target = reachable.backward_row(*target);
+                candidates.iter().any(|candidate| {
+                    self.components.get(candidate).is_some_and(|candidate| {
+                        from_source.contains(*candidate) && to_target.contains(*candidate)
+                    })
+                })
+            }
+        }
+    }
+}
+
+impl SparseReachability {
+    const MAX_CACHED_ROWS: usize = 32;
+
+    fn reaches(&self, source: usize, target: usize) -> bool {
+        if source == target {
+            return true;
+        }
+        if self.topological_positions[source] >= self.topological_positions[target] {
+            return false;
+        }
+        self.forward_row(source).contains(target)
+    }
+
+    fn forward_row(&self, source: usize) -> Arc<DefinitionSet> {
+        Self::row(&self.forward, &self.successors, source)
+    }
+
+    fn backward_row(&self, target: usize) -> Arc<DefinitionSet> {
+        Self::row(&self.backward, &self.predecessors, target)
+    }
+
+    fn row(
+        cache: &Mutex<ReachabilityCache>,
+        adjacency: &[Vec<usize>],
+        source: usize,
+    ) -> Arc<DefinitionSet> {
+        if let Some(row) = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rows
+            .get(&source)
+            .cloned()
+        {
+            return row;
+        }
+
+        let mut row = DefinitionSet::new(adjacency.len());
+        let mut pending = vec![source];
+        while let Some(component) = pending.pop() {
+            if row.contains(component) {
+                continue;
+            }
+            row.insert(component);
+            pending.extend(adjacency[component].iter().copied());
+        }
+        let row = Arc::new(row);
+
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = cache.rows.get(&source) {
+            return existing.clone();
+        }
+        while cache.rows.len() >= Self::MAX_CACHED_ROWS {
+            let Some(evicted) = cache.order.pop_front() else {
+                break;
+            };
+            cache.rows.remove(&evicted);
+        }
+        cache.order.push_back(source);
+        cache.rows.insert(source, row.clone());
+        row
     }
 }
 
@@ -1692,6 +1829,47 @@ mod tests {
         };
 
         assert!(!graph.must_reach(source, target));
+    }
+
+    #[test]
+    fn sparse_reachability_matches_dense_reachability() {
+        let points = (0..7).map(point).collect::<Vec<_>>();
+        let mut graph = SemanticFlowGraph {
+            complete: true,
+            ..SemanticFlowGraph::default()
+        };
+        for (source, target) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 4), (4, 3), (4, 5)] {
+            graph
+                .successors
+                .entry(points[source])
+                .or_default()
+                .push(points[target]);
+            graph
+                .predecessors
+                .entry(points[target])
+                .or_default()
+                .push((points[source], SemanticFlowEdgeKind::Normal));
+        }
+        graph.entries.insert(points[0]);
+
+        let dense = SemanticReachability::analyze_with_dense_limit(&graph, usize::MAX);
+        let sparse = SemanticReachability::analyze_with_dense_limit(&graph, 0);
+        assert!(matches!(sparse.store, ReachabilityStore::Sparse(_)));
+        for source in &points {
+            for target in &points {
+                assert_eq!(
+                    sparse.reaches(*source, *target),
+                    dense.reaches(*source, *target),
+                    "reachability mismatch from {source:?} to {target:?}"
+                );
+            }
+        }
+
+        let candidates = BTreeSet::from([points[1], points[2], points[6]]);
+        assert_eq!(
+            sparse.reaches_any_between(points[0], points[5], &candidates),
+            dense.reaches_any_between(points[0], points[5], &candidates)
+        );
     }
 }
 

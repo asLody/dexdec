@@ -9,7 +9,7 @@ use crate::ir::semantic::SemanticFactory;
 use crate::ir::{
     BlockId, RegionGraph, RegionId, RegionKind, SemanticBlock, SemanticCatch, SemanticFinally,
     SemanticFoldError, SemanticFolder, SemanticLeave, SemanticLeaveKind, SemanticNode,
-    StructuredRegion, CFG,
+    SemanticOperation, SemanticVisitor, StructuredRegion, CFG,
 };
 
 use super::{
@@ -143,12 +143,35 @@ impl<'a> RegionReducer<'a> {
             });
         }
         Self::verify_root_labels("contracted", &root.body)?;
+        Self::verify_node_limit(root_region, "contraction", &root.body)?;
         let body = ExceptionEnvelopeCanonicalizer::new(self.cfg, self.regions).apply(root.body)?;
         Self::verify_root_labels("exception-canonicalized", &body)?;
+        Self::verify_node_limit(root_region, "exception canonicalization", &body)?;
         let mut body = LexicalLabels::uniquify(body).map_err(StructureError::from)?;
         Self::verify_root_labels("label-uniquified", &body)?;
+        Self::verify_node_limit(root_region, "label repair", &body)?;
         SemanticCleanupResolver::apply(self.regions, &mut body);
         Ok(body)
+    }
+
+    fn verify_node_limit(
+        region: RegionId,
+        stage: &'static str,
+        body: &SemanticNode,
+    ) -> Result<(), StructureError> {
+        const MAX_SEMANTIC_ITEMS: usize = 100_000;
+        let mut count = SemanticComplexity::default();
+        count.visit_node(body);
+        if count.items > MAX_SEMANTIC_ITEMS {
+            Err(StructureError::SemanticItemLimit {
+                region,
+                stage,
+                items: count.items,
+                limit: MAX_SEMANTIC_ITEMS,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     fn verify_root_labels(stage: &'static str, body: &SemanticNode) -> Result<(), StructureError> {
@@ -462,6 +485,21 @@ impl<'a> RegionReducer<'a> {
             }),
             continuation,
         ])
+    }
+}
+
+#[derive(Default)]
+struct SemanticComplexity {
+    items: usize,
+}
+
+impl SemanticVisitor for SemanticComplexity {
+    fn enter_node(&mut self, _node: &SemanticNode) {
+        self.items = self.items.saturating_add(1);
+    }
+
+    fn enter_operation(&mut self, _operation: &SemanticOperation) {
+        self.items = self.items.saturating_add(1);
     }
 }
 
