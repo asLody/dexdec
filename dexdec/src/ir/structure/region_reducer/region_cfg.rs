@@ -1024,17 +1024,36 @@ impl RegionCfg {
                     .any(|(target, _)| {
                         std::iter::once(*target)
                             .chain(graph.handler_adapters().get(target).copied())
-                            .filter_map(|entry| graph.owner_of(entry))
-                            .any(|owner| {
-                                handlers.iter().any(|handler| {
-                                    owner == *handler
-                                        || graph
-                                            .tree()
-                                            .is_ancestor(*handler, owner)
-                                            .is_ok_and(|descendant| descendant)
-                                })
+                            .any(|entry| {
+                                let owned_by_handler = graph.owner_of(entry).is_some_and(|owner| {
+                                    handlers.iter().any(|handler| {
+                                        owner == *handler
+                                            || graph
+                                                .tree()
+                                                .is_ancestor(*handler, owner)
+                                                .is_ok_and(|descendant| descendant)
+                                    })
+                                });
+                                owned_by_handler
+                                    || Self::empty_handler_continues_at(
+                                        graph.tree(),
+                                        &handlers,
+                                        entry,
+                                    )
                             })
                     })
+        })
+    }
+
+    fn empty_handler_continues_at(
+        tree: &crate::ir::RegionTree,
+        handlers: &BTreeSet<RegionId>,
+        target: BlockId,
+    ) -> bool {
+        handlers.iter().any(|handler| {
+            tree.region(*handler).is_some_and(|region| {
+                region.entry.is_none() && region.kind.continuation() == Some(target)
+            })
         })
     }
 }
@@ -1126,7 +1145,7 @@ impl BoundaryValueKey {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{BoundaryExitKey, BoundaryValueKey, RegionEntryPorts};
+    use super::{BoundaryExitKey, BoundaryValueKey, RegionCfg, RegionEntryPorts};
     use crate::ir::{ArgType, BlockId, CatchRegion, InsnArg, RegionExit, RegionKind, RegionTree};
 
     #[test]
@@ -1221,5 +1240,37 @@ mod tests {
         assert_eq!(entries[&inner], BTreeSet::from([target]));
         assert_eq!(entries[&handler], BTreeSet::from([target]));
         assert!(entries[&outer].is_empty());
+    }
+
+    #[test]
+    fn empty_catch_is_reached_through_its_continuation() {
+        let continuation = BlockId::new(20);
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let try_region = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(17)))
+            .expect("try region");
+        let handler = tree
+            .add_child(
+                try_region,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::object("java/lang/Exception")],
+                    exception_value: None,
+                    continuation: Some(continuation),
+                }),
+                None,
+            )
+            .expect("empty catch");
+
+        assert!(RegionCfg::empty_handler_continues_at(
+            &tree,
+            &BTreeSet::from([handler]),
+            continuation,
+        ));
+        assert!(!RegionCfg::empty_handler_continues_at(
+            &tree,
+            &BTreeSet::from([handler]),
+            BlockId::new(21),
+        ));
     }
 }

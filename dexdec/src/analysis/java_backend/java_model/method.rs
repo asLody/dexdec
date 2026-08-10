@@ -456,23 +456,43 @@ impl JavaMethodDeclaration {
         }
     }
 
-    pub fn from_method_node(
+    pub fn from_method_node<'a>(
         class: &ClassNode,
         method: &MethodNode,
+        lexical_type_variables: impl IntoIterator<Item = &'a str>,
+        inherited_declaration_signature: Option<crate::ir::generic_types::MethodSignature>,
     ) -> Result<Self, crate::ir::generic_types::SignatureError> {
         let mut declaration = Self::from_method_node_erased(class, method);
-        let (signature, source_return_type) = match method.signature.as_deref() {
-            Some(signature) => (
-                Some(crate::ir::generic_types::GenericSignatures::method(
-                    signature,
-                )?),
-                None,
-            ),
+        let parsed_signature = method
+            .signature
+            .as_deref()
+            .map(crate::ir::generic_types::GenericSignatures::method)
+            .transpose()?;
+        // Local and anonymous classes can legitimately retain variables from
+        // an enclosing generic method even when incomplete DEX enclosing
+        // metadata keeps them out of the reconstructed lexical scope. Java
+        // enums and annotations cannot declare fallback type parameters at
+        // all, so only those declaration kinds must reject an orphaned method
+        // variable here.
+        let rejects_fallback_type_parameters =
+            class.access_flags.is_enum() || class.access_flags.is_annotation();
+        let has_unbound_variables = rejects_fallback_type_parameters
+            && parsed_signature.as_ref().is_some_and(|signature| {
+                signature.has_unbound_type_variables(lexical_type_variables)
+            });
+        let explicit_signature = parsed_signature.filter(|_| !has_unbound_variables);
+        let (signature, source_return_type) = match explicit_signature {
+            Some(signature) => (Some(signature), None),
             None => {
                 let inherited = method
                     .override_semantics
                     .as_ref()
-                    .and_then(|semantics| semantics.inherited_signature.clone());
+                    .and_then(|semantics| semantics.inherited_signature.clone())
+                    .or_else(|| {
+                        has_unbound_variables
+                            .then_some(inherited_declaration_signature)
+                            .flatten()
+                    });
                 let covariant_return = inherited
                     .as_ref()
                     .is_some_and(|signature| signature.return_erasure() != *method.return_type())

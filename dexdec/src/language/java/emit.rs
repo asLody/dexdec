@@ -850,9 +850,9 @@ impl JavaPrinter {
                     JavaExpr::ClassLiteral(ty) => {
                         results.push(RenderedExpression::primary(format!("{ty}.class")))
                     }
-                    JavaExpr::StaticField { owner, name } => {
-                        results.push(RenderedExpression::primary(format!("{owner}.{name}")))
-                    }
+                    JavaExpr::StaticField { owner, name } => results.push(
+                        RenderedExpression::primary(format!("{}.{name}", owner.clone().into_raw())),
+                    ),
                     JavaExpr::Field { owner, name } => {
                         pending.push(ExpressionTask::Rebuild(ExpressionFrame::Field {
                             name,
@@ -1455,7 +1455,8 @@ impl ExpressionFrame<'_> {
                     .map(|child| child.text)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let prefix = receiver.or_else(|| owner.map(ToString::to_string));
+                let prefix =
+                    receiver.or_else(|| owner.map(|owner| owner.clone().into_raw().to_string()));
                 let type_arguments = (!type_arguments.is_empty()).then(|| {
                     format!(
                         "<{}>",
@@ -1833,6 +1834,51 @@ mod tests {
             .expect("diamond construction");
 
         assert_eq!(expression, "new java.util.ArrayList<>()");
+    }
+
+    #[test]
+    fn static_method_owner_does_not_emit_class_type_arguments() {
+        let mut owner = match JavaType::source_class("example.Owner") {
+            JavaType::Class(owner) => owner,
+            _ => unreachable!(),
+        };
+        owner.segments.last_mut().unwrap().arguments = vec![JavaTypeArgument::Exact(
+            JavaType::source_class("java.lang.String"),
+        )];
+        let expression = JavaExpr::Call {
+            receiver: None,
+            owner: Some(JavaType::Class(owner)),
+            type_arguments: vec![JavaType::source_class("java.lang.Integer")],
+            method: JavaIdentifier::from_dex("select"),
+            args: Vec::new(),
+        };
+
+        let expression = JavaPrinter::default()
+            .expression_at(&expression, 0)
+            .expect("static method call");
+
+        assert_eq!(expression, "example.Owner.<java.lang.Integer>select()");
+    }
+
+    #[test]
+    fn static_field_owner_does_not_emit_class_type_arguments() {
+        let mut owner = match JavaType::source_class("example.Owner") {
+            JavaType::Class(owner) => owner,
+            _ => unreachable!(),
+        };
+        owner.segments.last_mut().unwrap().arguments = vec![JavaTypeArgument::Exact(
+            JavaType::source_class("java.lang.String"),
+        )];
+        let expression = JavaExpr::StaticField {
+            owner: JavaType::Class(owner),
+            name: JavaIdentifier::from_dex("INSTANCE"),
+        };
+
+        let expression = JavaPrinter::default()
+            .expression_at(&expression, 0)
+            .expect("static field access");
+
+        assert_eq!(expression, "example.Owner.INSTANCE");
     }
 
     #[test]

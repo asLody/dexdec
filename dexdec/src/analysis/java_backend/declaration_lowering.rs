@@ -14,7 +14,7 @@ use super::anonymous_lowering::{
     NestedTypeLiveness,
 };
 use super::constants::JavaConstantLowering;
-use super::constructor_syntax::ConstructorSyntaxRecovery;
+use super::constructor_syntax::{ConstructorMethodReturnTypes, ConstructorSyntaxRecovery};
 use super::enum_lowering::{EnumDeclarationRecovery, EnumSwitchRecovery};
 use super::function_object_types::FunctionObjectTypeCatalog;
 use super::java_model::method::{JavaMethodDeclarationKind as MethodModelKind, JavaMethodModel};
@@ -30,6 +30,28 @@ use super::JavaDecompilerError;
 pub(super) struct JavaCompilationUnitLowering;
 
 impl JavaCompilationUnitLowering {
+    fn constructor_factory_erased_return_is_safe(return_type: &JvmTypeSignature) -> bool {
+        match return_type {
+            JvmTypeSignature::ClassType(_) | JvmTypeSignature::BaseType(_) => true,
+            JvmTypeSignature::Array(component) => {
+                Self::constructor_factory_erased_return_is_safe(component)
+            }
+            JvmTypeSignature::TypeVariable(_) => false,
+        }
+    }
+
+    fn normalize_annotation_header(declaration: &mut JavaTypeDeclaration) {
+        if declaration.kind != JavaTypeDeclarationKind::Annotation {
+            return;
+        }
+        // JVM annotation interfaces carry java.lang.annotation.Annotation as
+        // an implemented interface and may retain generic Signature metadata,
+        // but neither relation is legal in a Java @interface declaration.
+        declaration.type_parameters.clear();
+        declaration.extends = None;
+        declaration.implements.clear();
+    }
+
     pub(super) fn lower(
         class: &JavaClassModel,
         source_abi: &std::sync::Arc<super::JavaSourceAbi>,
@@ -77,6 +99,39 @@ impl JavaCompilationUnitLowering {
                     .with_overloads(referenced_overloads),
             )
         });
+        let constructor_method_return_types = method_references
+            .iter()
+            .filter(|reference| {
+                reference.name != "<init>"
+                    && reference.descriptor.return_type != ArgType::VOID
+                    && generic_methods.get(*reference).is_none_or(|contract| {
+                        Self::constructor_factory_erased_return_is_safe(
+                            &contract.signature.return_type,
+                        )
+                    })
+            })
+            .try_fold(
+                ConstructorMethodReturnTypes::new(),
+                |mut types, reference| -> Result<_, JavaDecompilerError> {
+                    let key = (
+                        names.resolve_type(&reference.owner)?.into_raw(),
+                        members.method(reference),
+                        reference.descriptor.parameters.len(),
+                    );
+                    let return_type = names
+                        .resolve_type(&reference.descriptor.return_type)?
+                        .into_raw();
+                    types
+                        .entry(key)
+                        .and_modify(|existing| {
+                            if existing.as_ref() != Some(&return_type) {
+                                *existing = None;
+                            }
+                        })
+                        .or_insert(Some(return_type));
+                    Ok(types)
+                },
+            )?;
         let source_field_types = generic_fields
             .iter()
             .map(|(field, contract)| {
@@ -115,6 +170,7 @@ impl JavaCompilationUnitLowering {
                 source_field_types,
                 generic_fields,
                 generic_methods,
+                constructor_method_return_types,
                 source_object_types,
                 outer_instances,
                 observer,
@@ -200,6 +256,7 @@ impl JavaSingleMethodLowering {
             source_field_types,
             generic_fields,
             generic_methods,
+            ConstructorMethodReturnTypes::new(),
             std::collections::BTreeMap::new(),
             outer_instances,
             observer,
@@ -234,6 +291,7 @@ struct JavaTypeLowering<'a> {
             crate::ir::generic_types::GenericMethodContract,
         >,
     >,
+    constructor_method_return_types: ConstructorMethodReturnTypes,
     source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
     outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
     generic_type_projection: std::sync::Arc<dyn crate::language::java::GenericTypeProjection>,
@@ -473,6 +531,7 @@ impl<'a> JavaTypeLowering<'a> {
             crate::ir::MethodReference,
             crate::ir::generic_types::GenericMethodContract,
         >,
+        constructor_method_return_types: ConstructorMethodReturnTypes,
         source_object_types: std::collections::BTreeMap<ArgType, JavaType>,
         outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
         observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
@@ -486,6 +545,7 @@ impl<'a> JavaTypeLowering<'a> {
             source_field_types: std::sync::Arc::new(source_field_types),
             generic_fields: std::sync::Arc::new(generic_fields),
             generic_methods: std::sync::Arc::new(generic_methods),
+            constructor_method_return_types,
             source_object_types: std::sync::Arc::new(source_object_types),
             outer_instances,
             generic_type_projection: std::sync::Arc::new(SourceGenericTypeProjection {
@@ -713,6 +773,7 @@ impl<'a> JavaTypeLowering<'a> {
             methods: enum_declaration.methods,
             nested: Vec::new(),
         };
+        JavaCompilationUnitLowering::normalize_annotation_header(&mut declaration);
         Self::assign_nested_names(&declaration, &mut nested);
         let liveness = NestedTypeLiveness::from_nested(&nested);
         let nested =
@@ -727,7 +788,10 @@ impl<'a> JavaTypeLowering<'a> {
         );
         StaticInitializationRecovery::apply(&mut declaration);
         Self::remove_implicit_field_modifiers(class.declaration.kind, &mut declaration.fields);
-        ConstructorSyntaxRecovery::apply(&mut declaration);
+        ConstructorSyntaxRecovery::apply_with_method_returns(
+            &mut declaration,
+            &self.constructor_method_return_types,
+        );
         let initialization =
             super::field_initialization::FieldInitializationFacts::analyze(&declaration);
         initialization.apply(&mut declaration);
@@ -1444,6 +1508,60 @@ mod tests {
     use super::*;
     use crate::ir::generic_types::GenericSignatures;
     use crate::language::java::GenericTypeProjection;
+
+    #[test]
+    fn annotation_header_omits_jvm_generics_and_marker_interface() {
+        let mut declaration = JavaTypeDeclaration {
+            annotations: Vec::new(),
+            modifiers: vec![JavaModifier::Public],
+            kind: JavaTypeDeclarationKind::Annotation,
+            name: JavaIdentifier::from_dex("RunInScope"),
+            type_parameters: vec![crate::language::java::JavaTypeParameter {
+                name: JavaIdentifier::from_dex("T"),
+                bounds: vec![JavaType::source_class("example.Scope")],
+            }],
+            extends: Some(JavaType::source_class("java.lang.Object")),
+            implements: vec![JavaType::source_class("java.lang.annotation.Annotation")],
+            enum_constants: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            nested: Vec::new(),
+        };
+
+        JavaCompilationUnitLowering::normalize_annotation_header(&mut declaration);
+
+        assert!(declaration.type_parameters.is_empty());
+        assert!(declaration.extends.is_none());
+        assert!(declaration.implements.is_empty());
+    }
+
+    #[test]
+    fn constructor_factory_accepts_safe_generic_return_erasure() {
+        let collection = GenericSignatures::method(
+            "<T:Ljava/lang/Object;>(Ljava/lang/Iterable<+TT;>;)Ljava/util/Set<TT;>;",
+        )
+        .expect("generic collection method");
+        let identity = GenericSignatures::method("<T:Ljava/lang/Object;>(TT;)TT;")
+            .expect("generic identity method");
+        let array = GenericSignatures::method("<T:Ljava/lang/Object;>(TT;)[TT;")
+            .expect("generic array method");
+
+        assert!(
+            JavaCompilationUnitLowering::constructor_factory_erased_return_is_safe(
+                &collection.return_type,
+            )
+        );
+        assert!(
+            !JavaCompilationUnitLowering::constructor_factory_erased_return_is_safe(
+                &identity.return_type,
+            )
+        );
+        assert!(
+            !JavaCompilationUnitLowering::constructor_factory_erased_return_is_safe(
+                &array.return_type,
+            )
+        );
+    }
 
     #[test]
     fn source_projection_infers_platform_subtype_with_relative_nested_argument() {

@@ -607,7 +607,26 @@ impl Pass for RecoverConstructors<'_> {
         let mut replacements = BTreeMap::<SsaVar, SsaVar>::new();
         let mut removals = facts.discarded_allocations().clone();
         let mut constructors = BTreeMap::new();
-        let mut exceptional_merges = Vec::new();
+        let mut exceptional_merges = facts
+            .discarded_allocations()
+            .iter()
+            .map(|allocation| {
+                let successors = cfg.successors_with_kind(allocation.block);
+                ExceptionalAllocationMerge {
+                    allocation: allocation.block,
+                    handlers: successors
+                        .iter()
+                        .filter_map(|(target, kind)| {
+                            (*kind == EdgeKind::Exception
+                                && !successors.iter().any(|(normal_target, normal_kind)| {
+                                    normal_target == target && *normal_kind != EdgeKind::Exception
+                                }))
+                            .then_some(*target)
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
         let mut versions = SyntheticVersions::new(&values);
         let mut object_plans = Vec::new();
         for initialization in facts.entries() {
@@ -799,5 +818,122 @@ impl InstructionTransform for ObjectArgumentRewriter<'_> {
             self.replacement.apply_to(&mut register);
         }
         InsnArg::Reg(register)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::analysis::ClassHierarchyIndex;
+    use crate::ir::Block;
+
+    #[test]
+    fn discarded_allocation_removes_exception_edge_and_phi_input() {
+        let entry_id = BlockId::new(3);
+        let allocation_id = BlockId::new(0);
+        let normal_id = BlockId::new(1);
+        let handler_id = BlockId::new(2);
+
+        let mut entry = Block::new(entry_id);
+        entry.push(InsnNode::const_val(
+            RegisterArg::new_ssa(1, 0, ArgType::INT),
+            0,
+            ArgType::INT,
+        ));
+
+        let builder_type = ArgType::object("java/lang/StringBuilder");
+        let mut allocation =
+            InsnNode::new_instance(RegisterArg::new_ssa(0, 0, builder_type.clone()), 0);
+        allocation.payload.class_type = Some(builder_type);
+        let mut allocation_block = Block::new(allocation_id);
+        allocation_block.push(allocation);
+
+        let mut normal = Block::new(normal_id);
+        normal.push(InsnNode::return_void());
+
+        let mut phi = InsnNode::phi(
+            RegisterArg::new_ssa(1, 1, ArgType::INT),
+            vec![(allocation_id.raw(), InsnArg::reg_ssa(1, 0, ArgType::INT))],
+        );
+        phi.payload.phi_edges[0].1 = EdgeKind::Exception;
+        let mut handler = Block::new(handler_id);
+        handler.push(phi);
+        handler.push(InsnNode::return_void());
+
+        let mut cfg = CFG::new("discarded_allocation");
+        cfg.entry = entry_id;
+        cfg.add_block(entry);
+        cfg.add_block(allocation_block);
+        cfg.add_block(normal);
+        cfg.add_block(handler);
+        cfg.add_edge(entry_id, allocation_id, EdgeKind::Normal);
+        cfg.add_edge(allocation_id, normal_id, EdgeKind::Normal);
+        cfg.add_edge(allocation_id, handler_id, EdgeKind::Exception);
+
+        let result = RecoverConstructors::new(&ClassHierarchyIndex::default())
+            .run(&mut cfg)
+            .expect("constructor recovery");
+
+        assert_eq!(result, PassResult::Changed);
+        assert!(cfg.has_edge(allocation_id, normal_id));
+        assert!(!cfg.has_edge(allocation_id, handler_id));
+        assert!(cfg.block(allocation_id).unwrap().insns.is_empty());
+        let phi = &cfg.block(handler_id).unwrap().insns[0];
+        assert!(phi.args.is_empty());
+        assert!(phi.payload.phi_edges.is_empty());
+    }
+
+    #[test]
+    fn discarded_allocation_preserves_shared_normal_and_exception_target() {
+        let entry_id = BlockId::new(2);
+        let allocation_id = BlockId::new(0);
+        let continuation_id = BlockId::new(1);
+
+        let mut entry = Block::new(entry_id);
+        entry.push(InsnNode::const_val(
+            RegisterArg::new_ssa(1, 0, ArgType::INT),
+            0,
+            ArgType::INT,
+        ));
+
+        let builder_type = ArgType::object("java/lang/StringBuilder");
+        let mut allocation =
+            InsnNode::new_instance(RegisterArg::new_ssa(0, 0, builder_type.clone()), 0);
+        allocation.payload.class_type = Some(builder_type);
+        let mut allocation_block = Block::new(allocation_id);
+        allocation_block.push(allocation);
+
+        let mut phi = InsnNode::phi(
+            RegisterArg::new_ssa(1, 1, ArgType::INT),
+            vec![
+                (allocation_id.raw(), InsnArg::reg_ssa(1, 0, ArgType::INT)),
+                (allocation_id.raw(), InsnArg::reg_ssa(1, 0, ArgType::INT)),
+            ],
+        );
+        phi.payload.phi_edges[1].1 = EdgeKind::Exception;
+        let mut continuation = Block::new(continuation_id);
+        continuation.push(phi);
+        continuation.push(InsnNode::return_void());
+
+        let mut cfg = CFG::new("shared_normal_exception_target");
+        cfg.entry = entry_id;
+        cfg.add_block(entry);
+        cfg.add_block(allocation_block);
+        cfg.add_block(continuation);
+        cfg.add_edge(entry_id, allocation_id, EdgeKind::Normal);
+        cfg.add_edge(allocation_id, continuation_id, EdgeKind::Normal);
+        cfg.add_edge(allocation_id, continuation_id, EdgeKind::Exception);
+
+        let result = RecoverConstructors::new(&ClassHierarchyIndex::default())
+            .run(&mut cfg)
+            .expect("constructor recovery");
+
+        assert_eq!(result, PassResult::Changed);
+        assert!(cfg.has_edge(allocation_id, continuation_id));
+        assert_eq!(cfg.successors_with_kind(allocation_id).len(), 2);
+        assert!(cfg.block(allocation_id).unwrap().insns.is_empty());
+        let phi = &cfg.block(continuation_id).unwrap().insns[0];
+        assert_eq!(phi.args.len(), 2);
+        assert_eq!(phi.payload.phi_edges.len(), 2);
     }
 }

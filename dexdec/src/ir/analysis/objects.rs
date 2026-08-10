@@ -298,7 +298,9 @@ impl ObjectInitializations {
         class: SsaVar,
         allocation: InsnPosition,
     ) -> bool {
-        if !Self::has_stable_exception_scope(cfg, allocation.block) {
+        if !Self::has_stable_exception_scope(cfg, allocation.block)
+            && !Self::is_orphan_string_builder(cfg, allocation)
+        {
             return false;
         }
         aliases.group(class).is_some_and(|members| {
@@ -315,6 +317,19 @@ impl ObjectInitializations {
                 })
             })
         })
+    }
+
+    /// DEX producers can leave a dead `new-instance StringBuilder` behind
+    /// after replacing an append chain with `String.concat`. The allocation is
+    /// never initialized or observed, which DEX permits but Java source cannot
+    /// express. Limit the exceptional-scope relaxation to this known inert
+    /// optimizer residue; arbitrary uninitialized allocations remain errors.
+    fn is_orphan_string_builder(cfg: &CFG, allocation: InsnPosition) -> bool {
+        cfg.block(allocation.block)
+            .and_then(|block| block.insns.get(allocation.index))
+            .and_then(|instruction| instruction.payload.class_type.as_ref())
+            .and_then(crate::ir::ArgType::as_object)
+            == Some("java/lang/StringBuilder")
     }
 
     /// Kotlin has no expression for allocating an uninitialized instance and
@@ -540,3 +555,71 @@ impl std::fmt::Display for ObjectInitializationError {
 }
 
 impl std::error::Error for ObjectInitializationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{analysis::ClassHierarchyIndex, Block, BlockId, InsnNode, RegisterArg};
+
+    fn orphan_allocation(ty: &str) -> CFG {
+        let allocation = BlockId::new(0);
+        let normal = BlockId::new(1);
+        let handler = BlockId::new(2);
+        let object_type = crate::ir::ArgType::object(ty);
+        let mut instruction =
+            InsnNode::new_instance(RegisterArg::with_ssa(0, object_type.clone(), 0), 0);
+        instruction.payload.class_type = Some(object_type);
+
+        let mut entry = Block::new(allocation);
+        entry.push(instruction);
+        let mut normal_exit = Block::new(normal);
+        normal_exit.push(InsnNode::return_void());
+        let mut exceptional_exit = Block::new(handler);
+        exceptional_exit.push(InsnNode::move_exception(RegisterArg::with_ssa(
+            1,
+            crate::ir::ArgType::object("java/lang/Throwable"),
+            0,
+        )));
+        exceptional_exit.push(InsnNode::return_void());
+
+        let mut cfg = CFG::new("orphan_allocation");
+        cfg.add_block(entry);
+        cfg.add_block(normal_exit);
+        cfg.add_block(exceptional_exit);
+        cfg.add_edge(allocation, normal, EdgeKind::Normal);
+        cfg.add_edge(allocation, handler, EdgeKind::Exception);
+        cfg
+    }
+
+    #[test]
+    fn discards_unobserved_string_builder_across_exception_scope() {
+        let cfg = orphan_allocation("java/lang/StringBuilder");
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let facts = ObjectInitializations::analyze(&cfg, &values, &ClassHierarchyIndex::default())
+            .expect("orphan StringBuilder should be recoverable");
+
+        assert_eq!(
+            facts.discarded_allocations(),
+            &BTreeSet::from([InsnPosition {
+                block: BlockId::new(0),
+                index: 0,
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_other_uninitialized_allocations_across_exception_scope() {
+        let cfg = orphan_allocation("example/HasSideEffects");
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let error = ObjectInitializations::analyze(&cfg, &values, &ClassHierarchyIndex::default())
+            .expect_err("arbitrary allocation must remain strict");
+
+        assert!(matches!(
+            error,
+            ObjectInitializationError::MissingConstructor(InsnPosition {
+                block: BlockId(0),
+                index: 0
+            })
+        ));
+    }
+}

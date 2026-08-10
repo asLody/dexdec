@@ -238,13 +238,12 @@ impl DexReader {
             }
         }
 
-        let mut result = result as i32;
-        if (byte & 0b0100_0000) == 0b0100_0000 {
+        if shift < u32::BITS && (byte & 0b0100_0000) == 0b0100_0000 {
             /* sign extend */
-            result |= -(1 << shift);
+            result |= u32::MAX << shift;
         }
 
-        Ok((result, bytes_read))
+        Ok((result as i32, bytes_read))
     }
 
     /// Read a signed LEB128p1 value from the reader
@@ -442,6 +441,9 @@ mod tests {
             0x7f, // -1
             0x80, 0x7f, // -128
             0x3c, // 0x3c
+            0xff, 0xff, 0xff, 0xff, 0x07, // i32::MAX
+            0x80, 0x80, 0x80, 0x80, 0x78, // i32::MIN
+            0xff, 0xff, 0xff, 0xff, 0x7f, // -1 in five bytes
         ];
 
         let mut reader = DexReader::build(dex_data.to_vec()).unwrap();
@@ -461,6 +463,15 @@ mod tests {
 
         let result = reader.read_sleb128().unwrap();
         assert_eq!(result, (0x3c, 1));
+
+        let result = reader.read_sleb128().unwrap();
+        assert_eq!(result, (i32::MAX, 5));
+
+        let result = reader.read_sleb128().unwrap();
+        assert_eq!(result, (i32::MIN, 5));
+
+        let result = reader.read_sleb128().unwrap();
+        assert_eq!(result, (-1, 5));
     }
 
     #[test]
