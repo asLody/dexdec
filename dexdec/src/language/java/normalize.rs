@@ -253,6 +253,14 @@ impl JavaAstNormalizer {
         catches: Vec<JavaCatch>,
         finally: Option<Box<JavaStmt>>,
     ) -> (JavaStmt, bool) {
+        let empty_finally = finally.as_deref().is_some_and(|finally| match finally {
+            JavaStmt::Empty => true,
+            JavaStmt::Block(statements) => statements.is_empty(),
+            _ => false,
+        });
+        if catches.is_empty() && empty_finally {
+            return (body, true);
+        }
         let empty_body = match &body {
             JavaStmt::Empty => true,
             JavaStmt::Block(statements) => statements.is_empty(),
@@ -1185,6 +1193,21 @@ impl JavaAstRewriter for NameUseCounter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removes_try_with_only_an_empty_finally() {
+        let statement = JavaStmt::Expression(JavaExpr::Name(JavaIdentifier::from_dex("work")));
+        let mut body = JavaMethodBody {
+            root: JavaStmt::Try {
+                body: Box::new(statement.clone()),
+                catches: Vec::new(),
+                finally: Some(Box::new(JavaStmt::Block(Vec::new()))),
+            },
+        };
+
+        assert!(JavaAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, statement);
+    }
 
     #[test]
     fn source_completion_appends_default_return_after_semantic_no_return_call() {

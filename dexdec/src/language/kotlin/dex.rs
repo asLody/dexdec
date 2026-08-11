@@ -4793,14 +4793,18 @@ impl DexKotlinDialect {
         &'a self,
         insn: &'a SemanticOperation,
     ) -> Result<&'a ArgType, KotlinLoweringError> {
-        let result = insn
-            .result
-            .as_ref()
-            .ok_or(KotlinLoweringError::MissingPayload {
-                instruction: insn.insn_type,
-                field: "result",
-            })?;
-        let array_type = self.types.ssa_type(result)?;
+        let array_type = match &insn.result {
+            Some(result) => self.types.ssa_type(result)?,
+            None => {
+                insn.payload
+                    .class_type
+                    .as_ref()
+                    .ok_or(KotlinLoweringError::MissingPayload {
+                        instruction: insn.insn_type,
+                        field: "result or class_type",
+                    })?
+            }
+        };
         array_type
             .as_array_element()
             .ok_or_else(|| KotlinLoweringError::InvalidArrayType {
@@ -5541,6 +5545,9 @@ impl KotlinDialect for DexKotlinDialect {
                         self.insn_expr(insn, None, None)?,
                     )
                 }
+            }
+            InsnType::FilledNewArray => {
+                KotlinStmt::Expression(self.insn_expr(insn, None, None)?)
             }
             InsnType::Iput => {
                 let field = Self::field(insn.payload.reference.as_ref())?;

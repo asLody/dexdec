@@ -1034,9 +1034,8 @@ impl InsnNode {
     }
 
     /// Create a FILLED_NEW_ARRAY instruction
-    pub fn filled_new_array(dest: RegisterArg, type_idx: u32, elements: Vec<InsnArg>) -> Self {
+    pub fn filled_new_array(type_idx: u32, elements: Vec<InsnArg>) -> Self {
         let mut insn = Self::new(InsnType::FilledNewArray, elements.len());
-        insn.set_result(dest);
         for elem in elements {
             insn.add_arg(elem);
         }

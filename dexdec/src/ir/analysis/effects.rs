@@ -1,6 +1,8 @@
 //! Source-observable instruction effects shared by dataflow analyses.
 
-use crate::ir::{ArgType, InsnArg, InsnNode, InsnType, MemberReference, MethodReference};
+use crate::ir::{
+    ArgType, InsnArg, InsnNode, InsnType, InvokeType, MemberReference, MethodReference,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThrowEffect {
@@ -243,6 +245,23 @@ impl InstructionEffects {
                 | InsnType::MoveException
                 | InsnType::Phi
         )
+    }
+
+    /// Kotlin emits these no-op calls to delimit inlined `finally` bodies.
+    /// They carry compiler structure but no source-level execution semantics.
+    pub fn is_kotlin_finally_marker(instruction: &InsnNode) -> bool {
+        if instruction.insn_type != InsnType::Invoke
+            || instruction.payload.invoke_type != Some(InvokeType::Static)
+        {
+            return false;
+        }
+        let Some(MemberReference::Method(method)) = instruction.payload.reference.as_ref() else {
+            return false;
+        };
+        method.owner == ArgType::object("kotlin/jvm/internal/InlineMarker")
+            && matches!(method.name.as_str(), "finallyStart" | "finallyEnd")
+            && method.descriptor.parameters == [ArgType::INT]
+            && method.descriptor.return_type == ArgType::VOID
     }
 
     pub fn can_relocate(self) -> bool {

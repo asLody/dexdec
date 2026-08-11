@@ -6,8 +6,14 @@ use crate::ir::analysis::{
     DominatorTree, InstructionEffects, SsaOrigins, SsaValueGraph, SsaVar, StrongComponents,
 };
 use crate::ir::{
-    BlockId, CatchHandler, InsnArg, InsnNode, InsnType, StatementOrigin, TryRegion, CFG,
+    ArgType, BlockId, CatchHandler, InsnArg, InsnNode, InsnType, StatementOrigin, TryRegion, CFG,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum MonitorIdentity {
+    Ssa(SsaVar),
+    Class(ArgType),
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct SynchronizationFact {
@@ -23,10 +29,12 @@ pub(super) struct SynchronizationAnalysis<'a> {
     cfg: &'a CFG,
     dominators: &'a DominatorTree,
     identities: BTreeMap<SsaVar, SsaVar>,
+    constant_classes: BTreeMap<SsaVar, (ArgType, StatementOrigin)>,
     origins: SsaOrigins,
     ordinary: BTreeSet<BlockId>,
     handler_entries: BTreeSet<BlockId>,
-    proven_release_handlers: BTreeMap<SsaVar, BTreeMap<BlockId, BTreeSet<StatementOrigin>>>,
+    proven_release_handlers:
+        BTreeMap<MonitorIdentity, BTreeMap<BlockId, BTreeSet<StatementOrigin>>>,
 }
 
 impl<'a> SynchronizationAnalysis<'a> {
@@ -44,10 +52,35 @@ impl<'a> SynchronizationAnalysis<'a> {
                 members.into_iter().map(move |member| (member, identity))
             })
             .collect();
+        let constant_classes = values
+            .values()
+            .filter_map(|value| {
+                let position = value.definition?;
+                let instruction = cfg
+                    .block(position.block)
+                    .and_then(|block| block.insns.get(position.index))?;
+                (instruction.insn_type == InsnType::ConstClass)
+                    .then(|| instruction.payload.class_type.clone())
+                    .flatten()
+                    .map(|class| {
+                        (
+                            value.variable,
+                            (
+                                class,
+                                StatementOrigin {
+                                    block: position.block,
+                                    instruction: instruction.id,
+                                },
+                            ),
+                        )
+                    })
+            })
+            .collect();
         let mut analysis = Self {
             cfg,
             dominators,
             identities,
+            constant_classes,
             origins: SsaOrigins::analyze(values),
             ordinary: Self::reachable(cfg, cfg.entry),
             handler_entries: regions
@@ -87,7 +120,7 @@ impl<'a> SynchronizationAnalysis<'a> {
             .cfg
             .block_ids()
             .into_iter()
-            .filter_map(|block| self.monitor_entry(block, release.lock))
+            .filter_map(|block| self.monitor_entry(block, &release.lock))
             .filter_map(|candidate| candidate.prove_scope(self, &release))
             .filter(|candidate| candidate.is_protected_by(self.cfg, region))
             .collect::<Vec<_>>();
@@ -117,7 +150,7 @@ impl<'a> SynchronizationAnalysis<'a> {
         if facts.iter().any(|fact| {
             fact.enter_origin != first.enter_origin
                 || fact.body_entry != first.body_entry
-                || self.identity(&fact.lock) != Some(identity)
+                || self.identity(&fact.lock) != Some(identity.clone())
         }) {
             return None;
         }
@@ -129,6 +162,7 @@ impl<'a> SynchronizationAnalysis<'a> {
             self.cfg,
             &self.identities,
             &self.origins,
+            &self.constant_classes,
             identity,
             &candidate_entries,
         )
@@ -192,6 +226,7 @@ impl<'a> SynchronizationAnalysis<'a> {
                     self.cfg,
                     &self.identities,
                     &self.origins,
+                    &self.constant_classes,
                     identity,
                     &candidate_entries,
                 )
@@ -250,7 +285,7 @@ impl<'a> SynchronizationAnalysis<'a> {
             .collect::<Option<Vec<_>>>()?;
         let locks = handlers
             .iter()
-            .map(|(proof, _)| proof.lock)
+            .map(|(proof, _)| proof.lock.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -265,7 +300,7 @@ impl<'a> SynchronizationAnalysis<'a> {
                 .extend(proof.releases);
         }
         Some(MonitorReleaseProof {
-            lock: *lock,
+            lock: lock.clone(),
             handler_releases,
         })
     }
@@ -318,12 +353,19 @@ impl<'a> SynchronizationAnalysis<'a> {
                             .first()
                             .and_then(InsnArg::as_register)
                             .and_then(SsaVar::from_reg)
-                            .map(|value| self.canonical(origins.resolve(value)))
+                            .map(|value| self.lock_identity(origins.resolve(value)))
                             .ok_or(ReleaseProofError::MissingLock(block))?;
-                        if lock.is_some_and(|lock| lock != value) {
+                        if lock.as_ref().is_some_and(|lock| lock != &value) {
                             return Err(ReleaseProofError::ConflictingLocks(block));
                         }
                         lock = Some(value);
+                        if let Some(origin) = instruction
+                            .args
+                            .first()
+                            .and_then(|argument| self.release_materialization(block, argument))
+                        {
+                            releases.insert(origin);
+                        }
                         releases.insert(StatementOrigin {
                             block,
                             instruction: instruction.id,
@@ -338,14 +380,20 @@ impl<'a> SynchronizationAnalysis<'a> {
                             .and_then(SsaVar::from_reg);
                         if !released
                             || !thrown.is_some_and(|value| {
-                                self.canonical(origins.resolve(value))
-                                    == self.canonical(origins.resolve(exception))
+                                self.canonical_var(origins.resolve(value))
+                                    == self.canonical_var(origins.resolve(exception))
                             })
                         {
                             return Err(ReleaseProofError::InvalidRethrow(block));
                         }
                         terminal = true;
                         reached_throw = true;
+                    }
+                    _ if InstructionEffects::is_kotlin_finally_marker(instruction) => {
+                        releases.insert(StatementOrigin {
+                            block,
+                            instruction: instruction.id,
+                        });
                     }
                     _ if InstructionEffects::is_ssa_bookkeeping(instruction) => {}
                     _ => {
@@ -382,9 +430,34 @@ impl<'a> SynchronizationAnalysis<'a> {
         Ok(HandlerReleaseProof { lock, releases })
     }
 
-    fn canonical(&self, value: SsaVar) -> SsaVar {
+    fn canonical_var(&self, value: SsaVar) -> SsaVar {
         let value = self.origins.unique(value).unwrap_or(value);
         self.identities.get(&value).copied().unwrap_or(value)
+    }
+
+    fn lock_identity(&self, value: SsaVar) -> MonitorIdentity {
+        let origin = self.origins.unique(value).unwrap_or(value);
+        self.constant_classes
+            .get(&origin)
+            .map(|(class, _)| class.clone())
+            .map(MonitorIdentity::Class)
+            .unwrap_or_else(|| {
+                MonitorIdentity::Ssa(self.identities.get(&origin).copied().unwrap_or(origin))
+            })
+    }
+
+    fn release_materialization(
+        &self,
+        block: BlockId,
+        argument: &InsnArg,
+    ) -> Option<StatementOrigin> {
+        let value = argument.as_register().and_then(SsaVar::from_reg)?;
+        let origin = self.origins.unique(value).unwrap_or(value);
+        self.constant_classes
+            .get(&origin)
+            .map(|(_, origin)| origin)
+            .filter(|origin| origin.block == block)
+            .cloned()
     }
 
     fn cleanup_domain(&self, entry: BlockId) -> BTreeSet<BlockId> {
@@ -422,7 +495,11 @@ impl<'a> SynchronizationAnalysis<'a> {
         reachable
     }
 
-    fn monitor_entry(&self, block: BlockId, cleanup_lock: SsaVar) -> Option<MonitorCandidate> {
+    fn monitor_entry(
+        &self,
+        block: BlockId,
+        cleanup_lock: &MonitorIdentity,
+    ) -> Option<MonitorCandidate> {
         let node = self.cfg.block(block)?;
         let enters = node
             .insns
@@ -434,7 +511,7 @@ impl<'a> SynchronizationAnalysis<'a> {
             return None;
         };
         let lock = enter.args.first()?.clone();
-        (self.identity(&lock)? == cleanup_lock).then_some(())?;
+        (self.identity(&lock)?.eq(cleanup_lock)).then_some(())?;
         let successors = self.cfg.normal_successors(block).collect::<Vec<_>>();
         let [body_entry] = successors.as_slice() else {
             return None;
@@ -455,9 +532,9 @@ impl<'a> SynchronizationAnalysis<'a> {
         })
     }
 
-    fn identity(&self, argument: &InsnArg) -> Option<SsaVar> {
+    fn identity(&self, argument: &InsnArg) -> Option<MonitorIdentity> {
         let value = argument.as_register().and_then(SsaVar::from_reg)?;
-        self.identities.get(&value).copied()
+        Some(self.lock_identity(value))
     }
 }
 
@@ -476,7 +553,8 @@ impl MonitorCandidate {
             analysis.cfg,
             &analysis.identities,
             &analysis.origins,
-            release.lock,
+            &analysis.constant_classes,
+            release.lock.clone(),
             &release.entries(),
         )
         .analyze(self.fact.body_entry)
@@ -518,7 +596,7 @@ impl MonitorCandidate {
 }
 
 struct MonitorReleaseProof {
-    lock: SsaVar,
+    lock: MonitorIdentity,
     handler_releases: BTreeMap<BlockId, BTreeSet<StatementOrigin>>,
 }
 
@@ -543,7 +621,7 @@ impl MonitorReleaseProof {
 
 #[derive(Debug)]
 struct HandlerReleaseProof {
-    lock: SsaVar,
+    lock: MonitorIdentity,
     releases: BTreeSet<StatementOrigin>,
 }
 
@@ -625,7 +703,8 @@ struct MonitorScopeFlow<'a> {
     cfg: &'a CFG,
     identities: &'a BTreeMap<SsaVar, SsaVar>,
     origins: &'a SsaOrigins,
-    lock: SsaVar,
+    constant_classes: &'a BTreeMap<SsaVar, (ArgType, StatementOrigin)>,
+    lock: MonitorIdentity,
     release_entries: &'a BTreeSet<BlockId>,
 }
 
@@ -634,13 +713,15 @@ impl<'a> MonitorScopeFlow<'a> {
         cfg: &'a CFG,
         identities: &'a BTreeMap<SsaVar, SsaVar>,
         origins: &'a SsaOrigins,
-        lock: SsaVar,
+        constant_classes: &'a BTreeMap<SsaVar, (ArgType, StatementOrigin)>,
+        lock: MonitorIdentity,
         release_entries: &'a BTreeSet<BlockId>,
     ) -> Self {
         Self {
             cfg,
             identities,
             origins,
+            constant_classes,
             lock,
             release_entries,
         }
@@ -735,10 +816,17 @@ impl<'a> MonitorScopeFlow<'a> {
                         .first()
                         .ok_or(MonitorScopeError::MalformedMonitor(block))?,
                 );
+            let release_marker = InstructionEffects::is_kotlin_finally_marker(instruction);
+            if depth == 0 && !release_marker {
+                break;
+            }
             // Once lock identity and all-path balance are proven, an
             // IllegalMonitorStateException edge from the compiler-generated
             // release is infeasible in source-level synchronized semantics.
-            if instruction.can_throw() && !scope_release {
+            // Kotlin's finally markers are compiler metadata implemented as
+            // no-op calls, so their synthetic exceptional edges do not leave
+            // a source-level monitor scope either.
+            if instruction.can_throw() && !scope_release && !release_marker {
                 let exceptional_depth = depth;
                 match exceptional {
                     Some(existing) if existing != exceptional_depth => {
@@ -766,6 +854,13 @@ impl<'a> MonitorScopeFlow<'a> {
                         .checked_sub(1)
                         .ok_or(MonitorScopeError::DepthUnderflow(block))?;
                     if before == 1 {
+                        if let Some(origin) = instruction
+                            .args
+                            .first()
+                            .and_then(|argument| self.release_materialization(block, argument))
+                        {
+                            releases.insert(origin);
+                        }
                         releases.insert(StatementOrigin {
                             block,
                             instruction: instruction.id,
@@ -774,8 +869,11 @@ impl<'a> MonitorScopeFlow<'a> {
                 }
                 _ => {}
             }
-            if depth == 0 {
-                break;
+            if release_marker {
+                releases.insert(StatementOrigin {
+                    block,
+                    instruction: instruction.id,
+                });
             }
         }
         Ok(MonitorDepthTransfer {
@@ -790,8 +888,32 @@ impl<'a> MonitorScopeFlow<'a> {
             .as_register()
             .and_then(SsaVar::from_reg)
             .map(|value| self.origins.unique(value).unwrap_or(value))
-            .map(|value| self.identities.get(&value).copied().unwrap_or(value))
+            .map(|origin| {
+                self.constant_classes
+                    .get(&origin)
+                    .map(|(class, _)| class.clone())
+                    .map(MonitorIdentity::Class)
+                    .unwrap_or_else(|| {
+                        MonitorIdentity::Ssa(
+                            self.identities.get(&origin).copied().unwrap_or(origin),
+                        )
+                    })
+            })
             .is_some_and(|identity| identity == self.lock)
+    }
+
+    fn release_materialization(
+        &self,
+        block: BlockId,
+        argument: &InsnArg,
+    ) -> Option<StatementOrigin> {
+        let value = argument.as_register().and_then(SsaVar::from_reg)?;
+        let origin = self.origins.unique(value).unwrap_or(value);
+        self.constant_classes
+            .get(&origin)
+            .map(|(_, origin)| origin)
+            .filter(|origin| origin.block == block)
+            .cloned()
     }
 }
 
@@ -815,4 +937,72 @@ struct MonitorDepthTransfer {
     normal: Option<u32>,
     exceptional: Option<u32>,
     releases: BTreeSet<StatementOrigin>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::analysis::{DominatorTree, SsaValueGraph};
+    use crate::ir::{Block, InvokeType, MemberReference, MethodReference, RegisterArg};
+
+    fn invocation(reference: &str) -> InsnNode {
+        let mut instruction = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        instruction.payload.reference = Some(MemberReference::Method(
+            reference.parse::<MethodReference>().unwrap(),
+        ));
+        instruction
+    }
+
+    #[test]
+    fn recognizes_only_kotlin_finally_markers() {
+        assert!(InstructionEffects::is_kotlin_finally_marker(&invocation(
+            "Lkotlin/jvm/internal/InlineMarker;->finallyStart(I)V"
+        )));
+        assert!(InstructionEffects::is_kotlin_finally_marker(&invocation(
+            "Lkotlin/jvm/internal/InlineMarker;->finallyEnd(I)V"
+        )));
+        assert!(!InstructionEffects::is_kotlin_finally_marker(&invocation(
+            "Lkotlin/jvm/internal/Intrinsics;->reifiedOperationMarker(ILjava/lang/String;)V"
+        )));
+        assert!(!InstructionEffects::is_kotlin_finally_marker(&invocation(
+            "Lkotlin/jvm/internal/InlineMarker;->finallyStart(J)V"
+        )));
+    }
+
+    fn constant_class(
+        register: u32,
+        version: u32,
+        type_index: u32,
+        class: &str,
+    ) -> (InsnNode, InsnArg) {
+        let result = RegisterArg::with_ssa(register, ArgType::class(), version);
+        let argument = InsnArg::Reg(result.clone());
+        let mut instruction = InsnNode::const_class(result, type_index);
+        instruction.payload.class_type = Some(ArgType::object(class));
+        (instruction, argument)
+    }
+
+    #[test]
+    fn repeated_const_class_values_have_the_same_monitor_identity() {
+        let (first, first_value) = constant_class(0, 0, 1, "example/Owner");
+        let (second, second_value) = constant_class(1, 0, 1, "example/Owner");
+        let (other, other_value) = constant_class(2, 0, 2, "example/Other");
+        let mut block = Block::new(0);
+        block.insns = vec![first, second, other];
+        let mut cfg = CFG::new("constant_class_monitor_identity");
+        cfg.add_block(block);
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).unwrap();
+        let dominators = DominatorTree::compute(&cfg).unwrap();
+        let analysis = SynchronizationAnalysis::new(&cfg, &values, &dominators, &[]);
+
+        assert_eq!(
+            analysis.identity(&first_value),
+            analysis.identity(&second_value)
+        );
+        assert_ne!(
+            analysis.identity(&first_value),
+            analysis.identity(&other_value)
+        );
+    }
 }

@@ -3905,14 +3905,17 @@ impl DexJavaDialect {
         &'a self,
         insn: &'a SemanticOperation,
     ) -> Result<&'a ArgType, JavaLoweringError> {
-        let result = insn
-            .result
-            .as_ref()
-            .ok_or(JavaLoweringError::MissingPayload {
-                instruction: insn.insn_type,
-                field: "result",
-            })?;
-        let array_type = self.types.ssa_type(result)?;
+        let array_type = match &insn.result {
+            Some(result) => self.types.ssa_type(result)?,
+            None => insn
+                .payload
+                .class_type
+                .as_ref()
+                .ok_or(JavaLoweringError::MissingPayload {
+                    instruction: insn.insn_type,
+                    field: "result or class_type",
+                })?,
+        };
         array_type
             .as_array_element()
             .ok_or_else(|| JavaLoweringError::InvalidArrayType {
@@ -4631,6 +4634,19 @@ impl JavaDialect for DexJavaDialect {
                     JavaStmt::Expression(
                         self.insn_expr(insn, None, None)?,
                     )
+                }
+            }
+            InsnType::FilledNewArray => {
+                let ty = self.source_type(insn.payload.class_type.as_ref().ok_or(
+                    JavaLoweringError::MissingPayload {
+                        instruction: insn.insn_type,
+                        field: "class_type",
+                    },
+                )?)?;
+                JavaStmt::Variable {
+                    ty,
+                    name: self.synthetic_variable("unusedArray"),
+                    value: Some(self.insn_expr(insn, None, None)?),
                 }
             }
             InsnType::Iput => {

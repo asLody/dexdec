@@ -1079,10 +1079,9 @@ impl<'a> MethodDecoder<'a> {
             regs
         };
 
-        // filled-new-array returns the result in move-result, so no dest here
-        // We create a placeholder destination that will be filled by move-result
-        let dest = RegisterArg::new(0, ArgType::unknown_object());
-        Some(InsnNode::filled_new_array(dest, type_idx, args))
+        // The array is only assigned a register when a following move-result-object
+        // consumes it. BindResults attaches that destination later.
+        Some(InsnNode::filled_new_array(type_idx, args))
     }
 }
 
@@ -1386,5 +1385,31 @@ mod tests {
         assert_eq!(result.insns.len(), 2);
         assert!(matches!(result.insns[0].insn_type, InsnType::Const));
         assert!(matches!(result.insns[1].insn_type, InsnType::Return));
+    }
+
+    #[test]
+    fn unconsumed_filled_new_array_has_no_placeholder_result() {
+        let code = MethodCode {
+            registers_size: 2,
+            ins_size: 0,
+            outs_size: 0,
+            insns: vec![
+                0x1024, // filled-new-array {v1}, type@0
+                0x0000, 0x0001, 0x1012, // const/4 v0, 1
+                0x000e, // return-void
+            ],
+            tries: vec![],
+            debug_info: None,
+        };
+
+        let result = MethodDecoder::from_code(&code).decode();
+
+        assert_eq!(result.insns.len(), 3);
+        assert_eq!(result.insns[0].insn_type, InsnType::FilledNewArray);
+        assert!(result.insns[0].result.is_none());
+        assert_eq!(
+            result.insns[1].result.as_ref().map(|result| result.reg_num),
+            Some(0)
+        );
     }
 }

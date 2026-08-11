@@ -1661,6 +1661,14 @@ impl KotlinAstNormalizer {
         catches: Vec<KotlinCatch>,
         finally: Option<Box<KotlinStmt>>,
     ) -> (KotlinStmt, bool) {
+        let empty_finally = finally.as_deref().is_some_and(|finally| match finally {
+            KotlinStmt::Empty => true,
+            KotlinStmt::Block(statements) => statements.is_empty(),
+            _ => false,
+        });
+        if catches.is_empty() && empty_finally {
+            return (body, true);
+        }
         let empty_body = match &body {
             KotlinStmt::Empty => true,
             KotlinStmt::Block(statements) => statements.is_empty(),
@@ -2856,6 +2864,21 @@ mod tests {
 
     fn name(value: &str) -> KotlinExpr {
         KotlinExpr::Name(KotlinIdentifier::from_dex(value))
+    }
+
+    #[test]
+    fn removes_try_with_only_an_empty_finally() {
+        let statement = KotlinStmt::Expression(name("work"));
+        let mut body = KotlinMethodBody {
+            root: KotlinStmt::Try {
+                body: Box::new(statement.clone()),
+                catches: Vec::new(),
+                finally: Some(Box::new(KotlinStmt::Block(Vec::new()))),
+            },
+        };
+
+        assert!(KotlinAstNormalizer.apply(&mut body).unwrap());
+        assert_eq!(body.root, statement);
     }
 
     #[test]
