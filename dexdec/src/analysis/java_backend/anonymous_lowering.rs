@@ -594,9 +594,7 @@ impl AnonymousTypeIdentity {
     fn matches(expected: &JavaType, actual: &JavaType) -> bool {
         match (expected, actual) {
             (JavaType::Class(expected), JavaType::Class(actual)) => {
-                expected.name() == actual.name()
-                    || Self::unqualified_matches(expected, actual)
-                    || Self::unqualified_matches(actual, expected)
+                expected.name() == actual.name() || Self::unqualified_matches(expected, actual)
             }
             _ => expected == actual,
         }
@@ -610,6 +608,27 @@ impl AnonymousTypeIdentity {
             .segments
             .last()
             .is_some_and(|expected| expected.name == actual.name)
+    }
+}
+
+#[cfg(test)]
+mod anonymous_type_identity_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_identity_accepts_its_unqualified_reference() {
+        let identity = JavaType::Class(JavaClassType::from_source("example.Owner.Callback"));
+        let reference = JavaType::Class(JavaClassType::from_source("Callback"));
+
+        assert!(AnonymousTypeIdentity::matches(&identity, &reference));
+    }
+
+    #[test]
+    fn unqualified_identity_rejects_an_external_type_with_the_same_simple_name() {
+        let identity = JavaType::Class(JavaClassType::from_source("b"));
+        let external = JavaType::Class(JavaClassType::from_source("example.external.b"));
+
+        assert!(!AnonymousTypeIdentity::matches(&identity, &external));
     }
 }
 

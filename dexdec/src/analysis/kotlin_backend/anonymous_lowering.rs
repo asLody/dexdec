@@ -601,9 +601,7 @@ impl AnonymousTypeIdentity {
     fn matches(expected: &KotlinType, actual: &KotlinType) -> bool {
         match (expected, actual) {
             (KotlinType::Class(expected), KotlinType::Class(actual)) => {
-                expected.name() == actual.name()
-                    || Self::unqualified_matches(expected, actual)
-                    || Self::unqualified_matches(actual, expected)
+                expected.name() == actual.name() || Self::unqualified_matches(expected, actual)
             }
             _ => expected == actual,
         }
@@ -617,6 +615,27 @@ impl AnonymousTypeIdentity {
             .segments
             .last()
             .is_some_and(|expected| expected.name == actual.name)
+    }
+}
+
+#[cfg(test)]
+mod anonymous_type_identity_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_identity_accepts_its_unqualified_reference() {
+        let identity = KotlinType::Class(KotlinClassType::from_source("example.Owner.Callback"));
+        let reference = KotlinType::Class(KotlinClassType::from_source("Callback"));
+
+        assert!(AnonymousTypeIdentity::matches(&identity, &reference));
+    }
+
+    #[test]
+    fn unqualified_identity_rejects_an_external_type_with_the_same_simple_name() {
+        let identity = KotlinType::Class(KotlinClassType::from_source("b"));
+        let external = KotlinType::Class(KotlinClassType::from_source("example.external.b"));
+
+        assert!(!AnonymousTypeIdentity::matches(&identity, &external));
     }
 }
 
