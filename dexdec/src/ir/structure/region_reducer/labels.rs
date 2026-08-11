@@ -12,9 +12,18 @@ use crate::ir::{
 /// must create fresh identities just like cloning an SSA scope.
 pub(super) struct LexicalLabels {
     duplicates: BTreeSet<SemanticLabel>,
+    preserved: BTreeSet<SemanticLabel>,
     used: BTreeSet<SemanticLabel>,
     used_blocks: BTreeSet<BlockId>,
     next_block: u32,
+    actions: Vec<DuplicateLabelAction>,
+}
+
+#[derive(Clone, Copy)]
+enum DuplicateLabelAction {
+    Ignore,
+    Preserve,
+    Rename,
 }
 
 impl LexicalLabels {
@@ -31,6 +40,7 @@ impl LexicalLabels {
         } else {
             Self {
                 duplicates,
+                preserved: BTreeSet::new(),
                 used: definitions.counts.into_keys().collect(),
                 next_block: definitions
                     .used_blocks
@@ -38,6 +48,7 @@ impl LexicalLabels {
                     .map(|block| block.raw().wrapping_add(1))
                     .unwrap_or_default(),
                 used_blocks: definitions.used_blocks,
+                actions: Vec::new(),
             }
             .fold_node(root)?
         };
@@ -354,10 +365,26 @@ impl SemanticFolder for LabelScopesRewrite {
 impl SemanticFolder for LexicalLabels {
     type Error = SemanticFoldError;
 
+    fn enter_node(&mut self, node: &SemanticNode) {
+        let action = match Self::binding(node).filter(|label| self.duplicates.contains(label)) {
+            Some(label) if self.preserved.insert(label) => DuplicateLabelAction::Preserve,
+            Some(_) => DuplicateLabelAction::Rename,
+            None => DuplicateLabelAction::Ignore,
+        };
+        self.actions.push(action);
+    }
+
     fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
+        let action = self
+            .actions
+            .pop()
+            .ok_or(SemanticFoldError::MalformedWorkStack)?;
+        if !matches!(action, DuplicateLabelAction::Rename) {
+            return Ok(node);
+        }
         let Some(label) = Self::binding(&node).filter(|label| self.duplicates.contains(label))
         else {
-            return Ok(node);
+            return Err(SemanticFoldError::MalformedWorkStack);
         };
         let replacement = self.fresh(label);
         LabelReferenceRewrite { label, replacement }.fold_node(node)
@@ -483,5 +510,67 @@ mod tests {
         }
         assert_eq!(labels, 1_000);
         assert!(matches!(cursor, SemanticNode::Empty));
+    }
+
+    #[test]
+    fn duplicate_block_labels_preserve_one_target_for_external_breaks() {
+        let region = RegionId::new(0);
+        let label = SemanticLabel::block(region, BlockId::new(1));
+        let break_to = |target| {
+            SemanticNode::Leave(SemanticLeave {
+                site: None,
+                condition: None,
+                kind: SemanticLeaveKind::BreakLabel(target),
+                edge: None,
+                origin: None,
+                source: region,
+                destination: region,
+                target: region,
+                cleanup: Vec::new(),
+            })
+        };
+        let root = SemanticNode::Sequence(vec![
+            break_to(label),
+            SemanticNode::Label {
+                label,
+                body: Box::new(break_to(label)),
+            },
+            SemanticNode::Label {
+                label,
+                body: Box::new(break_to(label)),
+            },
+        ]);
+
+        let repaired = LexicalLabels::uniquify(root).expect("label scope repair");
+
+        let SemanticNode::Label {
+            label: outer_label,
+            body,
+        } = repaired
+        else {
+            panic!("the preserved label must enclose its external break");
+        };
+        assert_eq!(outer_label, label);
+        let SemanticNode::Sequence(children) = *body else {
+            panic!("the repaired label must retain the original sequence");
+        };
+        assert!(matches!(
+            children.first(),
+            Some(SemanticNode::Leave(leave))
+                if matches!(&leave.kind, SemanticLeaveKind::BreakLabel(target) if *target == label)
+        ));
+        let Some(SemanticNode::Label {
+            label: cloned_label,
+            body: cloned_body,
+        }) = children.get(2)
+        else {
+            panic!("the cloned binding must remain independently labeled");
+        };
+        assert_ne!(*cloned_label, label);
+        assert!(matches!(
+            cloned_body.as_ref(),
+            SemanticNode::Leave(leave)
+                if matches!(&leave.kind, SemanticLeaveKind::BreakLabel(target) if *target == *cloned_label)
+        ));
     }
 }
