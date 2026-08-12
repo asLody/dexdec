@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dexdec-wordmark-dark.png">
@@ -149,7 +151,7 @@ Configured clients can be disconnected from **Settings > MCP** at any time.
 Requirements:
 
 - A current stable Rust toolchain
-- Node.js and npm
+- Node.js 22 or later and npm
 - Platform prerequisites for [Tauri 2](https://v2.tauri.app/start/prerequisites/)
 
 Run the development application:
