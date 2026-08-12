@@ -232,14 +232,24 @@ impl TypeLattice {
             let exact_satisfies = state
                 .exact
                 .iter()
-                .all(|bound| Self::is_assignable(bound, candidate, hierarchy));
+                .all(|bound| Self::producer_bound_compatible(bound, candidate, hierarchy));
             let lower_satisfies = state
                 .lower
                 .iter()
-                .all(|bound| Self::lower_bound_compatible(bound, candidate, hierarchy));
+                .all(|bound| Self::producer_bound_compatible(bound, candidate, hierarchy));
             if exact_satisfies && lower_satisfies && Self::domain_accepts(&state.domain, candidate)
             {
                 return Some(candidate.clone());
+            }
+        }
+        if let Some(ty) = strong.as_ref().filter(|ty| Self::is_concrete(ty)) {
+            if state
+                .upper
+                .iter()
+                .all(|upper| Self::producer_bound_compatible(ty, upper, hierarchy))
+                && Self::domain_accepts(&state.domain, ty)
+            {
+                return Some(ty.clone());
             }
         }
         if let Some(candidate) = Self::join_all(state.fallback.iter().cloned(), hierarchy) {
@@ -341,7 +351,12 @@ impl TypeLattice {
         }
     }
 
-    fn lower_bound_compatible(
+    /// Reference producers can be broader than a consumer's required type:
+    /// Java lowering preserves that physical type and inserts a cast or uses a
+    /// generic source projection when the emitted expression is not directly
+    /// assignable. Primitive values cannot use that recovery and must remain
+    /// directly assignable.
+    fn producer_bound_compatible(
         produced: &ArgType,
         expected: &ArgType,
         hierarchy: &dyn TypeHierarchy,
@@ -560,5 +575,117 @@ mod tests {
         let resolved = TypeLattice::solve(&constraints, &ClassHierarchyIndex::default());
 
         assert_eq!(resolved.get(&array), Some(&ArgType::array(value_type)));
+    }
+
+    #[test]
+    fn array_copy_uses_the_narrow_destination_element_type() {
+        let source = SsaVar::new(0, 0);
+        let destination = SsaVar::new(1, 0);
+        let value = SsaVar::new(2, 0);
+        let element = ArgType::object("androidx/compose/ui/node/LayoutNode");
+        let constraints = NormalizedTypeConstraints {
+            members: BTreeMap::from([
+                (source, BTreeSet::from([source])),
+                (destination, BTreeSet::from([destination])),
+                (value, BTreeSet::from([value])),
+            ]),
+            bounds: BTreeMap::from([
+                (
+                    source,
+                    BTreeSet::from([TypeBound::new(
+                        BoundKind::Exact,
+                        ArgType::array(ArgType::object("java/lang/Object")),
+                    )]),
+                ),
+                (
+                    destination,
+                    BTreeSet::from([
+                        TypeBound::new(BoundKind::Lower, ArgType::array(element.clone())),
+                        TypeBound::new(BoundKind::Upper, ArgType::array(element.clone())),
+                    ]),
+                ),
+                (
+                    value,
+                    BTreeSet::from([TypeBound::new(BoundKind::Domain, ArgType::unknown_object())]),
+                ),
+            ]),
+            flows: BTreeSet::new(),
+            upper_flows: BTreeSet::new(),
+            arrays: BTreeSet::from([
+                ArrayConstraint::Read {
+                    array: source,
+                    result: value,
+                },
+                ArrayConstraint::Write {
+                    array: destination,
+                    value,
+                },
+            ]),
+        };
+
+        let mut hierarchy = ClassHierarchyIndex::default();
+        hierarchy.add("java/lang/Object", Vec::new());
+        hierarchy.add(
+            "androidx/compose/ui/node/LayoutNode",
+            vec!["java/lang/Object".to_string()],
+        );
+        let resolved = TypeLattice::solve(&constraints, &hierarchy);
+
+        assert_eq!(resolved.get(&value), Some(&element));
+    }
+
+    #[test]
+    fn incompatible_primitive_producer_does_not_use_the_consumer_type() {
+        let value = SsaVar::new(0, 0);
+        let constraints = NormalizedTypeConstraints {
+            members: BTreeMap::from([(value, BTreeSet::from([value]))]),
+            bounds: BTreeMap::from([(
+                value,
+                BTreeSet::from([
+                    TypeBound::new(BoundKind::Exact, ArgType::BOOLEAN),
+                    TypeBound::new(BoundKind::Upper, ArgType::INT),
+                ]),
+            )]),
+            flows: BTreeSet::new(),
+            upper_flows: BTreeSet::new(),
+            arrays: BTreeSet::new(),
+        };
+
+        let resolved = TypeLattice::solve(&constraints, &ClassHierarchyIndex::default());
+
+        assert_eq!(resolved.get(&value), None);
+    }
+
+    #[test]
+    fn reference_producer_survives_incomparable_consumer_types() {
+        let value = SsaVar::new(4, 11);
+        let view = ArgType::object("android/view/View");
+        let callback = ArgType::object("com/example/SelectionCallback");
+        let constraints = NormalizedTypeConstraints {
+            members: BTreeMap::from([(value, BTreeSet::from([value]))]),
+            bounds: BTreeMap::from([(
+                value,
+                BTreeSet::from([
+                    TypeBound::new(BoundKind::Lower, view.clone()),
+                    TypeBound::new(BoundKind::Upper, view.clone()),
+                    TypeBound::new(BoundKind::Upper, callback),
+                    TypeBound::new(BoundKind::Domain, ArgType::unknown_object()),
+                ]),
+            )]),
+            flows: BTreeSet::new(),
+            upper_flows: BTreeSet::new(),
+            arrays: BTreeSet::new(),
+        };
+
+        let mut hierarchy = ClassHierarchyIndex::default();
+        hierarchy.add("java/lang/Object", Vec::new());
+        hierarchy.add("android/view/View", vec!["java/lang/Object".to_string()]);
+        hierarchy.add(
+            "com/example/SelectionCallback",
+            vec!["java/lang/Object".to_string()],
+        );
+        let resolved = TypeLattice::solve(&constraints, &hierarchy);
+
+        assert_eq!(resolved.get(&value), Some(&view));
     }
 }
