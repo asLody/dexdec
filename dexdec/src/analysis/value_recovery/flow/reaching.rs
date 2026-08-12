@@ -224,10 +224,15 @@ impl<'a, 'graph> ReachingDefinitions<'a, 'graph> {
             );
             let mut candidates = Vec::new();
             for index in indices {
-                if !self
-                    .graph
-                    .logic
-                    .disjoint(usage.domain, definitions[index].domain)?
+                // A definition in a repetitive scope can reach the use from an
+                // earlier iteration. Its execution domain describes one
+                // iteration only, so comparing it directly with the use domain
+                // can incorrectly make the two look disjoint.
+                if definitions[index].repetitive
+                    || !self
+                        .graph
+                        .logic
+                        .disjoint(usage.domain, definitions[index].domain)?
                 {
                     candidates.push(index);
                 }
@@ -285,14 +290,128 @@ impl<'a, 'graph> ReachingDefinitions<'a, 'graph> {
     ) -> Result<bool, ValueRecoveryError> {
         for &candidate in reaching {
             if candidate != selected
-                && !self
-                    .graph
-                    .logic
-                    .disjoint(usage.domain, definitions[candidate].domain)?
+                && (definitions[candidate].repetitive
+                    || !self
+                        .graph
+                        .logic
+                        .disjoint(usage.domain, definitions[candidate].domain)?)
             {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        ArgType, BlockId, InsnArg, InsnNode, InsnType, InstructionId, LiteralArg, RegionId,
+        RegisterArg, SemanticBlock, SemanticExpression, SemanticLeave, SemanticLeaveKind,
+        SemanticLoopControl, SemanticNode, SemanticOperand, SemanticPredicate,
+        SemanticSiteNumbering, SemanticStatement,
+    };
+    use std::collections::BTreeSet;
+
+    fn predicate(id: usize) -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(id);
+        SemanticPredicate::Test(
+            crate::ir::SemanticOperation::from_instruction(instruction).unwrap(),
+        )
+    }
+
+    fn value_predicate(id: usize, register: u32, variable: u32) -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(id);
+        SemanticPredicate::Test(crate::ir::SemanticOperation::from_parts(
+            instruction,
+            vec![SemanticExpression::Register(local(register, variable))],
+            None,
+        ))
+    }
+
+    fn local(register: u32, variable: u32) -> RegisterArg {
+        let mut result = RegisterArg::new(register, ArgType::INT);
+        result.code_var = Some(variable);
+        result
+    }
+
+    fn move_statement(
+        register: u32,
+        variable: u32,
+        value: i64,
+        edge_copy: bool,
+    ) -> SemanticStatement {
+        let mut instruction = InsnNode::mov(
+            local(register, variable),
+            InsnArg::Lit(LiteralArg::new(value, ArgType::INT)),
+        );
+        instruction.payload.edge_copy = edge_copy;
+        SemanticStatement::instruction(instruction).unwrap()
+    }
+
+    fn nop_statement() -> SemanticStatement {
+        SemanticStatement::instruction(InsnNode::new(InsnType::Nop, 0)).unwrap()
+    }
+
+    #[test]
+    fn repetitive_definition_reaches_a_disjoint_loop_exit_domain() {
+        let region = RegionId::new(1);
+        let variable = 2;
+        let mut root = SemanticNode::sequence([
+            SemanticNode::BasicBlock(SemanticBlock {
+                id: BlockId::new(0),
+                statements: vec![move_statement(0, variable, 0, true)],
+            }),
+            SemanticNode::For {
+                control: SemanticLoopControl::Region(region),
+                init: nop_statement(),
+                condition: SemanticOperand::new(predicate(1)),
+                update: nop_statement(),
+                body: Box::new(SemanticNode::guard(
+                    predicate(2),
+                    SemanticNode::BasicBlock(SemanticBlock {
+                        id: BlockId::new(1),
+                        statements: vec![move_statement(0, variable, 7, true)],
+                    }),
+                )),
+            },
+            SemanticNode::guard(
+                value_predicate(3, 0, variable),
+                SemanticNode::Leave(SemanticLeave {
+                    site: None,
+                    condition: None,
+                    kind: SemanticLeaveKind::Return(None),
+                    edge: None,
+                    origin: None,
+                    source: region,
+                    destination: region,
+                    target: region,
+                    cleanup: Vec::new(),
+                }),
+            ),
+        ]);
+        SemanticSiteNumbering::assign(&mut root).unwrap();
+        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new()).unwrap();
+        let key = SsaVar::new(variable, 0);
+        let definitions = &graph.definitions[&key];
+        let uses = &graph.uses[&key];
+        let analysis = SemanticReachingAnalysis::new(&graph, None);
+
+        let facts = ReachingDefinitions::new(&graph, &analysis)
+            .analyze(definitions, uses)
+            .unwrap();
+        let repetitive = definitions
+            .iter()
+            .position(|definition| definition.repetitive)
+            .expect("loop definition");
+
+        assert_eq!(uses.len(), 1);
+        assert!(facts.uses[0].control);
+        assert!(facts.uses[0].candidates.contains(&repetitive));
+        assert_eq!(facts.uses[0].selected, None);
+        assert_eq!(facts.candidate_uses[repetitive], 1);
     }
 }
