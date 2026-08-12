@@ -61,6 +61,19 @@ impl GuardDistribution {
         if new_cost >= old_cost {
             return Ok((original, false));
         }
+        let original_region = SemanticNode::sequence([
+            original.clone(),
+            SemanticNode::If {
+                condition: guard.clone(),
+                then_node: Box::new(tail.clone()),
+                else_node: None,
+            },
+        ]);
+        if SemanticCompletion::analyze(&original_region)
+            != SemanticCompletion::analyze(&injected.node)
+        {
+            return Ok((original, false));
+        }
         Ok((injected.node, true))
     }
 
@@ -421,4 +434,83 @@ enum InjectionTask {
     Visit { node: SemanticNode, path: Bdd },
     Sequence(Vec<SemanticNode>),
     If { condition: SemanticPredicate },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        BlockId, InsnNode, InsnType, InstructionId, RegionId, SemanticBlock, SemanticLeave,
+        SemanticLeaveKind, SemanticOperand, SemanticStatement,
+    };
+
+    fn predicate(id: usize) -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(id);
+        SemanticPredicate::Test(SemanticOperation::from_instruction(instruction).unwrap())
+    }
+
+    fn return_node() -> SemanticNode {
+        let region = RegionId::new(0);
+        SemanticNode::Leave(SemanticLeave {
+            site: None,
+            condition: None,
+            kind: SemanticLeaveKind::Return(None),
+            edge: None,
+            origin: None,
+            source: region,
+            destination: region,
+            target: region,
+            cleanup: Vec::new(),
+        })
+    }
+
+    fn no_return_block() -> SemanticNode {
+        let mut instruction = InsnNode::new(InsnType::Invoke, 0);
+        instruction.id = InstructionId::new(3);
+        instruction.payload.no_return = true;
+        SemanticNode::BasicBlock(SemanticBlock {
+            id: BlockId::new(3),
+            statements: vec![SemanticStatement::instruction(instruction).unwrap()],
+        })
+    }
+
+    #[test]
+    fn rejects_distribution_that_changes_structural_completion() {
+        let first = predicate(1);
+        let second = predicate(2);
+        let prefix = SemanticNode::guard(
+            first.clone().negate(),
+            SemanticNode::guard(second.clone(), return_node()),
+        );
+        let guard = SemanticPredicate::Or(vec![first, second.negate()]);
+        let tail = no_return_block();
+
+        let domain = PredicateDomain::collect(&prefix, &guard).unwrap();
+        let guard_domain = domain.compile(&guard).unwrap();
+        let injected = PathInjector::new(&domain, guard_domain, &tail)
+            .inject(prefix.clone())
+            .unwrap();
+        let original_region = SemanticNode::sequence([
+            prefix.clone(),
+            SemanticNode::guard(guard.clone(), tail.clone()),
+        ]);
+
+        assert!(SemanticCompletion::analyze(&original_region).can_complete_normally());
+        assert!(!SemanticCompletion::analyze(&injected.node).can_complete_normally());
+        assert!(
+            GuardDistribution::node_cost(&injected.node) < {
+                GuardDistribution::node_cost(&prefix)
+                    + GuardDistribution::predicate_cost(&guard)
+                    + GuardDistribution::node_cost(&tail)
+                    + 1
+            }
+        );
+
+        let (result, changed) =
+            GuardDistribution::apply(prefix, &SemanticOperand::new(guard), &tail).unwrap();
+
+        assert!(!changed);
+        assert!(SemanticCompletion::analyze(&result).can_complete_normally());
+    }
 }

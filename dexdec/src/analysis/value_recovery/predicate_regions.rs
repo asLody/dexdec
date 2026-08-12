@@ -47,7 +47,7 @@ impl PredicateRegionFormation {
     ) -> Result<SemanticNode, ValueRecoveryError> {
         let mut formed = Vec::<SemanticNode>::with_capacity(nodes.len());
         for node in nodes {
-            let merged = match (formed.last_mut(), &node) {
+            let merged = match (formed.last(), &node) {
                 (
                     Some(SemanticNode::If {
                         condition,
@@ -64,18 +64,26 @@ impl PredicateRegionFormation {
                 _ => None,
             };
             if let Some(next) = merged {
-                let previous = std::mem::replace(
-                    match formed.last_mut() {
-                        Some(SemanticNode::If { then_node, .. }) => then_node,
-                        _ => unreachable!("predicate region candidate changed"),
-                    },
-                    Box::new(SemanticNode::Empty),
-                );
-                if let Some(SemanticNode::If { then_node, .. }) = formed.last_mut() {
-                    *then_node = Box::new(SemanticNode::sequence([*previous, next]));
+                let previous = formed
+                    .last()
+                    .cloned()
+                    .expect("predicate region candidate disappeared");
+                let mut candidate = previous.clone();
+                if let SemanticNode::If { then_node, .. } = &mut candidate {
+                    let body = std::mem::replace(then_node, Box::new(SemanticNode::Empty));
+                    *then_node = Box::new(SemanticNode::sequence([*body, next]));
+                } else {
+                    unreachable!("predicate region candidate changed");
                 }
-                self.changed = true;
-                continue;
+                let original = SemanticNode::sequence([previous, node.clone()]);
+                if SemanticCompletion::analyze(&original) == SemanticCompletion::analyze(&candidate)
+                {
+                    *formed
+                        .last_mut()
+                        .expect("predicate region candidate disappeared") = candidate;
+                    self.changed = true;
+                    continue;
+                }
             }
 
             if let SemanticNode::If {
@@ -357,5 +365,58 @@ impl SemanticFolder for PredicateRegionFormation {
             SemanticNode::BasicBlock(block) => Ok(self.form_block(block)),
             node => Ok(node),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        ArgType, InsnNode, InsnType, InstructionId, LiteralArg, RegionId, SemanticExpression,
+        SemanticLeave, SemanticLeaveKind,
+    };
+
+    fn predicate(id: usize) -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(id);
+        SemanticPredicate::Test(
+            crate::ir::SemanticOperation::from_instruction(instruction).unwrap(),
+        )
+    }
+
+    fn leave(kind: SemanticLeaveKind) -> SemanticNode {
+        let region = RegionId::new(0);
+        SemanticNode::Leave(SemanticLeave {
+            site: None,
+            condition: None,
+            kind,
+            edge: None,
+            origin: None,
+            source: region,
+            destination: region,
+            target: region,
+            cleanup: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn rejects_equivalent_guard_merge_that_drops_an_abrupt_outcome() {
+        let condition = predicate(1);
+        let mut root = SemanticNode::sequence([
+            SemanticNode::guard(
+                condition.clone(),
+                leave(SemanticLeaveKind::Throw(SemanticExpression::Literal(
+                    LiteralArg::new(0, ArgType::INT),
+                ))),
+            ),
+            SemanticNode::guard(condition, leave(SemanticLeaveKind::Return(None))),
+        ]);
+        let before = SemanticCompletion::analyze(&root);
+
+        let changed = PredicateRegionFormation::apply(&mut root).unwrap();
+
+        assert!(!changed);
+        assert_eq!(SemanticCompletion::analyze(&root), before);
+        assert!(matches!(root, SemanticNode::Sequence(nodes) if nodes.len() == 2));
     }
 }

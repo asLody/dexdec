@@ -1,6 +1,6 @@
-//! Isolate every `monitor-enter` at a CFG boundary.
+//! Isolate monitor bodies and post-release continuations at CFG boundaries.
 
-use crate::ir::{Block, BlockId, EdgeKind, InsnType, CFG};
+use crate::ir::{analysis::InstructionEffects, Block, BlockId, EdgeKind, InsnNode, InsnType, CFG};
 
 use super::{Pass, PassResult};
 
@@ -32,7 +32,7 @@ impl Pass for SplitMonitorEntries {
     type Error = MonitorSplitError;
 
     fn name(&self) -> &'static str {
-        "split_monitor_entries"
+        "split_monitor_boundaries"
     }
 
     fn run(&mut self, cfg: &mut CFG) -> Result<PassResult, Self::Error> {
@@ -41,12 +41,8 @@ impl Pass for SplitMonitorEntries {
             .block_ids()
             .into_iter()
             .filter(|block| {
-                cfg.block(*block).is_some_and(|block| {
-                    block.insns.iter().enumerate().any(|(index, instruction)| {
-                        instruction.insn_type == InsnType::MonitorEnter
-                            && index + 1 < block.insns.len()
-                    })
-                })
+                cfg.block(*block)
+                    .is_some_and(|block| !Self::partition_boundaries(&block.insns).is_empty())
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
@@ -68,15 +64,7 @@ impl Pass for SplitMonitorEntries {
                     .ok_or(MonitorSplitError::MissingBlock(original_id))?
                     .insns,
             );
-            let mut boundaries = instructions
-                .iter()
-                .enumerate()
-                .filter_map(|(index, instruction)| {
-                    (instruction.insn_type == InsnType::MonitorEnter
-                        && index + 1 < instructions.len())
-                    .then_some(index + 1)
-                })
-                .collect::<Vec<_>>();
+            let mut boundaries = Self::partition_boundaries(&instructions);
             boundaries.push(instructions.len());
 
             cfg.remove_all_edges_from(original_id);
@@ -134,5 +122,114 @@ impl Pass for SplitMonitorEntries {
             }
         }
         Ok(PassResult::Changed)
+    }
+}
+
+impl SplitMonitorEntries {
+    fn partition_boundaries(instructions: &[InsnNode]) -> Vec<usize> {
+        let mut boundaries = Vec::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            let boundary = match instruction.insn_type {
+                InsnType::MonitorEnter => index + 1,
+                InsnType::MonitorExit => {
+                    let mut boundary = index + 1;
+                    while instructions
+                        .get(boundary)
+                        .is_some_and(InstructionEffects::is_kotlin_finally_marker)
+                    {
+                        boundary += 1;
+                    }
+                    boundary
+                }
+                _ => continue,
+            };
+            if boundary < instructions.len() {
+                boundaries.push(boundary);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{ArgType, InsnArg, InvokeType, MemberReference, MethodReference, RegisterArg};
+
+    fn finally_marker(name: &str) -> InsnNode {
+        let mut instruction = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        instruction.payload.reference = Some(MemberReference::Method(
+            format!("Lkotlin/jvm/internal/InlineMarker;->{name}(I)V")
+                .parse::<MethodReference>()
+                .unwrap(),
+        ));
+        instruction
+    }
+
+    #[test]
+    fn splits_after_monitor_release_epilogue() {
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+        let mut block = Block::new(0);
+        block.insns = vec![
+            InsnNode::monitor_enter(lock.clone()),
+            InsnNode::nop(),
+            finally_marker("finallyStart"),
+            InsnNode::monitor_exit(lock),
+            finally_marker("finallyEnd"),
+            InsnNode::nop(),
+        ];
+        let mut cfg = CFG::new("monitor_release_boundary");
+        cfg.add_block(block);
+
+        assert_eq!(
+            SplitMonitorEntries.run(&mut cfg).unwrap(),
+            PassResult::Changed
+        );
+        assert_eq!(
+            cfg.block_ids(),
+            vec![BlockId::new(0), BlockId::new(1), BlockId::new(2)]
+        );
+        assert_eq!(
+            cfg.block(0)
+                .unwrap()
+                .insns
+                .iter()
+                .map(|i| i.insn_type)
+                .collect::<Vec<_>>(),
+            vec![InsnType::MonitorEnter]
+        );
+        assert_eq!(
+            cfg.block(1)
+                .unwrap()
+                .insns
+                .iter()
+                .map(|i| i.insn_type)
+                .collect::<Vec<_>>(),
+            vec![
+                InsnType::Nop,
+                InsnType::Invoke,
+                InsnType::MonitorExit,
+                InsnType::Invoke
+            ]
+        );
+        assert_eq!(
+            cfg.block(2)
+                .unwrap()
+                .insns
+                .iter()
+                .map(|i| i.insn_type)
+                .collect::<Vec<_>>(),
+            vec![InsnType::Nop]
+        );
+        assert_eq!(
+            cfg.normal_successors(0).collect::<Vec<_>>(),
+            vec![BlockId::new(1)]
+        );
+        assert_eq!(
+            cfg.normal_successors(1).collect::<Vec<_>>(),
+            vec![BlockId::new(2)]
+        );
     }
 }

@@ -21,7 +21,7 @@ use super::analysis::{
     SsaVar, SubtypeRelation, ThrowEffect, TypeHierarchy,
 };
 use super::semantic::StatementOrigin;
-use super::{ArgType, BlockId, EdgeKind, InsnArg, InsnType, RegisterArg, CFG};
+use super::{ArgType, BlockId, EdgeKind, InsnArg, InsnType, MemberReference, RegisterArg, CFG};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HandlerKind {
@@ -466,6 +466,12 @@ impl<'a> ExceptionAnalyzer<'a> {
         HandlerDomains::assign(self.cfg, &mut regions);
         ElidedHandlerTails::new(self.cfg, &elided_instructions).trim(&mut regions);
         regions = ElidedExceptionScopes::prune(self.cfg, regions, &elided_instructions);
+        PrecedingHandlerProtectionArtifacts::prune(
+            self.cfg,
+            &mut regions,
+            self.hierarchy,
+            self.values,
+        );
         HandlerProtectedPartition::apply(self.cfg, &mut regions)?;
         HandlerDomains::assign(self.cfg, &mut regions);
         let live_handler_adapters = regions
@@ -758,6 +764,170 @@ impl<'a> ExceptionAnalyzer<'a> {
             }
         }
         reachable
+    }
+}
+
+/// Removes a source-layout artifact created when two lexical try statements
+/// are adjacent but the first statement's handler is emitted inside the
+/// second statement's physical DEX range. The later range has a raw exception
+/// edge from that handler, but the detached handler is not part of the later
+/// source try statement. Pruning requires every terminal path through the
+/// preceding handler to throw a known type that the later handlers cannot
+/// catch; a matching throw proves that the ranges are lexically nested instead.
+struct PrecedingHandlerProtectionArtifacts;
+
+impl PrecedingHandlerProtectionArtifacts {
+    fn prune(
+        cfg: &CFG,
+        regions: &mut [TryRegion],
+        hierarchy: &dyn TypeHierarchy,
+        values: &SsaValueGraph,
+    ) {
+        let snapshots = regions.to_vec();
+        for protected in regions {
+            // A catch-all range commonly protects monitor-exit or resource
+            // cleanup emitted in an earlier handler. That ownership is
+            // intentional even when the ranges happen to be adjacent.
+            if protected
+                .handlers
+                .iter()
+                .any(|handler| handler.catch_type.is_none())
+            {
+                continue;
+            }
+            let own_handlers = protected
+                .handlers
+                .iter()
+                .map(|handler| handler.canonical_entry)
+                .collect::<BTreeSet<_>>();
+            let protected_handlers = ClauseKey(
+                protected
+                    .handlers
+                    .iter()
+                    .map(|handler| (handler.catch_type.clone(), handler.handler_offset))
+                    .collect(),
+            );
+            let protected_blocks = protected.blocks.iter().copied().collect::<BTreeSet<_>>();
+            let artifacts = snapshots
+                .iter()
+                .filter(|owner| owner.id != protected.id)
+                .filter(|owner| owner.end_offset == protected.start_offset)
+                .flat_map(|owner| &owner.handlers)
+                .filter(|handler| !own_handlers.contains(&handler.canonical_entry))
+                .filter(|handler| Self::detached(cfg, handler, &protected_blocks))
+                .filter(|handler| {
+                    Self::terminal_throws_escape(
+                        cfg,
+                        handler,
+                        &protected_handlers,
+                        hierarchy,
+                        values,
+                    )
+                })
+                .flat_map(|handler| {
+                    handler
+                        .blocks
+                        .iter()
+                        .chain(&handler.entry_blocks)
+                        .chain(&handler.adapter_blocks)
+                        .copied()
+                })
+                .collect::<BTreeSet<_>>();
+            protected.blocks.retain(|block| !artifacts.contains(block));
+        }
+    }
+
+    fn detached(cfg: &CFG, handler: &CatchHandler, protected: &BTreeSet<BlockId>) -> bool {
+        let domain = handler
+            .blocks
+            .iter()
+            .chain(&handler.entry_blocks)
+            .chain(&handler.adapter_blocks)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        !domain.is_empty()
+            && domain.iter().all(|block| {
+                cfg.normal_successors(*block)
+                    .all(|target| domain.contains(&target) || !protected.contains(&target))
+            })
+    }
+
+    fn terminal_throws_escape(
+        cfg: &CFG,
+        handler: &CatchHandler,
+        protected_handlers: &ClauseKey,
+        hierarchy: &dyn TypeHierarchy,
+        values: &SsaValueGraph,
+    ) -> bool {
+        let domain = handler
+            .blocks
+            .iter()
+            .chain(&handler.entry_blocks)
+            .chain(&handler.adapter_blocks)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut saw_terminal = false;
+        for block in &domain {
+            if cfg
+                .normal_successors(*block)
+                .any(|target| domain.contains(&target))
+            {
+                continue;
+            }
+            let Some(terminal) = cfg.block(*block).and_then(|block| block.terminator()) else {
+                return false;
+            };
+            if terminal.insn_type != InsnType::Throw {
+                return false;
+            }
+            let Some(thrown) = terminal
+                .args
+                .first()
+                .and_then(|argument| Self::thrown_type(cfg, values, argument))
+            else {
+                return false;
+            };
+            if protected_handlers.catches(thrown, hierarchy) {
+                return false;
+            }
+            saw_terminal = true;
+        }
+        saw_terminal
+    }
+
+    fn thrown_type<'cfg>(
+        cfg: &'cfg CFG,
+        values: &SsaValueGraph,
+        argument: &'cfg InsnArg,
+    ) -> Option<&'cfg str> {
+        if let Some(ty) = argument.declared_type().and_then(ArgType::as_object) {
+            return Some(ty);
+        }
+        let value = argument
+            .as_register()
+            .and_then(SsaVar::from_reg)
+            .and_then(|value| values.value(value))?;
+        let definition = value.definition?;
+        let instruction = cfg
+            .block(definition.block)
+            .and_then(|block| block.insns.get(definition.index))?;
+        instruction
+            .result
+            .as_ref()
+            .and_then(|result| result.ty.as_object())
+            .or_else(|| {
+                instruction
+                    .payload
+                    .class_type
+                    .as_ref()
+                    .and_then(ArgType::as_object)
+            })
+            .or_else(|| match instruction.payload.reference.as_ref() {
+                Some(MemberReference::Method(method)) if method.is_constructor() => {
+                    method.owner.as_object()
+                }
+                _ => None,
+            })
     }
 }
 
@@ -3897,7 +4067,193 @@ impl<'a> FiniteExitAnalysis<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::analysis::ClassHierarchyIndex;
     use crate::ir::{Block, InsnNode};
+
+    fn exception_hierarchy() -> ClassHierarchyIndex {
+        let mut hierarchy = ClassHierarchyIndex::default();
+        hierarchy.add("java/lang/Object", Vec::new());
+        hierarchy.add("java/lang/Throwable", vec!["java/lang/Object".to_string()]);
+        hierarchy.add(
+            "java/lang/Exception",
+            vec!["java/lang/Throwable".to_string()],
+        );
+        hierarchy.add(
+            "java/lang/RuntimeException",
+            vec!["java/lang/Exception".to_string()],
+        );
+        hierarchy.add(
+            "test/AnnotatedException",
+            vec!["java/lang/Exception".to_string()],
+        );
+        hierarchy
+    }
+
+    fn catch_handler(entry: u32, blocks: &[u32]) -> CatchHandler {
+        let blocks = blocks.iter().copied().map(BlockId::new).collect::<Vec<_>>();
+        CatchHandler {
+            id: entry,
+            catch_type: Some(ArgType::object("java/lang/Exception")),
+            handler_offset: entry,
+            entry_blocks: BTreeSet::from([BlockId::new(entry)]),
+            handler_block: BlockId::new(entry),
+            semantic_entry: BlockId::new(entry),
+            canonical_entry: BlockId::new(entry),
+            adapter_blocks: BTreeSet::new(),
+            semantic_blocks: blocks.clone(),
+            lexical_blocks: blocks.clone(),
+            blocks,
+            continuation: None,
+            exception_value: None,
+            canonical_exception_value: None,
+            rethrow_blocks: BTreeSet::new(),
+            kind: HandlerKind::Catch,
+        }
+    }
+
+    fn try_region(
+        id: u32,
+        start: u32,
+        end: u32,
+        blocks: &[u32],
+        handlers: Vec<CatchHandler>,
+    ) -> TryRegion {
+        TryRegion {
+            id,
+            start_offset: start,
+            end_offset: end,
+            blocks: blocks.iter().copied().map(BlockId::new).collect(),
+            handlers,
+            parent: None,
+            children: Vec::new(),
+            normal_exit_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detached_preceding_handler_is_not_owned_by_adjacent_try() {
+        let mut cfg = CFG::new("adjacent_handler_protection");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(0), BlockId::new(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        let constructed = RegisterArg::new_ssa(0, 0, ArgType::object("java/lang/RuntimeException"));
+        let mut construction = InsnNode::new(InsnType::Constructor, 0);
+        construction.set_result(constructed);
+        cfg.block_mut(BlockId::new(1)).unwrap().push(construction);
+        cfg.block_mut(BlockId::new(2))
+            .unwrap()
+            .push(InsnNode::throw(InsnArg::reg_ssa(
+                0,
+                0,
+                ArgType::unknown_object(),
+            )));
+        let values = SsaValueGraph::build(&cfg).unwrap();
+        let mut outer = catch_handler(4, &[4]);
+        outer.catch_type = Some(ArgType::object("test/AnnotatedException"));
+        let mut regions = vec![
+            try_region(0, 10, 20, &[0], vec![catch_handler(1, &[1, 2])]),
+            try_region(1, 20, 40, &[1, 2, 3], vec![outer]),
+        ];
+
+        PrecedingHandlerProtectionArtifacts::prune(
+            &cfg,
+            &mut regions,
+            &exception_hierarchy(),
+            &values,
+        );
+
+        assert_eq!(regions[1].blocks, vec![BlockId::new(3)]);
+    }
+
+    #[test]
+    fn preceding_handler_flowing_into_adjacent_try_remains_protected() {
+        let mut cfg = CFG::new("connected_adjacent_handler_protection");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(3), EdgeKind::Normal);
+        let mut regions = vec![
+            try_region(0, 10, 20, &[0], vec![catch_handler(1, &[1, 2])]),
+            try_region(1, 20, 40, &[1, 2, 3], vec![catch_handler(4, &[4])]),
+        ];
+
+        PrecedingHandlerProtectionArtifacts::prune(
+            &cfg,
+            &mut regions,
+            &exception_hierarchy(),
+            &SsaValueGraph::default(),
+        );
+
+        assert_eq!(
+            regions[1].blocks,
+            vec![BlockId::new(1), BlockId::new(2), BlockId::new(3)]
+        );
+    }
+
+    #[test]
+    fn catch_all_keeps_preceding_handler_protected_for_cleanup() {
+        let mut cfg = CFG::new("catch_all_cleanup_protection");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        let mut cleanup = catch_handler(4, &[4]);
+        cleanup.catch_type = None;
+        let mut regions = vec![
+            try_region(0, 10, 20, &[0], vec![catch_handler(1, &[1, 2])]),
+            try_region(1, 20, 40, &[1, 2, 3], vec![cleanup]),
+        ];
+
+        PrecedingHandlerProtectionArtifacts::prune(
+            &cfg,
+            &mut regions,
+            &exception_hierarchy(),
+            &SsaValueGraph::default(),
+        );
+
+        assert_eq!(
+            regions[1].blocks,
+            vec![BlockId::new(1), BlockId::new(2), BlockId::new(3)]
+        );
+    }
+
+    #[test]
+    fn caught_throw_keeps_preceding_handler_inside_adjacent_try() {
+        let mut cfg = CFG::new("caught_handler_throw");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.block_mut(BlockId::new(2))
+            .unwrap()
+            .push(InsnNode::throw(InsnArg::reg(
+                0,
+                ArgType::object("test/AnnotatedException"),
+            )));
+        let mut outer = catch_handler(4, &[4]);
+        outer.catch_type = Some(ArgType::object("test/AnnotatedException"));
+        let mut regions = vec![
+            try_region(0, 10, 20, &[0], vec![catch_handler(1, &[1, 2])]),
+            try_region(1, 20, 40, &[1, 2, 3], vec![outer]),
+        ];
+
+        PrecedingHandlerProtectionArtifacts::prune(
+            &cfg,
+            &mut regions,
+            &exception_hierarchy(),
+            &SsaValueGraph::default(),
+        );
+
+        assert_eq!(
+            regions[1].blocks,
+            vec![BlockId::new(1), BlockId::new(2), BlockId::new(3)]
+        );
+    }
 
     #[test]
     fn handler_adapter_stops_at_exception_state_transfer() {
