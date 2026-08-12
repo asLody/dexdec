@@ -52,7 +52,10 @@ impl LoopSyntaxFact {
                     || method.ssa_escapes(local, *iterator_value)
                     || variable
                         .code_var
-                        .is_some_and(|source| method.variable_escapes(local, source))
+                        // For-each removes the iterator-advance definition. A phi may use a
+                        // different SSA value coalesced into the same source variable after
+                        // the loop, so compare uses directly instead of definition/use ratios.
+                        .is_some_and(|source| method.use_count(source) != local.use_count(source))
             }
         }
     }
@@ -245,6 +248,77 @@ enum CountedLoopRejection {
     InvalidContinuationUpdates,
     MissingInitSite,
     MissingUpdateSite,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BlockId, InsnArg, InsnNode, RegisterArg, SemanticBlock, SemanticStatement};
+
+    fn register(reg_num: u32, version: u32, variable: u32) -> RegisterArg {
+        let mut register = RegisterArg::new(reg_num, ArgType::object("java/lang/Object"));
+        register.ssa_version = Some(version);
+        register.code_var = Some(variable);
+        register
+    }
+
+    fn block(id: u32, statements: Vec<SemanticStatement>) -> SemanticNode {
+        SemanticNode::BasicBlock(SemanticBlock {
+            id: BlockId::new(id),
+            statements,
+        })
+    }
+
+    fn move_statement(result: RegisterArg, source: InsnArg) -> SemanticStatement {
+        SemanticStatement::instruction(InsnNode::mov(result, source))
+            .expect("move should produce a semantic statement")
+    }
+
+    #[test]
+    fn foreach_rejects_a_phi_coalesced_advance_used_after_the_loop() {
+        let advance = register(0, 4, 4);
+        let iteration_value = register(1, 2, 8);
+        let phi_value = register(0, 6, 4);
+        let consumer = register(0, 7, 6);
+        let iterator = register(8, 4, 30);
+        let local = block(
+            1,
+            vec![
+                move_statement(
+                    advance.clone(),
+                    InsnArg::lit(0, ArgType::object("java/lang/Object")),
+                ),
+                move_statement(iteration_value, InsnArg::Reg(advance.clone())),
+            ],
+        );
+        let continuation = block(
+            2,
+            vec![
+                move_statement(
+                    phi_value.clone(),
+                    InsnArg::lit(0, ArgType::object("java/lang/Object")),
+                ),
+                move_statement(consumer, InsnArg::Reg(phi_value)),
+            ],
+        );
+        let method = SemanticNode::sequence([local.clone(), continuation]);
+        let method_facts = SemanticExpressionFacts::of_node(&method);
+        let local_facts = SemanticExpressionFacts::of_node(&local);
+        assert!(!method_facts.variable_escapes(&local_facts, 4));
+
+        let fact = LoopSyntaxFact::ForEach {
+            init: SemanticSiteId(1),
+            variable_value: crate::ir::analysis::SsaVar::from_reg(&advance)
+                .expect("advance should have an SSA identity"),
+            iterator_value: crate::ir::analysis::SsaVar::from_reg(&iterator)
+                .expect("iterator should have an SSA identity"),
+            variable: advance,
+            iterable: SemanticExpression::Register(iterator),
+            advance: InstructionId::new(1),
+            advance_is_statement: true,
+        };
+        assert!(fact.escapes(&method_facts, &local_facts));
+    }
 }
 
 struct IteratorLoopProof<'a> {
