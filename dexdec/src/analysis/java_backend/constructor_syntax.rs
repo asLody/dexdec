@@ -3335,7 +3335,20 @@ impl ConstructorBindings {
             let names = ExpressionNames::collect(argument);
             names.iter().any(|name| self.values.contains_key(name))
                 || ReplayableExpression::check(argument)
+                || Self::passive_field_read(argument)
         })
+    }
+
+    /// A direct field read already occupies one constructor argument position.
+    /// It can separate surrounding one-use bindings without changing their
+    /// left-to-right evaluation order, provided evaluating its receiver is
+    /// itself replayable. The read is neither duplicated nor discarded.
+    fn passive_field_read(expression: &JavaExpr) -> bool {
+        match expression {
+            JavaExpr::Field { owner, .. } => ReplayableExpression::check(owner),
+            JavaExpr::Cast { value, .. } => Self::passive_field_read(value),
+            _ => false,
+        }
     }
 
     fn binding_positions(
@@ -8278,6 +8291,47 @@ mod tests {
                     ] if matches!(when_true.as_ref(), JavaExpr::Call { method, .. }
                         if method == &JavaIdentifier::from_dex("currentTimeMillis"))
                 )
+        ));
+    }
+
+    #[test]
+    fn direct_field_argument_preserves_surrounding_binding_order() {
+        let request = JavaIdentifier::from_dex("request");
+        let first = JavaIdentifier::from_dex("first");
+        let last = JavaIdentifier::from_dex("last");
+        let field = |name: &str| JavaExpr::Field {
+            owner: Box::new(JavaExpr::Name(request.clone())),
+            name: JavaIdentifier::from_dex(name),
+        };
+        let mut statements = vec![
+            JavaStmt::Variable {
+                ty: JavaType::boolean(),
+                name: first.clone(),
+                value: Some(field("first")),
+            },
+            JavaStmt::Variable {
+                ty: JavaType::boolean(),
+                name: last.clone(),
+                value: Some(field("last")),
+            },
+            JavaStmt::ConstructorInvocation {
+                target: JavaConstructorTarget::This,
+                args: vec![JavaExpr::Name(first), field("middle"), JavaExpr::Name(last)],
+            },
+        ];
+
+        ConstructorSyntaxRecovery::schedule_arguments(&mut statements);
+
+        assert!(matches!(
+            statements.as_slice(),
+            [JavaStmt::ConstructorInvocation { args, .. }]
+                if matches!(args.as_slice(), [
+                    JavaExpr::Field { name: first, .. },
+                    JavaExpr::Field { name: middle, .. },
+                    JavaExpr::Field { name: last, .. },
+                ] if first.as_str() == "first"
+                    && middle.as_str() == "middle"
+                    && last.as_str() == "last")
         ));
     }
 
