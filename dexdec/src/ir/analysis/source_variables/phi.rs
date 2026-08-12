@@ -1912,6 +1912,9 @@ impl<'a> PhiTypeResolver<'a> {
     fn physical_type(&self, mut value: SsaVar) -> Option<ArgType> {
         let mut visited = BTreeSet::new();
         while visited.insert(value) {
+            if let Some(ty) = self.resolved.get(&value) {
+                return Some(ty.clone());
+            }
             if let Some(constant) = self.constants.get(&value) {
                 if let Some(ty) = constant.declared_type().filter(|ty| ty.is_known()) {
                     return Some(ty.clone());
@@ -2561,6 +2564,7 @@ impl SemanticVisitor for EvaluationInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::analysis::ClassHierarchyIndex;
     use crate::ir::{
         Block, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, SemanticExpression,
     };
@@ -2569,6 +2573,41 @@ mod tests {
         let mut value = RegisterArg::new_ssa(register, version, ArgType::INT);
         value.code_var = Some(variable);
         value
+    }
+
+    #[test]
+    fn physical_type_reuses_resolved_phi_through_a_move() {
+        let predecessor = BlockId::new(0);
+        let block_id = BlockId::new(1);
+        let phi_input = RegisterArg::new_ssa(7, 0, ArgType::narrow());
+        let phi_value = RegisterArg::new_ssa(7, 10, ArgType::narrow());
+        let moved = RegisterArg::new_ssa(23, 0, ArgType::narrow());
+        let moved_value = SsaVar::from_reg(&moved).expect("moved SSA value");
+        let mut predecessor_block = Block::new(predecessor);
+        predecessor_block.push(InsnNode::const_value(phi_input.clone(), 0));
+        let mut block = Block::new(block_id);
+        block.push(InsnNode::phi(
+            phi_value.clone(),
+            vec![(predecessor.raw(), InsnArg::Reg(phi_input))],
+        ));
+        block.push(InsnNode::move_insn(moved, InsnArg::Reg(phi_value.clone())));
+        let mut cfg = CFG::new("resolved_phi_move");
+        cfg.entry = predecessor;
+        cfg.add_block(predecessor_block);
+        cfg.add_block(block);
+        cfg.add_edge(predecessor, block_id, EdgeKind::Normal);
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let types = SsaTypeEnvironment::default();
+        let constants = BTreeMap::new();
+        let hierarchy = ClassHierarchyIndex::default();
+        let resolved = BTreeMap::from([(
+            SsaVar::from_reg(&phi_value).expect("phi SSA value"),
+            ArgType::BOOLEAN,
+        )]);
+        let resolver =
+            PhiTypeResolver::new(&cfg, &values, &types, &constants, &hierarchy, &resolved);
+
+        assert_eq!(resolver.physical_type(moved_value), Some(ArgType::BOOLEAN));
     }
 
     #[test]
