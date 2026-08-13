@@ -202,6 +202,7 @@ impl InterferenceGraph {
         cfg: &CFG,
         semantic: &SemanticNode,
         liveness: &SsaLiveness,
+        required_phis: &BTreeSet<SsaVar>,
     ) -> Result<Self, SourceVariableError> {
         let mut graph = Self::default();
         if let Some(inputs) = liveness.live_in.get(&cfg.entry) {
@@ -249,7 +250,9 @@ impl InterferenceGraph {
                 return Err(SourceVariableError::LivenessMismatch(block));
             }
         }
-        SemanticLiveness::analyze(semantic, &liveness.retained)?.add_interference(&mut graph);
+        let semantic_liveness = SemanticLiveness::analyze(semantic, &liveness.retained)?;
+        semantic_liveness.add_recovered_phi_interference(cfg, required_phis, &mut graph);
+        semantic_liveness.add_interference(&mut graph);
         Ok(graph)
     }
 
@@ -324,6 +327,7 @@ impl InterferenceGraph {
 struct SemanticSiteFacts {
     uses: BTreeSet<SsaVar>,
     definitions: BTreeSet<SsaVar>,
+    blocks: BTreeSet<BlockId>,
 }
 
 struct SemanticLiveness {
@@ -396,6 +400,60 @@ impl SemanticLiveness {
             for definition in &facts.definitions {
                 for other in live.iter().copied().filter(|other| other != definition) {
                     graph.add_semantic(*definition, other);
+                }
+            }
+        }
+    }
+
+    fn add_recovered_phi_interference(
+        &self,
+        cfg: &CFG,
+        required_phis: &BTreeSet<SsaVar>,
+        graph: &mut InterferenceGraph,
+    ) {
+        let mut uses_by_block = BTreeMap::<BlockId, BTreeSet<SsaVar>>::new();
+        for facts in self.sites.values() {
+            for block in &facts.blocks {
+                uses_by_block
+                    .entry(*block)
+                    .or_default()
+                    .extend(facts.uses.iter().copied());
+            }
+        }
+
+        for (block, uses) in uses_by_block {
+            let Some(body) = cfg.block(block) else {
+                continue;
+            };
+            for phi in body
+                .insns
+                .iter()
+                .filter(|instruction| instruction.insn_type == InsnType::Phi)
+            {
+                let Some(result) = phi.result.as_ref().and_then(SsaVar::from_reg) else {
+                    continue;
+                };
+                if !required_phis.contains(&result) {
+                    continue;
+                }
+                let inputs = phi
+                    .args
+                    .iter()
+                    .filter_map(InsnArg::as_register)
+                    .filter_map(SsaVar::from_reg)
+                    .collect::<BTreeSet<_>>();
+                // Value recovery can synthesize a use of a pre-Phi SSA value
+                // in a statement originating in the Phi block. The CFG never
+                // contained that use, so physical liveness alone would allow
+                // the Phi result to share its source variable and its edge
+                // copy would overwrite the old value before the recovered
+                // expression reads it.
+                for usage in uses
+                    .intersection(&inputs)
+                    .copied()
+                    .filter(|usage| *usage != result)
+                {
+                    graph.add(result, usage);
                 }
             }
         }
@@ -517,6 +575,9 @@ impl<'a> SemanticSiteCollector<'a> {
             .site
             .ok_or(SourceVariableError::MissingSemanticSite("statement"))?;
         self.site(site);
+        if let Some(origin) = &statement.origin {
+            self.site(site).blocks.insert(origin.block);
+        }
         match &statement.kind {
             SemanticStatementKind::Instruction(operation) => {
                 self.add_uses(
@@ -679,7 +740,7 @@ impl InstructionVisitor for InstructionUses {
 #[cfg(test)]
 mod tests {
     use super::{InterferenceGraph, SsaLiveness};
-    use crate::ir::{analysis::SsaVar, ArgType, Block, IfOp, InsnArg, InsnNode, CFG};
+    use crate::ir::{analysis::SsaVar, ArgType, Block, IfOp, InsnArg, InsnNode, RegisterArg, CFG};
     use std::collections::BTreeSet;
 
     #[test]
@@ -698,12 +759,87 @@ mod tests {
 
         let retained = BTreeSet::from([left, right]);
         let liveness = SsaLiveness::analyze(&cfg, &retained).unwrap();
-        let interference =
-            InterferenceGraph::build(&cfg, &crate::ir::SemanticNode::Empty, &liveness).unwrap();
+        let interference = InterferenceGraph::build(
+            &cfg,
+            &crate::ir::SemanticNode::Empty,
+            &liveness,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert!(interference
             .hard_edges
             .get(&left)
             .is_some_and(|neighbors| neighbors.contains(&right)));
+    }
+
+    #[test]
+    fn recovered_same_block_use_interferes_with_required_phi_result() {
+        use crate::ir::{
+            BlockId, InstructionId, SemanticBlock, SemanticNode, SemanticSiteNumbering,
+            SemanticStatement, StatementOrigin,
+        };
+
+        let predecessor = BlockId::new(0);
+        let join = BlockId::new(1);
+        let old = RegisterArg::new_ssa(0, 0, ArgType::INT);
+        let unrelated = RegisterArg::new_ssa(2, 0, ArgType::INT);
+        let phi_result = RegisterArg::new_ssa(0, 1, ArgType::INT);
+        let old_value = SsaVar::from_reg(&old).unwrap();
+        let unrelated_value = SsaVar::from_reg(&unrelated).unwrap();
+        let phi_value = SsaVar::from_reg(&phi_result).unwrap();
+
+        let mut predecessor_block = Block::new(predecessor);
+        predecessor_block.push(InsnNode::const_value(old.clone(), 0));
+        predecessor_block.push(InsnNode::const_value(unrelated.clone(), 1));
+        let mut join_block = Block::new(join);
+        join_block.push(InsnNode::phi(
+            phi_result,
+            vec![(predecessor.raw(), InsnArg::Reg(old.clone()))],
+        ));
+        let mut cfg = CFG::new("recovered-phi-use");
+        cfg.entry = predecessor;
+        cfg.add_block(predecessor_block);
+        cfg.add_block(join_block);
+        cfg.add_edge(predecessor, join, crate::ir::EdgeKind::Normal);
+
+        let mut statement = SemanticStatement::instruction(InsnNode::mov(
+            RegisterArg::new_ssa(1, 0, ArgType::INT),
+            InsnArg::Reg(old),
+        ))
+        .unwrap();
+        statement.origin = Some(StatementOrigin {
+            block: join,
+            instruction: InstructionId::new(0),
+        });
+        let mut unrelated_statement = SemanticStatement::instruction(InsnNode::mov(
+            RegisterArg::new_ssa(3, 0, ArgType::INT),
+            InsnArg::Reg(unrelated),
+        ))
+        .unwrap();
+        unrelated_statement.origin = Some(StatementOrigin {
+            block: join,
+            instruction: InstructionId::new(0),
+        });
+        let mut semantic = SemanticNode::BasicBlock(SemanticBlock {
+            id: join,
+            statements: vec![statement, unrelated_statement],
+        });
+        SemanticSiteNumbering::assign(&mut semantic).unwrap();
+
+        let retained = BTreeSet::from([old_value, unrelated_value, phi_value]);
+        let liveness = SsaLiveness::analyze(&cfg, &retained).unwrap();
+        let interference =
+            InterferenceGraph::build(&cfg, &semantic, &liveness, &BTreeSet::from([phi_value]))
+                .unwrap();
+
+        assert!(interference
+            .hard_edges
+            .get(&phi_value)
+            .is_some_and(|neighbors| neighbors.contains(&old_value)));
+        assert!(!interference
+            .hard_edges
+            .get(&phi_value)
+            .is_some_and(|neighbors| neighbors.contains(&unrelated_value)));
     }
 }

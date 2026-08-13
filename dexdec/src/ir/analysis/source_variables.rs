@@ -90,7 +90,7 @@ impl SourceVariableAllocation {
         let liveness = SsaLiveness::analyze(cfg, &retained)?;
         let edge_arguments =
             edge_arguments::ContractedEdgeArguments::new(cfg, values, constants, &contractions);
-        let mut interference = InterferenceGraph::build(cfg, root, &liveness)?;
+        let mut interference = InterferenceGraph::build(cfg, root, &liveness, &required_phis)?;
         interference.add_exceptional_edge_interference(cfg, &liveness, &edge_arguments)?;
         let classes = SsaClasses::new(
             values
