@@ -1255,8 +1255,12 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
         for (entry, group) in handlers {
             let lexical_blocks =
                 HandlerLexicalAnalysis::new(self.cfg).analyze(group.iter().copied())?;
-            let blocks = self.handler_component(entry, &lexical_blocks)?;
             let kind = Self::handler_kind(source_id, entry, &group)?;
+            let blocks = self.handler_component(
+                entry,
+                &lexical_blocks,
+                matches!(kind, RegionKind::Catch(_)),
+            )?;
             if let Some(region) = self.interned_handler(entry, &kind, &blocks)? {
                 self.handler_domains
                     .entry(region)
@@ -1594,6 +1598,7 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
         &self,
         entry: BlockId,
         lexical_blocks: &BTreeSet<BlockId>,
+        claim_ancestor_owned_suffixes: bool,
     ) -> Result<BTreeSet<BlockId>, RegionInvariantError> {
         if !lexical_blocks.contains(&entry) {
             return Ok(BTreeSet::new());
@@ -1604,7 +1609,13 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
         let mut pending = vec![entry];
         while let Some(block) = pending.pop() {
             if !lexical_blocks.contains(&block)
-                || !self.belongs_to_handler_domain(block, owner, lexical_blocks)?
+                || !self.belongs_to_handler_domain(
+                    block,
+                    entry,
+                    owner,
+                    lexical_blocks,
+                    claim_ancestor_owned_suffixes,
+                )?
                 || !blocks.insert(block)
             {
                 continue;
@@ -1624,11 +1635,27 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
     fn belongs_to_handler_domain(
         &self,
         block: BlockId,
+        entry: BlockId,
         owner: RegionId,
         lexical_blocks: &BTreeSet<BlockId>,
+        claim_ancestor_owned_suffixes: bool,
     ) -> Result<bool, RegionInvariantError> {
         let block_owner = self.tree.owner(block)?;
         if block_owner == owner {
+            return Ok(true);
+        }
+        // Catch discovery can run after an enclosing try has claimed the
+        // physical handler entry but before private, non-throwing suffixes are
+        // moved out of an ancestor region. HandlerLexicalAnalysis has already
+        // proved that such blocks have no normal predecessor outside this
+        // handler, and entry dominance distinguishes a suffix from exceptional
+        // ingress adapters that merely converge on the catch. Finally and
+        // cleanup handlers deliberately stay on the cleanup-contraction path:
+        // claiming their normal copies here would emit the same cleanup twice.
+        if claim_ancestor_owned_suffixes
+            && self.tree.is_ancestor(block_owner, owner)?
+            && self.facts.semantic_dominators().dominates(entry, block)
+        {
             return Ok(true);
         }
         let region = self
@@ -1893,6 +1920,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(blocks, BTreeSet::from([BlockId::new(1)]));
+    }
+
+    #[test]
+    fn handler_component_claims_a_private_ancestor_owned_suffix() {
+        let method_entry = BlockId::new(0);
+        let handler_entry = BlockId::new(1);
+        let suffix = BlockId::new(2);
+        let mut cfg = CFG::new("ancestor_owned_handler_suffix");
+        cfg.entry = method_entry;
+        for block in [method_entry, handler_entry, suffix] {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(method_entry, handler_entry, EdgeKind::Normal);
+        cfg.add_edge(handler_entry, suffix, EdgeKind::Normal);
+
+        let facts = ControlFlowFacts::analyze(&cfg).expect("control-flow facts");
+        let mut tree = RegionTree::new(Some(method_entry));
+        tree.cover_method(&cfg).expect("method ownership");
+        let root = tree.root();
+        let enclosing_try = tree
+            .add_child(root, RegionKind::Try, Some(handler_entry))
+            .expect("enclosing try");
+        tree.add_block(enclosing_try, handler_entry)
+            .expect("handler entry ownership");
+
+        let analysis = ExceptionAnalysis::default();
+        let representatives = BTreeMap::new();
+        let builder = ExceptionRegionTreeBuilder::new(
+            &analysis,
+            &cfg,
+            &facts,
+            &cfg,
+            &facts,
+            &representatives,
+            tree,
+        );
+
+        assert_eq!(
+            builder
+                .handler_component(
+                    handler_entry,
+                    &BTreeSet::from([method_entry, handler_entry, suffix]),
+                    true,
+                )
+                .expect("handler component"),
+            BTreeSet::from([handler_entry, suffix])
+        );
+
+        assert_eq!(
+            builder
+                .handler_component(
+                    handler_entry,
+                    &BTreeSet::from([handler_entry, suffix]),
+                    false,
+                )
+                .expect("cleanup component"),
+            BTreeSet::from([handler_entry])
+        );
     }
 
     #[test]

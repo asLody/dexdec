@@ -3407,18 +3407,59 @@ struct HandlerContinuation<'a> {
 struct HandlerAdapterEffects;
 
 impl HandlerAdapterEffects {
-    fn is_transparent(block: &super::Block, exception_flow: &BTreeSet<SsaVar>) -> bool {
-        block.insns.iter().all(|instruction| {
+    fn is_transparent(
+        block: &super::Block,
+        successor: &super::Block,
+        exception_flow: &BTreeSet<SsaVar>,
+    ) -> bool {
+        let exception_phis = block
+            .insns
+            .iter()
+            .filter(|instruction| instruction.insn_type == InsnType::Phi)
+            .filter_map(|instruction| instruction.result.as_ref().and_then(SsaVar::from_reg))
+            .filter(|result| exception_flow.contains(result))
+            .collect::<BTreeSet<_>>();
+        let is_bookkeeping = block.insns.iter().all(|instruction| {
             let is_bookkeeping = InstructionEffects::is_ssa_bookkeeping(instruction)
                 || instruction.insn_type == InsnType::Const;
-            let carries_caught_exception = instruction.insn_type != InsnType::MoveException
-                && instruction
-                    .result
-                    .as_ref()
-                    .and_then(SsaVar::from_reg)
-                    .is_some_and(|result| exception_flow.contains(&result));
-            is_bookkeeping && !carries_caught_exception
-        })
+            let materializes_exception_state = !matches!(
+                instruction.insn_type,
+                InsnType::MoveException | InsnType::Phi
+            ) && instruction
+                .result
+                .as_ref()
+                .and_then(SsaVar::from_reg)
+                .is_some_and(|result| exception_flow.contains(&result));
+            is_bookkeeping && !materializes_exception_state
+        });
+        if !is_bookkeeping || exception_phis.is_empty() {
+            return is_bookkeeping;
+        }
+
+        // A terminal exception phi is the source-level catch binding and must anchor the
+        // handler.  A phi whose value is immediately re-merged by the semantic successor is
+        // only an SSA edge adapter, so it is safe to cross.
+        let forwards_exception = exception_phis.iter().all(|value| {
+            successor.insns.iter().any(|instruction| {
+                instruction.insn_type == InsnType::Phi
+                    && instruction
+                        .result
+                        .as_ref()
+                        .and_then(SsaVar::from_reg)
+                        .is_some_and(|result| exception_flow.contains(&result))
+                    && instruction
+                        .args
+                        .iter()
+                        .filter_map(InsnArg::as_register)
+                        .filter_map(SsaVar::from_reg)
+                        .any(|argument| argument == *value)
+            })
+        });
+        let reaches_semantics = successor.insns.iter().any(|instruction| {
+            !InstructionEffects::is_ssa_bookkeeping(instruction)
+                && instruction.insn_type != InsnType::Const
+        });
+        forwards_exception && reaches_semantics
     }
 }
 
@@ -3443,9 +3484,6 @@ impl<'a> HandlerContinuation<'a> {
             let Some(block) = self.cfg.block(current) else {
                 break;
             };
-            if !HandlerAdapterEffects::is_transparent(block, self.exception_flow) {
-                break;
-            }
             let successors = self
                 .cfg
                 .normal_successors(current)
@@ -3454,6 +3492,12 @@ impl<'a> HandlerContinuation<'a> {
             let [successor] = successors.as_slice() else {
                 break;
             };
+            let Some(successor_block) = self.cfg.block(*successor) else {
+                break;
+            };
+            if !HandlerAdapterEffects::is_transparent(block, successor_block, self.exception_flow) {
+                break;
+            }
             adapters.insert(current);
             current = *successor;
         }
@@ -3619,12 +3663,37 @@ impl HandlerDomains {
             .iter()
             .flat_map(|region| region.handlers.iter().map(|handler| handler.semantic_entry))
             .collect::<BTreeSet<_>>();
+        let mut handler_entry_owners = BTreeMap::<BlockId, BTreeSet<u32>>::new();
+        let mut bound_handler_entries = BTreeSet::new();
+        for region in regions {
+            for handler in &region.handlers {
+                handler_entry_owners
+                    .entry(handler.semantic_entry)
+                    .or_default()
+                    .insert(region.id);
+                if handler.exception_value.is_some() {
+                    bound_handler_entries.insert(handler.semantic_entry);
+                }
+            }
+        }
+        // DEX can share an exception-insensitive terminal body between handlers in
+        // different try ranges. Represent each clause as an empty catch that reaches
+        // the common continuation instead of giving one block two lexical owners.
+        let shared_handler_continuations = handler_entry_owners
+            .into_iter()
+            .filter_map(|(entry, owners)| {
+                (owners.len() > 1
+                    && !bound_handler_entries.contains(&entry)
+                    && cfg.normal_successors(entry).next().is_none())
+                .then_some(entry)
+            })
+            .collect::<BTreeSet<_>>();
         let physical_handler_entries = regions
             .iter()
             .flat_map(|region| &region.handlers)
             .flat_map(|handler| handler.entry_blocks.iter().copied())
             .collect::<BTreeSet<_>>();
-        let continuations = regions
+        let mut continuations = regions
             .iter()
             .flat_map(|region| {
                 region.handlers.iter().filter(|handler| {
@@ -3639,6 +3708,7 @@ impl HandlerDomains {
             })
             .map(|handler| handler.semantic_entry)
             .collect::<BTreeSet<_>>();
+        continuations.extend(shared_handler_continuations.iter().copied());
         let reachable = entries
             .iter()
             .copied()
@@ -3649,7 +3719,19 @@ impl HandlerDomains {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let descendants = Self::handler_descendants(regions, &entries, &reachable);
+        // A no-op catch can target a continuation shared with ordinary flow.
+        // Such a target is not an exception-only descendant of an enclosing
+        // handler. Keep handler-local continuations eligible for ownership.
+        let ordinary_continuations = continuations
+            .intersection(&ordinary)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let detached_continuations = ordinary_continuations
+            .union(&shared_handler_continuations)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let descendants =
+            Self::handler_descendants(regions, &entries, &detached_continuations, &reachable);
 
         regions
             .iter()
@@ -3815,6 +3897,7 @@ impl HandlerDomains {
     fn handler_descendants(
         regions: &[TryRegion],
         entries: &BTreeSet<BlockId>,
+        ordinary_continuations: &BTreeSet<BlockId>,
         reachable: &BTreeMap<BlockId, BTreeSet<BlockId>>,
     ) -> BTreeMap<BlockId, BTreeSet<BlockId>> {
         let mut descendants = entries
@@ -3836,7 +3919,9 @@ impl HandlerDomains {
                             .handlers
                             .iter()
                             .map(|handler| handler.semantic_entry)
-                            .filter(|entry| entry != outer),
+                            .filter(|entry| {
+                                entry != outer && !ordinary_continuations.contains(entry)
+                            }),
                     );
                 }
             }
@@ -4131,6 +4216,106 @@ mod tests {
     }
 
     #[test]
+    fn shared_noop_catch_continuation_is_not_inherited_by_outer_handler() {
+        let mut cfg = CFG::new("shared_noop_catch_continuation");
+        for block in 0..=7 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(6), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(6), BlockId::new(7), EdgeKind::Normal);
+
+        let mut regions = vec![
+            try_region(0, 1, 2, &[1], vec![catch_handler(2, &[2, 3, 6])]),
+            try_region(1, 3, 4, &[3], vec![catch_handler(6, &[6, 7])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert_eq!(
+            regions[0].handlers[0].lexical_blocks,
+            vec![BlockId::new(2), BlockId::new(3)]
+        );
+        assert_eq!(regions[1].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[1].handlers[0].continuation, Some(BlockId::new(6)));
+    }
+
+    #[test]
+    fn repeated_exception_terminal_becomes_shared_continuation() {
+        let mut cfg = CFG::new("repeated_exception_terminal");
+        for block in 0..=6 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(6), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Exception);
+
+        let mut regions = vec![
+            try_region(
+                0,
+                1,
+                2,
+                &[1],
+                vec![catch_handler(5, &[5]), catch_handler(3, &[3, 4, 5, 6])],
+            ),
+            try_region(1, 3, 5, &[3, 4], vec![catch_handler(5, &[5])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert_eq!(regions[0].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[0].handlers[0].continuation, Some(BlockId::new(5)));
+        assert_eq!(
+            regions[0].handlers[1].lexical_blocks,
+            vec![BlockId::new(3), BlockId::new(4), BlockId::new(6)]
+        );
+        assert_eq!(regions[1].handlers[0].lexical_blocks, Vec::new());
+        assert_eq!(regions[1].handlers[0].continuation, Some(BlockId::new(5)));
+    }
+
+    #[test]
+    fn repeated_nonterminal_handler_entry_remains_lexical() {
+        let mut cfg = CFG::new("repeated_nonterminal_handler_entry");
+        for block in 0..=6 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(5), BlockId::new(6), EdgeKind::Normal);
+
+        let mut regions = vec![
+            try_region(
+                0,
+                1,
+                2,
+                &[1],
+                vec![catch_handler(5, &[5, 6]), catch_handler(3, &[3, 4])],
+            ),
+            try_region(1, 3, 5, &[3, 4], vec![catch_handler(5, &[5, 6])]),
+        ];
+        HandlerDomains::assign(&cfg, &mut regions);
+
+        assert!(regions[0].handlers[0]
+            .lexical_blocks
+            .contains(&BlockId::new(5)));
+        assert_ne!(regions[0].handlers[0].continuation, Some(BlockId::new(5)));
+        assert!(regions[1].handlers[0]
+            .lexical_blocks
+            .contains(&BlockId::new(5)));
+        assert_ne!(regions[1].handlers[0].continuation, Some(BlockId::new(5)));
+    }
+
+    #[test]
     fn detached_preceding_handler_is_not_owned_by_adjacent_try() {
         let mut cfg = CFG::new("adjacent_handler_protection");
         for block in 0..=4 {
@@ -4277,6 +4462,84 @@ mod tests {
             SsaVar::from_reg(&caught).expect("caught SSA value"),
             SsaVar::from_reg(&state).expect("state SSA value"),
         ]);
+        let continuation =
+            HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
+
+        assert_eq!(continuation.entry, BlockId::new(1));
+        assert_eq!(continuation.adapters, BTreeSet::from([BlockId::new(0)]));
+    }
+
+    #[test]
+    fn handler_adapter_crosses_forwarded_exception_phi() {
+        let mut cfg = CFG::new("handler_exception_phi");
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let merged = RegisterArg::new_ssa(0, 1, ArgType::throwable());
+        let canonical = RegisterArg::new_ssa(0, 2, ArgType::throwable());
+
+        let mut entry = Block::new(0);
+        entry.push(InsnNode::move_exception(caught.clone()));
+        cfg.add_block(entry);
+
+        let mut adapter = Block::new(1);
+        adapter.push(InsnNode::phi(
+            merged.clone(),
+            vec![(0, InsnArg::Reg(caught.clone()))],
+        ));
+        cfg.add_block(adapter);
+
+        let mut body = Block::new(2);
+        body.push(InsnNode::phi(
+            canonical.clone(),
+            vec![(1, InsnArg::Reg(merged.clone()))],
+        ));
+        body.push(InsnNode::new(InsnType::Invoke, 2));
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+
+        let domain = BTreeSet::from([BlockId::new(0), BlockId::new(1), BlockId::new(2)]);
+        let exception_flow = [caught, merged, canonical]
+            .iter()
+            .filter_map(SsaVar::from_reg)
+            .collect::<BTreeSet<_>>();
+        let continuation =
+            HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
+
+        assert_eq!(continuation.entry, BlockId::new(2));
+        assert_eq!(
+            continuation.adapters,
+            BTreeSet::from([BlockId::new(0), BlockId::new(1)])
+        );
+    }
+
+    #[test]
+    fn handler_adapter_stops_at_terminal_exception_phi() {
+        let mut cfg = CFG::new("handler_terminal_exception_phi");
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let merged = RegisterArg::new_ssa(0, 1, ArgType::throwable());
+
+        let mut entry = Block::new(0);
+        entry.push(InsnNode::move_exception(caught.clone()));
+        cfg.add_block(entry);
+
+        let mut binding = Block::new(1);
+        binding.push(InsnNode::phi(
+            merged.clone(),
+            vec![(0, InsnArg::Reg(caught.clone()))],
+        ));
+        cfg.add_block(binding);
+
+        let mut body = Block::new(2);
+        body.push(InsnNode::new(InsnType::Invoke, 1));
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+
+        let domain = BTreeSet::from([BlockId::new(0), BlockId::new(1), BlockId::new(2)]);
+        let exception_flow = [caught, merged]
+            .iter()
+            .filter_map(SsaVar::from_reg)
+            .collect::<BTreeSet<_>>();
         let continuation =
             HandlerContinuation::new(&cfg, &domain, &exception_flow).from(BlockId::new(0));
 

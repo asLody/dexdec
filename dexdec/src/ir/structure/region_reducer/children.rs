@@ -445,7 +445,8 @@ impl<'a> ChildCompletion<'a> {
                             scope: self.owner,
                             target: self.follow,
                         })?;
-                self.scope.continuation(self.cfg, edge.target)
+                self.scope
+                    .continuation(self.cfg, self.completion_destination(edge.target))
             })
             .collect::<Result<BTreeSet<_>, StructureError>>()?;
         if local_targets.len() == 1 {
@@ -501,13 +502,25 @@ impl<'a> ChildCompletion<'a> {
                 continue;
             }
             if resolved.leave.edge.is_some_and(|edge| {
-                self.scope.control_continuation(edge.target)
-                    == self.scope.control_continuation(self.follow)
+                self.completion_destination(edge.target) == self.completion_destination(self.follow)
             }) {
                 exits.push(resolved.clone());
             }
         }
         Ok(exits)
+    }
+
+    fn completion_destination(&self, block: BlockId) -> BlockId {
+        // Cleanup predecessors may be preserved as physical Phi-copy anchors,
+        // but they still denote the same control destination as the cleanup
+        // completion. Compare that semantic destination without erasing the
+        // anchors needed by later out-of-SSA lowering.
+        let continuation = self.graph.control_continuation(block);
+        let continuation = self
+            .graph
+            .cleanup_representative(continuation)
+            .unwrap_or(continuation);
+        self.graph.control_continuation(continuation)
     }
 }
 

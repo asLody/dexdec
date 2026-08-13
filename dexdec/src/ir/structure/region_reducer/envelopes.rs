@@ -837,15 +837,26 @@ impl ExceptionEnvelope {
     }
 
     fn can_wrap(&self, node: &SemanticNode) -> bool {
-        let bindings = LabelBindings::collect(node);
-        if bindings.is_empty() {
-            return true;
-        }
-        self.label_dependencies().is_disjoint(&bindings)
+        self.label_dependencies()
+            .is_disjoint(&LabelBindings::collect(node))
+            && self
+                .control_dependencies()
+                .is_disjoint(&ControlBindings::collect(node))
     }
 
     fn label_dependencies(&self) -> BTreeSet<SemanticLabel> {
         let mut dependencies = FreeLabelDependencies::default();
+        for catch in &self.catches {
+            dependencies.visit_node(&catch.body);
+        }
+        if let Some(finally) = &self.finally {
+            dependencies.visit_node(&finally.body);
+        }
+        dependencies.free
+    }
+
+    fn control_dependencies(&self) -> BTreeSet<RegionId> {
+        let mut dependencies = FreeControlDependencies::default();
         for catch in &self.catches {
             dependencies.visit_node(&catch.body);
         }
@@ -953,6 +964,82 @@ impl SemanticVisitor for FreeLabelDependencies {
     }
 }
 
+#[derive(Default)]
+struct ControlBindings {
+    regions: BTreeSet<RegionId>,
+}
+
+impl ControlBindings {
+    fn collect(node: &SemanticNode) -> BTreeSet<RegionId> {
+        let mut bindings = Self::default();
+        bindings.visit_node(node);
+        bindings.regions
+    }
+
+    fn binding(node: &SemanticNode) -> Option<RegionId> {
+        match node {
+            SemanticNode::Loop {
+                control: SemanticLoopControl::Region(region),
+                ..
+            }
+            | SemanticNode::For {
+                control: SemanticLoopControl::Region(region),
+                ..
+            }
+            | SemanticNode::ForEach {
+                control: SemanticLoopControl::Region(region),
+                ..
+            } => Some(*region),
+            SemanticNode::Switch { region, .. } => *region,
+            _ => None,
+        }
+    }
+}
+
+impl SemanticVisitor for ControlBindings {
+    fn enter_node(&mut self, node: &SemanticNode) {
+        if let Some(region) = Self::binding(node) {
+            self.regions.insert(region);
+        }
+    }
+}
+
+#[derive(Default)]
+struct FreeControlDependencies {
+    active: BTreeMap<RegionId, usize>,
+    free: BTreeSet<RegionId>,
+}
+
+impl SemanticVisitor for FreeControlDependencies {
+    fn enter_node(&mut self, node: &SemanticNode) {
+        if let Some(region) = ControlBindings::binding(node) {
+            *self.active.entry(region).or_default() += 1;
+        }
+        if let SemanticNode::Leave(leave) = node {
+            if matches!(
+                leave.kind,
+                SemanticLeaveKind::Break | SemanticLeaveKind::Continue
+            ) && !self.active.contains_key(&leave.target)
+            {
+                self.free.insert(leave.target);
+            }
+        }
+    }
+
+    fn exit_node(&mut self, node: &SemanticNode) {
+        let Some(region) = ControlBindings::binding(node) else {
+            return;
+        };
+        let Some(depth) = self.active.get_mut(&region) else {
+            return;
+        };
+        *depth -= 1;
+        if *depth == 0 {
+            self.active.remove(&region);
+        }
+    }
+}
+
 struct SynchronizedEnvelopePlacement {
     region: RegionId,
     envelope: Option<ExceptionEnvelope>,
@@ -1009,5 +1096,75 @@ impl EnvelopeSet {
             Self::One(current) if current.same_shape(&incoming) => {}
             Self::One(_) | Self::Conflict => *self = Self::Conflict,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{SemanticLeave, SemanticLoopKind, SemanticLoopTest, SemanticPredicate};
+
+    fn control_leave(region: RegionId, kind: SemanticLeaveKind) -> SemanticNode {
+        SemanticNode::Leave(SemanticLeave {
+            site: None,
+            condition: None,
+            kind,
+            edge: None,
+            origin: None,
+            source: region,
+            destination: region,
+            target: region,
+            cleanup: Vec::new(),
+        })
+    }
+
+    fn loop_node(region: RegionId, body: SemanticNode) -> SemanticNode {
+        SemanticNode::Loop {
+            control: SemanticLoopControl::Region(region),
+            header: None,
+            kind: SemanticLoopKind::Endless,
+            test: SemanticLoopTest::pure(SemanticPredicate::True),
+            body: Box::new(body),
+        }
+    }
+
+    fn envelope(handler: RegionId, body: SemanticNode) -> ExceptionEnvelope {
+        ExceptionEnvelope {
+            catches: vec![SemanticCatch {
+                region: handler,
+                exception_types: Vec::new(),
+                exception_value: None,
+                body,
+            }],
+            finally: None,
+        }
+    }
+
+    #[test]
+    fn envelope_does_not_cross_handler_control_dependency() {
+        let loop_region = RegionId::new(1);
+        let handler_region = RegionId::new(2);
+        let envelope = envelope(
+            handler_region,
+            control_leave(loop_region, SemanticLeaveKind::Break),
+        );
+
+        assert!(!envelope.can_wrap(&loop_node(loop_region, SemanticNode::Empty)));
+        assert!(envelope.can_wrap(&loop_node(RegionId::new(3), SemanticNode::Empty,)));
+    }
+
+    #[test]
+    fn locally_bound_handler_control_is_not_a_free_dependency() {
+        let loop_region = RegionId::new(1);
+        let handler_region = RegionId::new(2);
+        let envelope = envelope(
+            handler_region,
+            loop_node(
+                loop_region,
+                control_leave(loop_region, SemanticLeaveKind::Continue),
+            ),
+        );
+
+        assert!(envelope.can_wrap(&loop_node(loop_region, SemanticNode::Empty)));
     }
 }

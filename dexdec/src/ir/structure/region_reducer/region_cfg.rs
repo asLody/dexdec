@@ -683,7 +683,10 @@ impl<'a> RegionCfgBuilder<'a> {
 
     pub(super) fn build(self) -> Result<RegionCfg, StructureError> {
         let mut layout = self.scope.layout(self.cfg)?;
-        if let Some(entry) = self.entry {
+        let entry = self
+            .entry
+            .or_else(|| Self::unique_detached_entry(self.cfg, &layout));
+        if let Some(entry) = entry {
             layout.preserve(entry);
         }
         let origin_sensitive_boundaries = self.scope.anchors.phi_copy_blocks().clone();
@@ -697,12 +700,49 @@ impl<'a> RegionCfgBuilder<'a> {
         if state.layout.representatives.is_empty() {
             return Ok(state.finish());
         }
-        let entry = self
-            .entry
-            .ok_or(StructureError::MissingEntry(self.region))?;
+        let entry = entry.ok_or(StructureError::MissingEntry(self.region))?;
         state.connect_source_edges(self.cfg, self.regions, self.region, entry, self.entry_cuts)?;
         state.connect_child_flows(self.child_flows, entry, self.entry_cuts)?;
         Ok(state.finish())
+    }
+
+    /// An entryless handler can still contain lexical work when its complete
+    /// body is partitioned into nested try fragments. Recover the detached
+    /// source order only when the quotient graph has one unambiguous root.
+    fn unique_detached_entry(cfg: &CFG, layout: &RegionLayout) -> Option<BlockId> {
+        let mut candidates = layout.representatives.clone();
+        let mut successors = layout
+            .representatives
+            .iter()
+            .copied()
+            .map(|block| (block, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        for source in cfg.block_ids() {
+            let Some(from) = layout.mapping.get(&source).copied() else {
+                continue;
+            };
+            for target in cfg.normal_successors(source) {
+                let Some(to) = layout.mapping.get(&target).copied() else {
+                    continue;
+                };
+                if from != to {
+                    candidates.remove(&to);
+                    successors.entry(from).or_default().insert(to);
+                }
+            }
+        }
+        let mut candidates = candidates.into_iter();
+        let (Some(entry), None) = (candidates.next(), candidates.next()) else {
+            return None;
+        };
+        let mut reached = BTreeSet::new();
+        let mut pending = vec![entry];
+        while let Some(block) = pending.pop() {
+            if reached.insert(block) {
+                pending.extend(successors.get(&block).into_iter().flatten().copied());
+            }
+        }
+        (reached == layout.representatives).then_some(entry)
     }
 }
 
@@ -1145,8 +1185,72 @@ impl BoundaryValueKey {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{BoundaryExitKey, BoundaryValueKey, RegionCfg, RegionEntryPorts};
-    use crate::ir::{ArgType, BlockId, CatchRegion, InsnArg, RegionExit, RegionKind, RegionTree};
+    use super::{
+        BoundaryExitKey, BoundaryValueKey, RegionCfg, RegionCfgBuilder, RegionEntryPorts,
+        RegionLayout,
+    };
+    use crate::ir::{
+        ArgType, Block, BlockId, CatchRegion, EdgeKind, InsnArg, RegionExit, RegionKind,
+        RegionTree, CFG,
+    };
+
+    #[test]
+    fn detached_layout_recovers_only_a_unique_normal_root() {
+        let mut cfg = CFG::new("detached_handler");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(4), BlockId::new(3), EdgeKind::Normal);
+        let layout = RegionLayout {
+            mapping: BTreeMap::from([
+                (BlockId::new(0), BlockId::new(0)),
+                (BlockId::new(1), BlockId::new(1)),
+            ]),
+            representatives: BTreeSet::from([BlockId::new(0), BlockId::new(1)]),
+            child_entries: BTreeSet::new(),
+        };
+
+        assert_eq!(
+            RegionCfgBuilder::unique_detached_entry(&cfg, &layout),
+            Some(BlockId::new(0))
+        );
+
+        let ambiguous = RegionLayout {
+            mapping: BTreeMap::from([
+                (BlockId::new(0), BlockId::new(0)),
+                (BlockId::new(2), BlockId::new(2)),
+            ]),
+            representatives: BTreeSet::from([BlockId::new(0), BlockId::new(2)]),
+            child_entries: BTreeSet::new(),
+        };
+        assert_eq!(
+            RegionCfgBuilder::unique_detached_entry(&cfg, &ambiguous),
+            None
+        );
+
+        let disconnected_cycle = RegionLayout {
+            mapping: BTreeMap::from([
+                (BlockId::new(0), BlockId::new(0)),
+                (BlockId::new(1), BlockId::new(1)),
+                (BlockId::new(3), BlockId::new(3)),
+                (BlockId::new(4), BlockId::new(4)),
+            ]),
+            representatives: BTreeSet::from([
+                BlockId::new(0),
+                BlockId::new(1),
+                BlockId::new(3),
+                BlockId::new(4),
+            ]),
+            child_entries: BTreeSet::new(),
+        };
+        assert_eq!(
+            RegionCfgBuilder::unique_detached_entry(&cfg, &disconnected_cycle),
+            None
+        );
+    }
 
     #[test]
     fn return_boundaries_include_their_ssa_value() {

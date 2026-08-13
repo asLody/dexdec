@@ -842,19 +842,53 @@ impl ExceptionHandlerPort {
         contractions: &ControlContractions,
         regions: &RegionGraph,
     ) -> Option<Self> {
-        Self::at(ingress, regions)
+        Self::at_or_detached(ingress, regions)
             .or_else(|| {
                 regions
                     .handler_adapters()
                     .get(&ingress)
-                    .and_then(|entry| Self::at(*entry, regions))
+                    .and_then(|entry| Self::at_or_detached(*entry, regions))
             })
             .or_else(|| {
                 contractions
                     .terminal(ingress)
                     .filter(|terminal| *terminal != ingress)
-                    .and_then(|terminal| Self::at(terminal, regions))
+                    .and_then(|terminal| Self::at_or_detached(terminal, regions))
             })
+    }
+
+    fn at_or_detached(block: BlockId, regions: &RegionGraph) -> Option<Self> {
+        Self::at(block, regions).or_else(|| {
+            Self::detached_continuation(
+                block,
+                regions.tree(),
+                regions
+                    .tree()
+                    .regions()
+                    .filter(|region| regions.is_exception_handler(region.id))
+                    .map(|region| region.id),
+            )
+        })
+    }
+
+    /// Resolve an empty handler whose physical entry is also an ordinary CFG
+    /// continuation. Such handlers cannot own the shared block lexically, so
+    /// region recovery records it as the handler continuation instead.
+    fn detached_continuation(
+        block: BlockId,
+        tree: &crate::ir::RegionTree,
+        handlers: impl IntoIterator<Item = RegionId>,
+    ) -> Option<Self> {
+        let mut matches = handlers.into_iter().filter(|handler| {
+            tree.region(*handler).is_some_and(|region| {
+                region.entry.is_none() && region.kind.continuation() == Some(block)
+            })
+        });
+        let region = matches.next()?;
+        matches.next().is_none().then_some(Self {
+            region,
+            entry: block,
+        })
     }
 
     fn at(block: BlockId, regions: &RegionGraph) -> Option<Self> {
@@ -1044,19 +1078,25 @@ impl SplitEdgeBlock {
     }
 }
 
-/// Repositions path-invariant copies from a physical exception ingress that
-/// structural recovery absorbs into a handler port.
+/// Repositions copies from a physical exception ingress that structural
+/// recovery absorbs into a handler port.
 ///
 /// This is critical-edge splitting in reverse: a copy may be evaluated at
-/// each throwing predecessor when the ingress has no normal predecessor, the
-/// copy source is path independent, and the physical block has no surviving
-/// semantic identity. Later liveness analysis spills the value when evaluating
-/// it on the predecessor would clobber a normal-path variable.
+/// each throwing predecessor when the ingress has no normal predecessor and
+/// the physical block has no surviving semantic identity. Path-invariant
+/// sources can be cloned directly. Register sources must resolve to an
+/// available value for every exceptional edge, selecting the ingress Phi input
+/// when necessary. Later liveness analysis spills the value when evaluating it
+/// on the predecessor would clobber a normal path.
 struct ExceptionalIngressCopyPlacement<'a> {
     cfg: &'a CFG,
     semantic_blocks: BTreeSet<BlockId>,
     contractions: &'a ControlContractions,
     regions: &'a RegionGraph,
+    values: &'a SsaValueGraph,
+    materialized: &'a BTreeSet<SsaVar>,
+    required_phis: &'a BTreeSet<SsaVar>,
+    constants: &'a BTreeMap<SsaVar, InsnArg>,
 }
 
 impl<'a> ExceptionalIngressCopyPlacement<'a> {
@@ -1065,16 +1105,26 @@ impl<'a> ExceptionalIngressCopyPlacement<'a> {
         semantic: &SemanticNode,
         contractions: &'a ControlContractions,
         regions: &'a RegionGraph,
+        values: &'a SsaValueGraph,
+        materialized: &'a BTreeSet<SsaVar>,
+        required_phis: &'a BTreeSet<SsaVar>,
+        constants: &'a BTreeMap<SsaVar, InsnArg>,
     ) -> Self {
         Self {
             cfg,
             semantic_blocks: SemanticBlocks::collect(semantic),
             contractions,
             regions,
+            values,
+            materialized,
+            required_phis,
+            constants,
         }
     }
 
     fn apply(&self, copies: &mut CollectedPhiCopies) {
+        let available = Self::available_values(self.materialized, self.required_phis);
+        let resolver = SsaCopyResolver::new(self.cfg, self.values, &available);
         let ingresses = copies
             .normal
             .keys()
@@ -1092,29 +1142,56 @@ impl<'a> ExceptionalIngressCopyPlacement<'a> {
                 continue;
             }
             let site = NormalCopySite::Block(ingress);
-            let Some(block_copies) = copies.normal.get_mut(&site) else {
+            let Some(block_copies) = copies.normal.remove(&site) else {
                 continue;
             };
-            let (lifted, retained): (Vec<_>, Vec<_>) = std::mem::take(block_copies)
-                .into_iter()
-                .partition(|copy| Self::is_path_invariant(&copy.source));
-            *block_copies = retained;
-            if lifted.is_empty() {
-                continue;
-            }
             let handler = ExceptionHandlerTarget::resolve(ingress, self.contractions, self.regions);
-            for (predecessor, _) in incoming {
-                copies
-                    .exceptional
-                    .entry(ExceptionalEdge {
-                        predecessor,
-                        handler,
-                    })
-                    .or_default()
-                    .extend(lifted.iter().cloned());
+            let mut retained = Vec::new();
+            for copy in block_copies {
+                let sources = if Self::is_path_invariant(&copy.source) {
+                    Some(vec![copy.source.clone(); incoming.len()])
+                } else {
+                    incoming
+                        .iter()
+                        .map(|(predecessor, kind)| {
+                            resolver.resolve_for_edge(
+                                copy.source.clone(),
+                                *predecessor,
+                                *kind,
+                                self.constants,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                };
+                let Some(sources) = sources else {
+                    retained.push(copy);
+                    continue;
+                };
+                for ((predecessor, _), source) in incoming.iter().zip(sources) {
+                    copies
+                        .exceptional
+                        .entry(ExceptionalEdge {
+                            predecessor: *predecessor,
+                            handler,
+                        })
+                        .or_default()
+                        .push(EdgeCopy {
+                            destination: copy.destination.clone(),
+                            source,
+                        });
+                }
+            }
+            if !retained.is_empty() {
+                copies.normal.insert(site, retained);
             }
         }
-        copies.normal.retain(|_, copies| !copies.is_empty());
+    }
+
+    fn available_values(
+        materialized: &BTreeSet<SsaVar>,
+        required_phis: &BTreeSet<SsaVar>,
+    ) -> BTreeSet<SsaVar> {
+        materialized.union(required_phis).copied().collect()
     }
 
     fn is_path_invariant(source: &InsnArg) -> bool {
@@ -1132,9 +1209,12 @@ pub(super) struct ExceptionalCopyPlacement<'a> {
     variables: &'a CodeVariables,
     liveness: &'a SsaLiveness,
     statement_definitions: &'a BTreeSet<SsaVar>,
+    required_phis: &'a BTreeSet<SsaVar>,
     semantic: &'a SemanticNode,
     contractions: &'a ControlContractions,
     regions: &'a RegionGraph,
+    values: &'a SsaValueGraph,
+    constants: &'a BTreeMap<SsaVar, InsnArg>,
 }
 
 impl<'a> ExceptionalCopyPlacement<'a> {
@@ -1143,18 +1223,24 @@ impl<'a> ExceptionalCopyPlacement<'a> {
         variables: &'a CodeVariables,
         liveness: &'a SsaLiveness,
         statement_definitions: &'a BTreeSet<SsaVar>,
+        required_phis: &'a BTreeSet<SsaVar>,
         semantic: &'a SemanticNode,
         contractions: &'a ControlContractions,
         regions: &'a RegionGraph,
+        values: &'a SsaValueGraph,
+        constants: &'a BTreeMap<SsaVar, InsnArg>,
     ) -> Self {
         Self {
             cfg,
             variables,
             liveness,
             statement_definitions,
+            required_phis,
             semantic,
             contractions,
             regions,
+            values,
+            constants,
         }
     }
 
@@ -1169,6 +1255,10 @@ impl<'a> ExceptionalCopyPlacement<'a> {
             self.semantic,
             self.contractions,
             self.regions,
+            self.values,
+            self.statement_definitions,
+            self.required_phis,
+            self.constants,
         )
         .apply(&mut copies);
         let exceptional_effects = self.exceptional_effects(&copies.exceptional)?;
@@ -2566,13 +2656,72 @@ mod tests {
     use super::*;
     use crate::ir::analysis::ClassHierarchyIndex;
     use crate::ir::{
-        Block, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, SemanticExpression,
+        Block, CatchRegion, EdgeKind, InsnNode, InsnType, LiteralArg, RegionEdge, RegionKind,
+        RegionTree, SemanticExpression,
     };
 
     fn source_variable(register: u32, version: u32, variable: u32) -> RegisterArg {
         let mut value = RegisterArg::new_ssa(register, version, ArgType::INT);
         value.code_var = Some(variable);
         value
+    }
+
+    #[test]
+    fn detached_handler_continuation_is_an_exception_port() {
+        let continuation = BlockId::new(7);
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let protected = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(6)))
+            .expect("try region");
+        let handler = tree
+            .add_child(
+                protected,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::throwable()],
+                    exception_value: None,
+                    continuation: Some(continuation),
+                }),
+                None,
+            )
+            .expect("detached handler");
+
+        assert_eq!(
+            ExceptionHandlerPort::detached_continuation(continuation, &tree, [handler]),
+            Some(ExceptionHandlerPort {
+                region: handler,
+                entry: continuation,
+            })
+        );
+    }
+
+    #[test]
+    fn ambiguous_detached_handler_continuation_is_not_selected() {
+        let continuation = BlockId::new(7);
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let protected = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(6)))
+            .expect("try region");
+        let handler = |tree: &mut RegionTree| {
+            tree.add_child(
+                protected,
+                RegionKind::Catch(CatchRegion {
+                    exception_types: vec![ArgType::throwable()],
+                    exception_value: None,
+                    continuation: Some(continuation),
+                }),
+                None,
+            )
+            .expect("detached handler")
+        };
+        let left = handler(&mut tree);
+        let right = handler(&mut tree);
+
+        assert_eq!(
+            ExceptionHandlerPort::detached_continuation(continuation, &tree, [left, right]),
+            None
+        );
     }
 
     #[test]
@@ -2700,6 +2849,51 @@ mod tests {
                 &BTreeMap::new(),
             )
             .is_none());
+    }
+
+    #[test]
+    fn exceptional_ingress_accepts_a_required_dominating_phi() {
+        let entry = BlockId::new(0);
+        let phi_block = BlockId::new(1);
+        let predecessor = BlockId::new(2);
+        let handler = BlockId::new(3);
+        let input = source_variable(0, 0, 1);
+        let phi_result = source_variable(0, 1, 7);
+        let phi_value = SsaVar::from_reg(&phi_result).expect("phi SSA value");
+
+        let mut cfg = CFG::new("required_dominating_exception_phi");
+        cfg.entry = entry;
+        let mut entry_body = Block::new(entry);
+        entry_body.push(InsnNode::const_value(input.clone(), 1));
+        cfg.add_block(entry_body);
+        let mut phi_body = Block::new(phi_block);
+        phi_body.push(InsnNode::phi(
+            phi_result.clone(),
+            vec![(entry.raw(), InsnArg::Reg(input))],
+        ));
+        cfg.add_block(phi_body);
+        cfg.add_block(Block::new(predecessor));
+        cfg.add_block(Block::new(handler));
+        cfg.add_edge(entry, phi_block, EdgeKind::Normal);
+        cfg.add_edge(phi_block, predecessor, EdgeKind::Normal);
+        cfg.add_edge(predecessor, handler, EdgeKind::Exception);
+
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let available = ExceptionalIngressCopyPlacement::available_values(
+            &BTreeSet::new(),
+            &BTreeSet::from([phi_value]),
+        );
+        let resolver = SsaCopyResolver::new(&cfg, &values, &available);
+        let resolved = resolver
+            .resolve_for_edge(
+                InsnArg::Reg(phi_result.clone()),
+                predecessor,
+                EdgeKind::Exception,
+                &BTreeMap::new(),
+            )
+            .expect("required Phi is materialized by Phi lowering");
+
+        assert!(same_value(&resolved, &InsnArg::Reg(phi_result)));
     }
 
     fn normal_copies() -> NormalCopies {

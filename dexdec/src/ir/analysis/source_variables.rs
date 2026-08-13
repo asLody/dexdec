@@ -235,9 +235,12 @@ impl SourceVariableAllocation {
             &self.variables,
             &self.liveness,
             &self.statement_definitions,
+            &self.required_phis,
             method.body(),
             &self.contractions,
             method.state().regions(),
+            method.state().values(),
+            method.state().constants(),
         )
         .verify(copies)?;
         let mut source_types = SourceTypeEnvironment::from_ssa(
