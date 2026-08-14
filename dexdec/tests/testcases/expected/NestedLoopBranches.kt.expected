@@ -12,15 +12,13 @@ public open class NestedLoopBranches {
                         if (step == p2) {
                             return total + step
                         }
-                        val v16: Int = step % 2
-                        if (v16 != 0) {
+                        if (step % 2 != 0) {
                             total += step
+                            if (total > 1000) {
+                                break
+                            }
                         }
-                        if (v16 == 0 || total <= 1000) {
-                            index2++
-                            continue
-                        }
-                        break
+                        index2++
                     }
                     if (total > 1000) {
                         return total

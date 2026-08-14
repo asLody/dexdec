@@ -10,10 +10,10 @@ public open class ComplexControlFlow {
                     return 10
                 }
                 val v2: Int = p0 + 1
-                p0 = v2
                 if (v2 >= 5) {
                     return v2
                 }
+                p0 = v2
             }
         }
 

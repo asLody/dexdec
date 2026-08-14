@@ -17,11 +17,18 @@ public open class SynchronizedAdvanced {
             var index: Int = 0
             var remaining: Int = 0
             while (index < values!!.size) {
-                synchronized(SynchronizedAdvanced.lock1!!) {
+                val lock1: Any? = SynchronizedAdvanced.lock1
+                var condition: Boolean = false
+                synchronized(lock1!!) {
+                    var step: Int = 0
                     try {
-                        remaining += 10 / values[index]
+                        step = 10 / values[index]
                     } catch (exception: ArithmeticException) {
                         remaining--
+                        condition = true
+                    }
+                    if (!condition) {
+                        remaining += step
                     }
                 }
                 index++
@@ -77,6 +84,8 @@ public open class SynchronizedAdvanced {
                 var result: Int = 0
                 while (p0 > 0) {
                     val v5: Int = p0 / 2
+                    p0 = v5
+                    p0 = v5
                     result++
                     p0 = v5
                 }
@@ -88,7 +97,10 @@ public open class SynchronizedAdvanced {
             synchronized(SynchronizedAdvanced.lock1!!) {
                 var index: Int = 0
                 var result: Int = 0
-                while (index < values!!.size && values[index] >= 0) {
+                while (index < values!!.size) {
+                    if (values[index] < 0) {
+                        return result
+                    }
                     val v6: Int = result + values[index]
                     index++
                     result = v6
@@ -124,6 +136,7 @@ public open class SynchronizedAdvanced {
                     result = 100 / p0
                 } catch (exception: ArithmeticException) {
                     result = -1
+                    return result
                 } finally {
                     SynchronizedAdvanced.value = 0
                 }
@@ -132,8 +145,8 @@ public open class SynchronizedAdvanced {
         }
 
         public fun syncWithSwitch(p0: Int): Int {
+            var result: Int = 0
             synchronized(SynchronizedAdvanced.lock1!!) {
-                var result: Int = 0
                 when (p0) {
                     1 -> {
                         result = 10
@@ -147,8 +160,8 @@ public open class SynchronizedAdvanced {
                     else -> {
                     }
                 }
-                return result
             }
+            return result
         }
     }
 }

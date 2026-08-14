@@ -533,7 +533,7 @@ where
                             .iter()
                             .map(|value| JavaExpr::Literal(JavaLiteral::Integer(*value)))
                             .collect(),
-                        body: Self::block_statements(body),
+                        body: switch_case_body(region, body),
                         is_default: case.is_default,
                     })
                     .collect(),
@@ -619,6 +619,18 @@ where
             .next()
             .ok_or_else(|| JavaStructuralError::MalformedWorkStack.into())
     }
+}
+
+fn switch_case_body(region: Option<crate::ir::RegionId>, body: JavaStmt) -> Vec<JavaStmt> {
+    let mut statements = match body {
+        JavaStmt::Block(statements) => statements,
+        JavaStmt::Empty => Vec::new(),
+        other => vec![other],
+    };
+    if region.is_none() && super::normalize::statements_can_complete_normally(&statements) {
+        statements.push(JavaStmt::Break(None));
+    }
+    statements
 }
 
 enum BoundLoopCondition {
@@ -776,5 +788,29 @@ impl LowerFrame<'_> {
                 has_finally,
             } => 1 + catches.len() + usize::from(*has_finally),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_dispatch_switch_cases_end_before_the_next_case() {
+        assert_eq!(
+            switch_case_body(None, JavaStmt::Empty),
+            vec![JavaStmt::Break(None)]
+        );
+    }
+
+    #[test]
+    fn structured_switch_cases_keep_explicit_fallthrough() {
+        assert!(switch_case_body(Some(crate::ir::RegionId::new(1)), JavaStmt::Empty).is_empty());
+    }
+
+    #[test]
+    fn anonymous_dispatch_switch_does_not_append_an_unreachable_break() {
+        let body = JavaStmt::Return(None);
+        assert_eq!(switch_case_body(None, body.clone()), vec![body]);
     }
 }

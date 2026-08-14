@@ -536,6 +536,10 @@ impl JavaAstNormalizer {
 
 struct TerminalBranchLinearizer;
 
+pub(super) fn statements_can_complete_normally(statements: &[JavaStmt]) -> bool {
+    TerminalBranchLinearizer::sequence_can_complete_normally(statements)
+}
+
 impl TerminalBranchLinearizer {
     const NESTING_PENALTY: usize = 12;
 

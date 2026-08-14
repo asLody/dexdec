@@ -99,29 +99,28 @@ public open class HardcoreControlFlow {
                     if (element == -1) {
                         return total
                     }
-                    if (element == -2 || element == -3) {
+                    if (element == -2) {
                         break
                     }
-                    if (element <= 100) {
-                        total += element
-                        index2++
-                        continue
+                    if (element == -3) {
+                        break
                     }
-                    var step: Int = 0
-                    while (step < element) {
-                        if (step * index2 > 1000) {
-                            total += step
-                            condition = true
+                    if (element > 100) {
+                        var step: Int = 0
+                        while (step < element) {
+                            if (step * index2 > 1000) {
+                                total += step
+                                condition = true
+                                break
+                            }
+                            step++
+                        }
+                        if (condition) {
                             break
                         }
-                        step++
-                    }
-                    if (condition) {
-                        break
                     }
                     total += element
                     index2++
-                    continue
                 }
             }
             index++

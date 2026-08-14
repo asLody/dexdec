@@ -410,24 +410,32 @@ impl<'a> RegionReducer<'a> {
         }
         for (block, leave) in &region_cfg.boundaries {
             let mut node = semantic.leave(leave)?;
-            if let Some(source) = leave
+            let mut anchor_blocks = leave
                 .leave
                 .source_block
+                .into_iter()
                 .filter(|source| self.anchors.phi_copy_blocks().contains(source))
+                .collect::<Vec<_>>();
+            if let Some(target) = leave
+                .leave
+                .edge
+                .map(|edge| edge.target)
+                .filter(|target| self.anchors.phi_copy_blocks().contains(target))
+                .filter(|target| !region_cfg.representatives.contains(target))
             {
-                node = Self::anchor_block(source, node);
+                anchor_blocks.push(target);
             }
-            seeded.insert(
-                *block,
-                match &leave.leave.exit {
-                    crate::ir::RegionExit::FallThrough(target)
-                        if self.anchors.phi_copy_blocks().contains(target) =>
-                    {
-                        Self::anchor_block(*target, node)
-                    }
-                    _ => node,
-                },
-            );
+            if let crate::ir::RegionExit::FallThrough(target) = &leave.leave.exit {
+                if self.anchors.phi_copy_blocks().contains(target) {
+                    anchor_blocks.push(*target);
+                }
+            }
+            let mut seen_anchors = BTreeSet::new();
+            anchor_blocks.retain(|anchor| seen_anchors.insert(*anchor));
+            for anchor in anchor_blocks.into_iter().rev() {
+                node = Self::anchor_block(anchor, node);
+            }
+            seeded.insert(*block, node);
         }
         for (block, target) in &region_cfg.entry_boundaries {
             let leave = SemanticNode::Leave(SemanticLeave {

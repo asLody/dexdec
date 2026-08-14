@@ -288,6 +288,8 @@ impl<'a> ValuePlanner<'a> {
     /// read, or call after both actions are composed. Applying producer leaves
     /// first preserves use cardinality and lets the next recovery stage rebuild
     /// domains, effects, and use-def facts before moving the expanded consumer.
+    /// A single lexical use in a loop is also a repeated dynamic use and may
+    /// not acquire an effect evaluated before that loop.
     fn retain_replacement_frontier(
         &self,
         actions: &mut Vec<ValueAction>,
@@ -336,22 +338,95 @@ impl<'a> ValuePlanner<'a> {
         if blocking_keys.is_empty() {
             return Ok(());
         }
+        let ssa_identity = self.graph().identity() == ValueIdentity::Ssa;
+        let mut deferred_keys = BTreeSet::new();
+        for action in actions.iter() {
+            let Some(key) = Self::replacement_key(action) else {
+                continue;
+            };
+            let mut dependencies = self.replacement_dependencies(action)?;
+            dependencies.remove(&key);
+            let crosses_repetition =
+                self.replacement_enters_repetition(key, &dependencies, &blocking_keys);
+            if (!ssa_identity || self.facts.uses_of(key).len() > 1 || crosses_repetition)
+                && !dependencies.is_disjoint(&blocking_keys)
+            {
+                deferred_keys.insert(key);
+            }
+        }
+        if ssa_identity {
+            // A canonical replacement may jump over register moves.  If an
+            // intermediate alias fans out, composing every replacement in one
+            // round would clone the effectful producer at those uses.
+            // Carry that boundary through the actual move chain, including
+            // aliases whose canonical replacement points straight at the
+            // producer.  Do not cross arithmetic or Phi definitions: those
+            // are distinct state transitions whose old/new ordering must stay
+            // available to the current schedule.
+            loop {
+                let discovered = actions
+                    .iter()
+                    .filter_map(Self::replacement_key)
+                    .filter(|key| !deferred_keys.contains(key))
+                    .filter(|key| {
+                        self.graph()
+                            .definitions
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|definition| self.register_move_source(definition))
+                            .any(|dependency| deferred_keys.contains(&dependency))
+                    })
+                    .collect::<BTreeSet<_>>();
+                if discovered.is_empty() {
+                    break;
+                }
+                deferred_keys.extend(discovered);
+            }
+        }
         let mut retained = Vec::with_capacity(actions.len());
         for action in std::mem::take(actions) {
             let Some(key) = Self::replacement_key(&action) else {
                 retained.push(action);
                 continue;
             };
-            let mut dependencies = self.replacement_dependencies(&action)?;
-            dependencies.remove(&key);
-            let duplicates_effects = self.graph().identity() == ValueIdentity::Source
-                || self.facts.uses_of(key).len() > 1;
-            if !duplicates_effects || dependencies.is_disjoint(&blocking_keys) {
+            if !deferred_keys.contains(&key) {
                 retained.push(action);
             }
         }
         *actions = retained;
         Ok(())
+    }
+
+    fn replacement_enters_repetition(
+        &self,
+        key: SsaVar,
+        dependencies: &BTreeSet<SsaVar>,
+        blocking_keys: &BTreeSet<SsaVar>,
+    ) -> bool {
+        self.facts.uses_of(key).iter().any(|usage| {
+            usage.repetitive
+                && dependencies.iter().any(|dependency| {
+                    blocking_keys.contains(dependency)
+                        && self
+                            .graph()
+                            .definitions
+                            .get(dependency)
+                            .is_some_and(|definitions| {
+                                definitions.iter().any(|definition| !definition.repetitive)
+                            })
+                })
+        })
+    }
+
+    fn register_move_source(&self, definition: &DefinitionFact) -> Option<SsaVar> {
+        let operation = definition.operation()?;
+        let [SemanticExpression::Register(register)] = operation.operands() else {
+            return None;
+        };
+        (operation.insn_type == InsnType::Move)
+            .then(|| self.graph().key(register))
+            .flatten()
     }
 
     fn replacement_key(action: &ValueAction) -> Option<SsaVar> {
@@ -1803,5 +1878,219 @@ impl ValueAction {
             | Self::Remove { event, .. }
             | Self::DiscardResult { event, .. } => *event,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        analysis::SsaValueGraph, block::Block, ArgType, BlockId, EdgeKind, InsnNode, InvokeType,
+        RegionId, RegisterArg, SemanticBlock, SemanticLoopControl, SemanticLoopKind,
+        SemanticLoopTest, SemanticNode, SemanticPredicate, SemanticStatement, CFG,
+    };
+
+    fn register(value: SsaVar, ty: &ArgType) -> RegisterArg {
+        RegisterArg::new_ssa(value.reg_num, value.version, ty.clone())
+    }
+
+    fn argument(value: SsaVar, ty: &ArgType) -> InsnArg {
+        InsnArg::Reg(register(value, ty))
+    }
+
+    fn scheduled_replacements(name: &str, block: Block) -> BTreeSet<SsaVar> {
+        let mut cfg = CFG::new(name);
+        cfg.add_block(block);
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let statements = cfg
+            .block(BlockId::new(0))
+            .expect("entry block")
+            .insns
+            .iter()
+            .cloned()
+            .map(|instruction| SemanticStatement::instruction(instruction).expect("semantic op"))
+            .collect();
+        let mut root = SemanticNode::BasicBlock(SemanticBlock {
+            id: BlockId::new(0),
+            statements,
+        });
+        crate::ir::SemanticSiteNumbering::assign(&mut root).expect("semantic sites");
+
+        let graph = ValueFlowGraph::build(&root, &values, &BTreeMap::new()).expect("value graph");
+        graph
+            .schedule(RecoveryMode::Full)
+            .expect("value plan")
+            .actions
+            .iter()
+            .filter_map(ValuePlanner::replacement_key)
+            .collect()
+    }
+
+    #[test]
+    fn defers_transitive_alias_across_effectful_producer() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let first_alias = SsaVar::new(14, 0);
+        let second_alias = SsaVar::new(9, 0);
+
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        block.push(InsnNode::mov(
+            register(first_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+        block.push(InsnNode::aput(
+            InsnArg::lit(0, ArgType::object("java/lang/Object")),
+            argument(first_alias, &array_type),
+            InsnArg::lit(0, ArgType::INT),
+        ));
+        block.push(InsnNode::mov(
+            register(second_alias, &array_type),
+            argument(first_alias, &array_type),
+        ));
+        block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(second_alias, &array_type)],
+        ));
+
+        let scheduled = scheduled_replacements("allocation_alias_fork", block);
+
+        assert!(scheduled.contains(&allocation));
+        assert!(!scheduled.contains(&first_alias));
+        assert!(!scheduled.contains(&second_alias));
+    }
+
+    #[test]
+    fn keeps_linear_alias_chain_with_effectful_producer() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let first_alias = SsaVar::new(14, 0);
+        let second_alias = SsaVar::new(9, 0);
+
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        block.push(InsnNode::mov(
+            register(first_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+        block.push(InsnNode::mov(
+            register(second_alias, &array_type),
+            argument(first_alias, &array_type),
+        ));
+        block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(second_alias, &array_type)],
+        ));
+
+        let scheduled = scheduled_replacements("allocation_alias_chain", block);
+
+        assert!(scheduled.contains(&allocation));
+        assert!(scheduled.contains(&first_alias));
+        assert!(scheduled.contains(&second_alias));
+    }
+
+    #[test]
+    fn defers_effectful_phi_replacement_entering_loop() {
+        let array_type = ArgType::object_array();
+        let allocation = SsaVar::new(10, 0);
+        let initial_alias = SsaVar::new(14, 0);
+        let loop_value = SsaVar::new(14, 1);
+        let body_alias = SsaVar::new(9, 0);
+        let backedge_alias = SsaVar::new(14, 2);
+
+        let mut preheader = Block::new(0u32);
+        preheader.push(InsnNode::new_array(
+            register(allocation, &array_type),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        preheader.push(InsnNode::mov(
+            register(initial_alias, &array_type),
+            argument(allocation, &array_type),
+        ));
+
+        let mut header = Block::new(1u32);
+        header.push(InsnNode::phi(
+            register(loop_value, &array_type),
+            vec![
+                (0, argument(initial_alias, &array_type)),
+                (2, argument(backedge_alias, &array_type)),
+            ],
+        ));
+
+        let mut body = Block::new(2u32);
+        body.push(InsnNode::mov(
+            register(body_alias, &array_type),
+            argument(loop_value, &array_type),
+        ));
+        body.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![argument(body_alias, &array_type)],
+        ));
+        body.push(InsnNode::mov(
+            register(backedge_alias, &array_type),
+            argument(body_alias, &array_type),
+        ));
+
+        let mut cfg = CFG::new("effectful_loop_invariant");
+        cfg.add_block(preheader);
+        cfg.add_block(header);
+        cfg.add_block(body);
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(1), EdgeKind::Normal);
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).expect("SSA graph");
+        let semantic_block = |id| {
+            SemanticNode::BasicBlock(SemanticBlock {
+                id,
+                statements: cfg
+                    .block(id)
+                    .expect("semantic block")
+                    .insns
+                    .iter()
+                    .filter(|instruction| instruction.insn_type != InsnType::Phi)
+                    .cloned()
+                    .map(|instruction| {
+                        SemanticStatement::instruction(instruction).expect("semantic op")
+                    })
+                    .collect(),
+            })
+        };
+        let mut root = SemanticNode::sequence([
+            semantic_block(BlockId::new(0)),
+            SemanticNode::Loop {
+                control: SemanticLoopControl::Region(RegionId::new(1)),
+                header: Some(BlockId::new(1)),
+                kind: SemanticLoopKind::Endless,
+                test: SemanticLoopTest::pure(SemanticPredicate::True),
+                body: Box::new(semantic_block(BlockId::new(2))),
+            },
+        ]);
+        crate::ir::SemanticSiteNumbering::assign(&mut root).expect("semantic sites");
+
+        let graph = ValueFlowGraph::build(&root, &values, &BTreeMap::new()).expect("value graph");
+        let scheduled = graph
+            .schedule(RecoveryMode::Full)
+            .expect("value plan")
+            .actions
+            .iter()
+            .filter_map(ValuePlanner::replacement_key)
+            .collect::<BTreeSet<_>>();
+
+        assert!(scheduled.contains(&allocation));
+        assert!(!scheduled.contains(&loop_value));
     }
 }

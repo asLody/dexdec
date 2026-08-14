@@ -150,6 +150,14 @@ impl JavaMethodBody {
         collector.fields
     }
 
+    pub(in crate::analysis::java_backend) fn static_owner_types(
+        &self,
+    ) -> std::collections::BTreeSet<ArgType> {
+        let mut collector = MemberReferenceCollector::default();
+        crate::ir::SemanticVisitor::visit_node(&mut collector, self.semantic.body());
+        collector.static_owners
+    }
+
     pub(in crate::analysis::java_backend) fn outer_instance_field(
         &self,
     ) -> Option<(&crate::ir::FieldReference, &ArgType)> {
@@ -356,15 +364,25 @@ impl JavaMethodBody {
 struct MemberReferenceCollector {
     methods: std::collections::BTreeSet<crate::ir::MethodReference>,
     fields: std::collections::BTreeSet<crate::ir::FieldReference>,
+    static_owners: std::collections::BTreeSet<ArgType>,
 }
 
 impl crate::ir::SemanticVisitor for MemberReferenceCollector {
     fn enter_operation(&mut self, operation: &crate::ir::SemanticOperation) {
         match operation.payload.reference.as_ref() {
             Some(crate::ir::MemberReference::Method(method)) => {
+                if operation.payload.invoke_type == Some(crate::ir::InvokeType::Static) {
+                    self.static_owners.insert(method.owner.clone());
+                }
                 self.methods.insert(method.clone());
             }
             Some(crate::ir::MemberReference::Field(field)) => {
+                if matches!(
+                    operation.insn_type,
+                    crate::ir::InsnType::Sget | crate::ir::InsnType::Sput
+                ) {
+                    self.static_owners.insert(field.owner.clone());
+                }
                 self.fields.insert(field.clone());
             }
             None => {}
