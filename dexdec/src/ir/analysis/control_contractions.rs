@@ -23,6 +23,13 @@ pub struct ControlContractions {
 }
 
 impl ControlContractions {
+    #[cfg(test)]
+    pub(crate) fn identity() -> Self {
+        Self {
+            domains: Vec::new(),
+        }
+    }
+
     pub fn from_regions(regions: &RegionGraph) -> Self {
         ContractionGraph::new(Self::region_relations(regions)).solve(CyclePolicy::Canonical)
     }
@@ -116,8 +123,8 @@ impl ControlContractions {
     ///
     /// Cleanup contraction can turn a non-critical physical edge into a
     /// critical quotient edge. When the contracted entry has one external
-    /// ingress and immediately continues inside the same component, its tail
-    /// is the edge-specific copy site.
+    /// ingress and every normal branch remains inside the same component, its
+    /// incoming edge is the edge-specific copy site.
     pub fn normal_copy_site(
         &self,
         cfg: &CFG,
@@ -144,7 +151,7 @@ impl ControlContractions {
             return None;
         }
         let entry_targets = cfg.normal_successors(entry).collect::<BTreeSet<_>>();
-        if entry_targets.len() != 1 || !entry_targets.is_subset(&component) {
+        if entry_targets.is_empty() || !entry_targets.is_subset(&component) {
             return None;
         }
         let edge = cfg
@@ -521,7 +528,10 @@ impl ComponentTerminals {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BlockId, ContractionGraph, CyclePolicy};
+    use super::{
+        BlockId, ContractionGraph, CyclePolicy, EdgeKind, NormalCopySite, RegionEdge, CFG,
+    };
+    use crate::ir::Block;
 
     #[test]
     fn contracts_acyclic_chain_to_its_sink() {
@@ -607,5 +617,49 @@ mod tests {
         assert_eq!(contractions.terminal(BlockId(2)), Some(BlockId(2)));
         assert!(!contractions.contracts_to(BlockId(1), BlockId(2)));
         assert!(!contractions.contracts_to(BlockId(2), BlockId(1)));
+    }
+
+    #[test]
+    fn places_copy_on_branching_contracted_entry_edge() {
+        let predecessor = BlockId::new(0);
+        let entry = BlockId::new(1);
+        let left = BlockId::new(2);
+        let right = BlockId::new(3);
+        let successor = BlockId::new(4);
+        let alternative = BlockId::new(5);
+        let outside = BlockId::new(6);
+        let contractions = ContractionGraph::new([
+            (entry, left),
+            (entry, right),
+            (left, successor),
+            (right, successor),
+        ])
+        .solve(CyclePolicy::Canonical);
+        let mut cfg = CFG::new("branching_contracted_entry");
+        for block in 0..=6 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(predecessor, entry, EdgeKind::True);
+        cfg.add_edge(predecessor, alternative, EdgeKind::False);
+        cfg.add_edge(entry, left, EdgeKind::True);
+        cfg.add_edge(entry, right, EdgeKind::False);
+        cfg.add_edge(left, successor, EdgeKind::Normal);
+        cfg.add_edge(right, successor, EdgeKind::Normal);
+
+        assert_eq!(
+            contractions.normal_copy_site(&cfg, predecessor, entry, successor),
+            Some(NormalCopySite::Edge(RegionEdge {
+                source: predecessor,
+                target: entry,
+                kind: EdgeKind::True,
+            }))
+        );
+
+        cfg.add_edge(entry, outside, EdgeKind::SwitchDefault);
+        assert_eq!(
+            contractions.normal_copy_site(&cfg, predecessor, entry, successor),
+            None,
+            "a branch leaving the contracted component must reject edge placement"
+        );
     }
 }

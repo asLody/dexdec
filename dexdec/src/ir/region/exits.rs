@@ -250,14 +250,15 @@ impl<'a> RegionExitAnalysis<'a> {
                     continue;
                 }
                 let target_region = self.tree.owner(target_block)?;
-                let destination_block = self
-                    .cleanup_representatives
-                    .get(&target_block)
-                    .copied()
-                    .unwrap_or(target_block);
-                let destination_region = self.tree.owner(destination_block)?;
+                let destination_block = Self::terminal_cleanup_representative(
+                    self.cleanup_representatives,
+                    target_block,
+                );
+                let destination_region = self
+                    .tree
+                    .enter_destination(source_region, destination_block)?;
                 let kind = self.transfer_kind(source_region, destination_region)?;
-                transfers.push(RegionTransfer {
+                let mut transfer = RegionTransfer {
                     source_block,
                     target_block,
                     edge_kind,
@@ -270,7 +271,11 @@ impl<'a> RegionExitAnalysis<'a> {
                         .transpose()?,
                     kind,
                     exit_kind: self.exit_kind(source_block, destination_block, source_region)?,
-                });
+                };
+                if self.forwarded_cleanup_throw(&transfer)?.is_some() {
+                    transfer.exit_kind = RegionExitKind::Throw;
+                }
+                transfers.push(transfer);
             }
         }
         Ok(transfers)
@@ -282,13 +287,19 @@ impl<'a> RegionExitAnalysis<'a> {
     ) -> Result<Vec<RegionLeave>, RegionInvariantError> {
         let mut leaves = Vec::new();
         for transfer in transfers {
+            let forwarded_cleanup = self.forwarded_cleanup_throw(transfer)?;
             if !transfer.requires_leave(self.cfg) {
                 continue;
             }
             let target = transfer.exit_destination(self.tree.root());
-            let exit = match transfer.exit_kind {
-                RegionExitKind::FallThrough => RegionExit::FallThrough(transfer.destination_block),
-                RegionExitKind::Return => self
+            let exit = match (forwarded_cleanup, transfer.exit_kind) {
+                (Some(exception), RegionExitKind::Throw) => {
+                    RegionExit::Throw(InsnArg::Reg(exception))
+                }
+                (None, RegionExitKind::FallThrough) => {
+                    RegionExit::FallThrough(transfer.destination_block)
+                }
+                (None, RegionExitKind::Return) => self
                     .terminal_continuation(
                         transfer.source_block,
                         self.control_flow.continuation(transfer.destination_block),
@@ -297,9 +308,9 @@ impl<'a> RegionExitAnalysis<'a> {
                         block: transfer.source_block,
                         kind: transfer.exit_kind,
                     })?,
-                RegionExitKind::Break => RegionExit::Break,
-                RegionExitKind::Continue => RegionExit::Continue,
-                kind => {
+                (None, RegionExitKind::Break) => RegionExit::Break,
+                (None, RegionExitKind::Continue) => RegionExit::Continue,
+                (_, kind) => {
                     return Err(RegionInvariantError::InvalidLeaveKind {
                         block: transfer.source_block,
                         kind,
@@ -391,6 +402,62 @@ impl<'a> RegionExitAnalysis<'a> {
         Ok(leaves)
     }
 
+    /// A nested compiler cleanup can forward its caught exception directly
+    /// into an enclosing cleanup handler. Once that handler is represented
+    /// lexically as a finally or catch-all cleanup, its physical entry no
+    /// longer denotes an ordinary source continuation (and a finally could be
+    /// replayed). Model the proven cleanup handler's logical completion as a
+    /// rethrow instead.
+    fn forwarded_cleanup_throw(
+        &self,
+        transfer: &RegionTransfer,
+    ) -> Result<Option<RegisterArg>, RegionInvariantError> {
+        if transfer.kind != RegionTransferKind::Leave
+            || !matches!(
+                transfer.exit_kind,
+                RegionExitKind::FallThrough | RegionExitKind::Throw
+            )
+        {
+            return Ok(None);
+        }
+        let source = self
+            .tree
+            .region(transfer.source_region)
+            .ok_or(RegionInvariantError::UnknownRegion(transfer.source_region))?;
+        let RegionKind::Cleanup(cleanup) = &source.kind else {
+            return Ok(None);
+        };
+        let destination = self.tree.region(transfer.destination_region).ok_or(
+            RegionInvariantError::UnknownRegion(transfer.destination_region),
+        )?;
+        if destination.entry != Some(transfer.destination_block) {
+            return Ok(None);
+        }
+        let target = transfer.exit_destination(self.tree.root());
+        let forwarded_handler = if matches!(&destination.kind, RegionKind::Finally) {
+            self.cleanup_chain(transfer.source_region, target)?
+                .contains(&transfer.destination_region)
+        } else if matches!(&destination.kind, RegionKind::Cleanup(_)) {
+            let mut attached = false;
+            for (owner, handlers) in self.handlers {
+                if handlers.contains(&transfer.destination_region)
+                    && (*owner == transfer.source_region
+                        || self.tree.is_ancestor(*owner, transfer.source_region)?)
+                {
+                    attached = true;
+                    break;
+                }
+            }
+            attached
+        } else {
+            false
+        };
+        if !forwarded_handler {
+            return Ok(None);
+        }
+        Ok(cleanup.exception_value.clone())
+    }
+
     fn resolve(&self, leave: RegionLeave) -> Result<ResolvedRegionExit, RegionInvariantError> {
         let cleanup_regions = self.cleanup_chain(leave.source, leave.target)?;
         Ok(ResolvedRegionExit {
@@ -411,6 +478,26 @@ impl<'a> RegionExitAnalysis<'a> {
         } else {
             RegionTransferKind::Leave
         })
+    }
+
+    fn terminal_cleanup_representative(
+        representatives: &BTreeMap<BlockId, BlockId>,
+        target: BlockId,
+    ) -> BlockId {
+        let mut current = target;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) {
+                // Cleanup proofs are expected to point toward a completion.
+                // Preserve the physical target if malformed input ever
+                // introduces a cycle instead of choosing an arbitrary member.
+                return target;
+            }
+            let Some(next) = representatives.get(&current).copied() else {
+                return current;
+            };
+            current = next;
+        }
     }
 
     fn exit_kind(
@@ -744,7 +831,168 @@ impl InstructionTransform for LocalValueSubstitution<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{ArgType, Block, InsnArg, InsnNode, RegisterArg};
+    use crate::ir::{ArgType, Block, CatchRegion, InsnArg, InsnNode, RegisterArg};
+
+    #[test]
+    fn enters_loop_when_header_is_shared_with_nested_try() {
+        // Parent → loop-header/try-entry must Enter the loop, not the nested try.
+        // Otherwise continue leaves inside the loop body target an inactive control.
+        let header = BlockId::new(1);
+        let body = BlockId::new(2);
+        let mut cfg = CFG::new("shared_loop_try_entry");
+        for id in 0..=2 {
+            cfg.add_block(Block::new(id));
+        }
+        cfg.add_edge(BlockId::new(0), header, EdgeKind::Normal);
+        cfg.add_edge(header, body, EdgeKind::Normal);
+        cfg.add_edge(body, header, EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let loop_region = tree
+            .add_child(
+                root,
+                RegionKind::Loop(crate::ir::LoopRegion {
+                    follow: None,
+                    latches: BTreeSet::from([body]),
+                }),
+                Some(header),
+            )
+            .unwrap();
+        tree.region_mut(loop_region).unwrap().blocks = BTreeSet::from([header, body]);
+        let nested_try = tree
+            .add_child(loop_region, RegionKind::Try, Some(header))
+            .unwrap();
+        tree.region_mut(nested_try).unwrap().blocks = BTreeSet::from([header]);
+
+        let control_flow = ControlFlowFacts::analyze(&cfg).unwrap();
+        let elisions = InstructionElisions::default();
+        let handlers = BTreeMap::new();
+        let facts = RegionExitAnalysis::new(
+            &cfg,
+            &tree,
+            &elisions,
+            &control_flow,
+            &BTreeMap::new(),
+            &handlers,
+        )
+        .analyze()
+        .unwrap();
+        let enter = facts
+            .transfers
+            .iter()
+            .find(|transfer| {
+                transfer.source_block == BlockId::new(0)
+                    && transfer.destination_block == header
+                    && transfer.kind == RegionTransferKind::Enter
+            })
+            .expect("enter transfer to shared header");
+        assert_eq!(
+            enter.destination_region, loop_region,
+            "shared loop/try header must enter the loop control region"
+        );
+    }
+
+    #[test]
+    fn cleanup_forwarding_to_enclosing_finally_is_a_rethrow() {
+        let (leaves, exception, handler) = cleanup_forwarding_leaves(true);
+        let forwarded = forwarded_cleanup_leave(&leaves);
+        assert!(matches!(
+            &forwarded.leave.exit,
+            RegionExit::Throw(InsnArg::Reg(value)) if value == &exception
+        ));
+        assert_eq!(forwarded.cleanup_regions, vec![handler]);
+    }
+
+    #[test]
+    fn cleanup_forwarding_to_enclosing_cleanup_is_a_rethrow() {
+        let (leaves, exception, _) = cleanup_forwarding_leaves(false);
+        let forwarded = forwarded_cleanup_leave(&leaves);
+        assert!(matches!(
+            &forwarded.leave.exit,
+            RegionExit::Throw(InsnArg::Reg(value)) if value == &exception
+        ));
+        assert!(forwarded.cleanup_regions.is_empty());
+    }
+
+    fn cleanup_forwarding_leaves(
+        source_level_finally: bool,
+    ) -> (Vec<ResolvedRegionExit>, RegisterArg, RegionId) {
+        let source = BlockId::new(0);
+        let finally_entry = BlockId::new(1);
+        let exception = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+
+        let mut cfg = CFG::new("forwarded_cleanup_throw");
+        let mut adapter = Block::new(source.raw());
+        adapter.push(InsnNode::goto(1));
+        cfg.add_block(adapter);
+        let mut cleanup_body = Block::new(finally_entry.raw());
+        cleanup_body.push(InsnNode::throw(InsnArg::Reg(exception.clone())));
+        cfg.add_block(cleanup_body);
+        cfg.add_edge(source, finally_entry, EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(source));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let outer = tree.add_child(root, RegionKind::Try, Some(source)).unwrap();
+        let inner = tree
+            .add_child(outer, RegionKind::Try, Some(source))
+            .unwrap();
+        let adapter_region = tree
+            .add_child(
+                inner,
+                RegionKind::Cleanup(CatchRegion {
+                    exception_types: vec![ArgType::throwable()],
+                    exception_value: Some(exception.clone()),
+                    continuation: None,
+                }),
+                Some(source),
+            )
+            .unwrap();
+        let destination_kind = if source_level_finally {
+            RegionKind::Finally
+        } else {
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: Some(exception.clone()),
+                continuation: None,
+            })
+        };
+        let finally_region = tree
+            .add_child(root, destination_kind, Some(finally_entry))
+            .unwrap();
+        for region in [outer, inner, adapter_region] {
+            tree.add_block(region, source).unwrap();
+        }
+        tree.add_block(finally_region, finally_entry).unwrap();
+
+        let handlers =
+            BTreeMap::from([(outer, vec![finally_region]), (inner, vec![adapter_region])]);
+        let control_flow = ControlFlowFacts::analyze(&cfg).unwrap();
+        let elisions = InstructionElisions::default();
+        let contractions = BTreeMap::new();
+        let leaves = RegionExitAnalysis::new(
+            &cfg,
+            &tree,
+            &elisions,
+            &control_flow,
+            &contractions,
+            &handlers,
+        )
+        .analyze()
+        .unwrap()
+        .leaves;
+
+        (leaves, exception, finally_region)
+    }
+
+    fn forwarded_cleanup_leave(leaves: &[ResolvedRegionExit]) -> &ResolvedRegionExit {
+        leaves
+            .iter()
+            .find(|leave| leave.leave.source_block == Some(BlockId::new(0)))
+            .expect("cleanup adapter leave")
+    }
 
     #[test]
     fn resolves_a_synthetic_control_edge_to_its_logical_destination() {
@@ -760,6 +1008,72 @@ mod tests {
         let facts = ControlFlowFacts::analyze(&cfg).unwrap();
 
         assert_eq!(facts.continuation(BlockId::new(1)), BlockId::new(2));
+    }
+
+    #[test]
+    fn follows_nested_cleanup_contractions_to_the_terminal_representative() {
+        let source = BlockId::new(0);
+        let first = BlockId::new(1);
+        let second = BlockId::new(2);
+        let terminal = BlockId::new(3);
+        let representatives = BTreeMap::from([(first, second), (second, terminal)]);
+
+        let lock = InsnArg::reg_ssa(0, 0, ArgType::object("java/lang/Object"));
+        let result = RegisterArg::new_ssa(1, 0, ArgType::INT);
+        let mut cfg = CFG::new("nested_cleanup_return");
+        let mut entry = Block::new(source.raw());
+        entry.push(InsnNode::goto(1));
+        cfg.add_block(entry);
+        let mut first_cleanup = Block::new(first.raw());
+        first_cleanup.push(InsnNode::monitor_exit(lock.clone()));
+        first_cleanup.push(InsnNode::goto(2));
+        cfg.add_block(first_cleanup);
+        let mut second_cleanup = Block::new(second.raw());
+        second_cleanup.push(InsnNode::monitor_exit(lock));
+        second_cleanup.push(InsnNode::goto(3));
+        cfg.add_block(second_cleanup);
+        let mut completion = Block::new(terminal.raw());
+        completion.push(InsnNode::const_val(result.clone(), 1, ArgType::INT));
+        let mut return_value = InsnNode::new(InsnType::Return, 1);
+        return_value.add_arg(InsnArg::Reg(result));
+        completion.push(return_value);
+        cfg.add_block(completion);
+        cfg.add_edge(source, first, EdgeKind::Normal);
+        cfg.add_edge(first, second, EdgeKind::Normal);
+        cfg.add_edge(second, terminal, EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(source));
+        tree.cover_method(&cfg).unwrap();
+        let control_flow = ControlFlowFacts::analyze(&cfg).unwrap();
+        let elisions = InstructionElisions::default();
+        let handlers = BTreeMap::new();
+        let facts = RegionExitAnalysis::new(
+            &cfg,
+            &tree,
+            &elisions,
+            &control_flow,
+            &representatives,
+            &handlers,
+        )
+        .analyze()
+        .unwrap();
+        let transfer = facts
+            .transfers
+            .iter()
+            .find(|transfer| transfer.source_block == source)
+            .expect("entry transfer");
+        assert_eq!(transfer.destination_block, terminal);
+        assert_eq!(transfer.exit_kind, RegionExitKind::Return);
+        assert!(facts.leaves.iter().any(|leave| {
+            leave.leave.source_block == Some(source)
+                && matches!(leave.leave.exit, RegionExit::Return(Some(_)))
+        }));
+
+        let cyclic = BTreeMap::from([(first, second), (second, first)]);
+        assert_eq!(
+            RegionExitAnalysis::terminal_cleanup_representative(&cyclic, first),
+            first
+        );
     }
 
     #[test]

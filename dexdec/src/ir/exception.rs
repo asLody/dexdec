@@ -3144,7 +3144,7 @@ impl HandlerSemanticDomains {
                 })
             })
             .collect::<BTreeSet<_>>();
-        let domains = entries
+        let mut domains = entries
             .iter()
             .copied()
             .map(|entry| {
@@ -3183,8 +3183,96 @@ impl HandlerSemanticDomains {
                     },
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        Self::bridge_monitor_split_handlers(cfg, &entries, &entry_clauses, &mut domains);
         Self { domains }
+    }
+
+    /// Rejoins the two physical catches produced when javac/d8 lowers an outer
+    /// catch around a synchronized statement. Exceptions thrown while acquiring
+    /// the monitor enter one adapter, while exceptions rethrown after monitor
+    /// cleanup enter another; both adapters merge the caught exception and live
+    /// local state into the same source-level catch body.
+    fn bridge_monitor_split_handlers(
+        cfg: &CFG,
+        entries: &BTreeSet<BlockId>,
+        entry_clauses: &HandlerEntryClauses,
+        domains: &mut BTreeMap<BlockId, HandlerSemanticDomain>,
+    ) {
+        let mut bridges = Vec::new();
+        for entry in entries {
+            let Some(domain) = domains.get(entry) else {
+                continue;
+            };
+            if domain.canonical_entry != *entry {
+                continue;
+            }
+            let enters_from_monitor =
+                cfg.incoming_edges(*entry)
+                    .into_iter()
+                    .any(|(predecessor, kind)| {
+                        kind.is_exception()
+                            && cfg.block(predecessor).is_some_and(|block| {
+                                block.insns.iter().any(|instruction| {
+                                    instruction.insn_type == InsnType::MonitorEnter
+                                })
+                            })
+                    });
+            if !enters_from_monitor {
+                continue;
+            }
+
+            let successors = cfg
+                .normal_successors(*entry)
+                .filter(|successor| domain.blocks.contains(successor))
+                .collect::<Vec<_>>();
+            let [successor] = successors.as_slice() else {
+                continue;
+            };
+            let has_compatible_peer = entry_clauses
+                .compatible_with(*entry)
+                .into_iter()
+                .filter(|peer| peer != entry)
+                .any(|peer| {
+                    domains
+                        .get(&peer)
+                        .is_some_and(|peer_domain| peer_domain.canonical_entry == *successor)
+                });
+            if !has_compatible_peer {
+                continue;
+            }
+
+            let Some(caught) = cfg.block(*entry).and_then(|block| {
+                block.insns.iter().find_map(|instruction| {
+                    (instruction.insn_type == InsnType::MoveException)
+                        .then(|| instruction.result.as_ref().and_then(SsaVar::from_reg))
+                        .flatten()
+                })
+            }) else {
+                continue;
+            };
+            let exception_flow = HandlerSemantics::exception_flow(cfg, &domain.blocks, caught);
+            let Some(entry_block) = cfg.block(*entry) else {
+                continue;
+            };
+            let Some(successor_block) = cfg.block(*successor) else {
+                continue;
+            };
+            if HandlerAdapterEffects::forwards_state_to_phis(
+                entry_block,
+                successor_block,
+                &exception_flow,
+            ) {
+                bridges.push((*entry, *successor));
+            }
+        }
+
+        for (entry, successor) in bridges {
+            if let Some(domain) = domains.get_mut(&entry) {
+                domain.adapter_blocks.insert(entry);
+                domain.canonical_entry = successor;
+            }
+        }
     }
 
     fn domain(&self, entry: BlockId) -> HandlerSemanticDomain {
@@ -3460,6 +3548,45 @@ impl HandlerAdapterEffects {
                 && instruction.insn_type != InsnType::Const
         });
         forwards_exception && reaches_semantics
+    }
+
+    fn forwards_state_to_phis(
+        block: &super::Block,
+        successor: &super::Block,
+        exception_flow: &BTreeSet<SsaVar>,
+    ) -> bool {
+        if !block.insns.iter().all(|instruction| {
+            InstructionEffects::is_ssa_bookkeeping(instruction)
+                || instruction.insn_type == InsnType::Const
+        }) {
+            return false;
+        }
+        let forwarded = block
+            .insns
+            .iter()
+            .filter(|instruction| instruction.insn_type != InsnType::MoveException)
+            .filter_map(|instruction| instruction.result.as_ref().and_then(SsaVar::from_reg))
+            .collect::<BTreeSet<_>>();
+        if forwarded.is_empty() || forwarded.is_disjoint(exception_flow) {
+            return false;
+        }
+
+        let is_phi_argument = |value: SsaVar| {
+            successor.insns.iter().any(|instruction| {
+                instruction.insn_type == InsnType::Phi
+                    && instruction
+                        .args
+                        .iter()
+                        .filter_map(InsnArg::as_register)
+                        .filter_map(SsaVar::from_reg)
+                        .any(|argument| argument == value)
+            })
+        };
+        let reaches_semantics = successor.insns.iter().any(|instruction| {
+            !InstructionEffects::is_ssa_bookkeeping(instruction)
+                && instruction.insn_type != InsnType::Const
+        });
+        forwarded.iter().copied().all(is_phi_argument) && reaches_semantics
     }
 }
 
@@ -4153,7 +4280,7 @@ impl<'a> FiniteExitAnalysis<'a> {
 mod tests {
     use super::*;
     use crate::ir::analysis::ClassHierarchyIndex;
-    use crate::ir::{Block, InsnNode};
+    use crate::ir::{Block, ExceptionHandler, InsnNode};
 
     fn exception_hierarchy() -> ClassHierarchyIndex {
         let mut hierarchy = ClassHierarchyIndex::default();
@@ -4510,6 +4637,102 @@ mod tests {
             continuation.adapters,
             BTreeSet::from([BlockId::new(0), BlockId::new(1)])
         );
+    }
+
+    fn split_handler_domains(enters_monitor: bool) -> HandlerSemanticDomains {
+        let mut cfg = CFG::new("monitor_split_handler");
+        let lock = RegisterArg::new_ssa(0, 0, ArgType::object("java/lang/Object"));
+        let caught_at_enter = RegisterArg::new_ssa(1, 0, ArgType::throwable());
+        let forwarded_exception = RegisterArg::new_ssa(1, 1, ArgType::throwable());
+        let caught_after_cleanup = RegisterArg::new_ssa(1, 2, ArgType::throwable());
+        let canonical_exception = RegisterArg::new_ssa(1, 3, ArgType::throwable());
+        let initial_state = RegisterArg::new_ssa(2, 0, ArgType::string());
+        let forwarded_state = RegisterArg::new_ssa(2, 1, ArgType::string());
+        let canonical_state = RegisterArg::new_ssa(2, 2, ArgType::string());
+
+        let mut monitor = Block::new(0);
+        if enters_monitor {
+            monitor.push(InsnNode::monitor_enter(InsnArg::Reg(lock)));
+        } else {
+            monitor.push(InsnNode::new(InsnType::Invoke, 0));
+        }
+        cfg.add_block(monitor);
+        let mut cleanup_rethrow = Block::new(1);
+        cleanup_rethrow.push(InsnNode::throw(InsnArg::reg_ssa(
+            3,
+            0,
+            ArgType::throwable(),
+        )));
+        cfg.add_block(cleanup_rethrow);
+
+        let mut enter_adapter = Block::new(2);
+        enter_adapter.push(InsnNode::move_exception(caught_at_enter.clone()));
+        enter_adapter.push(InsnNode::mov(
+            forwarded_state.clone(),
+            InsnArg::Reg(initial_state),
+        ));
+        enter_adapter.push(InsnNode::mov(
+            forwarded_exception.clone(),
+            InsnArg::Reg(caught_at_enter),
+        ));
+        cfg.add_block(enter_adapter);
+
+        let mut cleanup_adapter = Block::new(3);
+        cleanup_adapter.push(InsnNode::move_exception(caught_after_cleanup.clone()));
+        cfg.add_block(cleanup_adapter);
+
+        let mut catch_body = Block::new(4);
+        catch_body.push(InsnNode::phi(
+            canonical_exception,
+            vec![
+                (2, InsnArg::Reg(forwarded_exception)),
+                (3, InsnArg::Reg(caught_after_cleanup)),
+            ],
+        ));
+        catch_body.push(InsnNode::phi(
+            canonical_state,
+            vec![(2, InsnArg::Reg(forwarded_state))],
+        ));
+        catch_body.push(InsnNode::new(InsnType::Invoke, 4));
+        cfg.add_block(catch_body);
+
+        cfg.add_edge(BlockId::new(0), BlockId::new(2), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(1), BlockId::new(3), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(2), BlockId::new(4), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(4), EdgeKind::Normal);
+        let catch_type = Some(ArgType::object("java/io/IOException"));
+        cfg.handlers
+            .push(ExceptionHandler::new(0, 1, 2, catch_type.clone()));
+        cfg.handlers
+            .push(ExceptionHandler::new(1, 2, 3, catch_type));
+
+        let entries = BTreeMap::from([(2, BlockId::new(2)), (3, BlockId::new(3))]);
+        HandlerSemanticDomains::analyze(&cfg, &entries)
+    }
+
+    #[test]
+    fn rejoins_catch_split_around_monitor_cleanup() {
+        let domains = split_handler_domains(true);
+
+        let enter_domain = domains.domain(BlockId::new(2));
+        assert_eq!(enter_domain.canonical_entry, BlockId::new(4));
+        assert_eq!(
+            enter_domain.adapter_blocks,
+            BTreeSet::from([BlockId::new(2)])
+        );
+        assert_eq!(
+            domains.domain(BlockId::new(3)).canonical_entry,
+            BlockId::new(4)
+        );
+    }
+
+    #[test]
+    fn ordinary_catch_state_transfer_remains_semantic() {
+        let domains = split_handler_domains(false);
+
+        let enter_domain = domains.domain(BlockId::new(2));
+        assert_eq!(enter_domain.canonical_entry, BlockId::new(2));
+        assert!(enter_domain.adapter_blocks.is_empty());
     }
 
     #[test]

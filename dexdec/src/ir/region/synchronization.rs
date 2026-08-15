@@ -396,6 +396,12 @@ impl<'a> SynchronizationAnalysis<'a> {
                         });
                     }
                     _ if InstructionEffects::is_ssa_bookkeeping(instruction) => {}
+                    // DEX compilers may materialize exception-edge values in
+                    // the synthetic release adapter before monitor-exit. Such
+                    // definitions have no observable effect of their own and
+                    // survive through SSA edge-value recovery after the
+                    // adapter is contracted.
+                    _ if InstructionEffects::of_tree(instruction).is_pure() => {}
                     _ => {
                         return Err(ReleaseProofError::UnexpectedInstruction {
                             block,
@@ -1004,5 +1010,91 @@ mod tests {
             analysis.identity(&first_value),
             analysis.identity(&other_value)
         );
+    }
+
+    #[test]
+    fn release_handler_allows_only_pure_exception_edge_definitions() {
+        let method_entry = BlockId::new(0);
+        let release_entry = BlockId::new(1);
+        let rethrow = BlockId::new(2);
+        let caught = RegisterArg::new_ssa(0, 0, ArgType::throwable());
+        let lock = RegisterArg::new_ssa(1, 0, ArgType::object("java/lang/Object"));
+        let edge_value = RegisterArg::new_ssa(2, 0, ArgType::LONG);
+
+        let mut entry = Block::new(method_entry.raw());
+        entry.push(InsnNode::const_val(
+            lock.clone(),
+            0,
+            ArgType::object("java/lang/Object"),
+        ));
+        entry.push(InsnNode::return_void());
+        let mut release = Block::new(release_entry.raw());
+        release.push(InsnNode::move_exception(caught.clone()));
+        release.push(InsnNode::const_val(edge_value, 0, ArgType::LONG));
+        release.push(InsnNode::monitor_exit(InsnArg::Reg(lock)));
+        let mut throw = Block::new(rethrow.raw());
+        throw.push(InsnNode::throw(InsnArg::Reg(caught.clone())));
+
+        let handler = CatchHandler {
+            id: 0,
+            catch_type: None,
+            handler_offset: 0,
+            entry_blocks: BTreeSet::from([release_entry]),
+            handler_block: release_entry,
+            semantic_entry: release_entry,
+            canonical_entry: release_entry,
+            adapter_blocks: BTreeSet::new(),
+            blocks: vec![release_entry, rethrow],
+            semantic_blocks: vec![release_entry, rethrow],
+            lexical_blocks: vec![release_entry, rethrow],
+            continuation: None,
+            exception_value: Some(caught.clone()),
+            canonical_exception_value: Some(caught),
+            rethrow_blocks: BTreeSet::from([rethrow]),
+            kind: crate::ir::HandlerKind::Cleanup,
+        };
+        let region = TryRegion {
+            id: 0,
+            start_offset: 0,
+            end_offset: 1,
+            blocks: vec![method_entry],
+            handlers: vec![handler],
+            parent: None,
+            children: Vec::new(),
+            normal_exit_blocks: Vec::new(),
+        };
+        let mut cfg = CFG::new("pure_release_adapter_definition");
+        cfg.entry = method_entry;
+        cfg.add_block(entry);
+        cfg.add_block(release);
+        cfg.add_block(throw);
+        cfg.add_edge(method_entry, release_entry, crate::ir::EdgeKind::Exception);
+        cfg.add_edge(release_entry, rethrow, crate::ir::EdgeKind::Normal);
+        cfg.identify_instructions();
+
+        let values = SsaValueGraph::build(&cfg).unwrap();
+        let dominators = DominatorTree::compute(&cfg).unwrap();
+        let regions = [region];
+        let analysis = SynchronizationAnalysis::new(&cfg, &values, &dominators, &regions);
+
+        assert!(analysis.prove_release(&regions[0].handlers[0]).is_ok());
+
+        drop(analysis);
+        cfg.block_mut(release_entry)
+            .unwrap()
+            .insns
+            .insert(2, invocation("Lexample/Observable;->record()V"));
+        cfg.identify_instructions();
+        let values = SsaValueGraph::build(&cfg).unwrap();
+        let dominators = DominatorTree::compute(&cfg).unwrap();
+        let analysis = SynchronizationAnalysis::new(&cfg, &values, &dominators, &regions);
+
+        assert!(matches!(
+            analysis.prove_release(&regions[0].handlers[0]),
+            Err(ReleaseProofError::UnexpectedInstruction {
+                instruction: InsnType::Invoke,
+                ..
+            })
+        ));
     }
 }

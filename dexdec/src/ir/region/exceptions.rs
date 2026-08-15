@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::analysis::ControlFlowFacts;
-use crate::ir::exception::{CatchHandler, ExceptionAnalysis, HandlerKind};
+use crate::ir::exception::{CatchHandler, CleanupProofOutcome, ExceptionAnalysis, HandlerKind};
 use crate::ir::{Block, BlockId, StatementOrigin, CFG};
 
 use super::{CatchRegion, RegionId, RegionInvariantError, RegionKind, RegionPlacement, RegionTree};
@@ -26,10 +26,13 @@ pub(super) struct ExceptionRegionCanonicalizer;
 
 impl ExceptionRegionCanonicalizer {
     pub(super) fn apply(
+        analysis: &ExceptionAnalysis,
+        cfg: &CFG,
         tree: &mut RegionTree,
         mapping: &mut BTreeMap<u32, Vec<RegionId>>,
         handlers: &mut BTreeMap<RegionId, Vec<RegionId>>,
     ) -> Result<(), RegionInvariantError> {
+        Self::coalesce_finally_families(analysis, cfg, tree, handlers)?;
         for regions in mapping.values_mut() {
             regions.sort_unstable();
             regions.dedup();
@@ -54,6 +57,154 @@ impl ExceptionRegionCanonicalizer {
                 .map(|(_, region)| region)
                 .collect::<BTreeSet<_>>();
             regions.retain(|region| !removed.contains(region));
+        }
+        Ok(())
+    }
+
+    /// DEX cannot overlap protected intervals, so javac/d8 split one lexical
+    /// try/finally around nested catches and their handler bodies. When those
+    /// intervals share one proven source-finally handler, recover the outer
+    /// scope before semantic reduction. The proven normal cleanup copy is the
+    /// lexical exit and must remain outside the recovered try body.
+    fn coalesce_finally_families(
+        analysis: &ExceptionAnalysis,
+        cfg: &CFG,
+        tree: &mut RegionTree,
+        handlers: &mut BTreeMap<RegionId, Vec<RegionId>>,
+    ) -> Result<(), RegionInvariantError> {
+        let finally_regions = tree
+            .regions()
+            .filter(|region| matches!(&region.kind, RegionKind::Finally))
+            .map(|region| region.id)
+            .collect::<Vec<_>>();
+        for finally in finally_regions {
+            let Some(finally_entry) = tree
+                .region(finally)
+                .ok_or(RegionInvariantError::UnknownRegion(finally))?
+                .entry
+            else {
+                continue;
+            };
+            let sources = analysis
+                .regions
+                .iter()
+                .filter_map(|source| {
+                    let cleanup = source.handlers.iter().find(|handler| {
+                        handler.kind != HandlerKind::Catch
+                            && handler.semantic_entry == finally_entry
+                    })?;
+                    Some((source, cleanup))
+                })
+                .collect::<Vec<_>>();
+            if sources.len() < 2 {
+                continue;
+            }
+
+            let mut owners = handlers
+                .iter()
+                .filter_map(|(owner, owned)| owned.contains(&finally).then_some(*owner))
+                .collect::<BTreeSet<_>>();
+            if owners.len() < 2 {
+                continue;
+            }
+            let normal_exits = analysis
+                .cleanup_proofs
+                .iter()
+                .filter(|proof| proof.outcome == CleanupProofOutcome::Proven)
+                .filter(|proof| {
+                    sources.iter().any(|(source, cleanup)| {
+                        source.id == proof.region && cleanup.id == proof.handler
+                    })
+                })
+                .map(|proof| proof.normal_entry)
+                .collect::<BTreeSet<_>>();
+            if normal_exits.is_empty() {
+                continue;
+            }
+            let final_component = sources
+                .iter()
+                .flat_map(|(_, handler)| {
+                    handler
+                        .entry_blocks
+                        .iter()
+                        .chain(&handler.adapter_blocks)
+                        .chain(&handler.blocks)
+                        .chain(&handler.semantic_blocks)
+                        .chain(&handler.rethrow_blocks)
+                        .copied()
+                        .chain([
+                            handler.handler_block,
+                            handler.semantic_entry,
+                            handler.canonical_entry,
+                        ])
+                })
+                .collect::<BTreeSet<_>>();
+
+            while owners.len() > 1 {
+                let Some(start) = owners
+                    .iter()
+                    .copied()
+                    .filter_map(|owner| {
+                        let entry = tree.region(owner)?.entry?;
+                        let offset = cfg
+                            .block(entry)
+                            .map(|block| block.offset)
+                            .unwrap_or(u32::MAX);
+                        Some((offset, entry, owner))
+                    })
+                    .min()
+                else {
+                    break;
+                };
+                let (_, entry, first_owner) = start;
+                let mut domain = BTreeSet::new();
+                let mut pending = vec![entry];
+                while let Some(block) = pending.pop() {
+                    if normal_exits.contains(&block)
+                        || final_component.contains(&block)
+                        || !domain.insert(block)
+                    {
+                        continue;
+                    }
+                    pending.extend(
+                        cfg.successors_with_kind(block)
+                            .iter()
+                            .map(|(target, _)| *target),
+                    );
+                }
+                let members = owners
+                    .iter()
+                    .copied()
+                    .filter(|owner| {
+                        tree.region(*owner)
+                            .and_then(|region| region.entry)
+                            .is_some_and(|entry| domain.contains(&entry))
+                    })
+                    .collect::<BTreeSet<_>>();
+                if members.len() < 2 {
+                    owners.remove(&first_owner);
+                    continue;
+                }
+                domain = tree.laminar_closure(&domain);
+                if !normal_exits.is_disjoint(&domain) || !final_component.is_disjoint(&domain) {
+                    owners.remove(&first_owner);
+                    continue;
+                }
+                let synthetic = match tree.insert_laminar_region(RegionKind::Try, entry, domain)? {
+                    RegionPlacement::Inserted(region) => region,
+                    RegionPlacement::Residual => {
+                        owners.remove(&first_owner);
+                        continue;
+                    }
+                };
+                handlers.insert(synthetic, vec![finally]);
+                for member in &members {
+                    if let Some(owned) = handlers.get_mut(member) {
+                        owned.retain(|handler| *handler != finally);
+                    }
+                }
+                owners.retain(|owner| !members.contains(owner));
+            }
         }
         Ok(())
     }
@@ -1151,6 +1302,13 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
             .map(|(_, entry)| *entry)
             .collect::<BTreeSet<_>>();
         if entries.len() != 1 {
+            // A protected range in a shared handler suffix can be contained
+            // by several lexical catch domains with different entries. None
+            // of those catches is a unique source-level owner; preserve the
+            // explicit exception-table parent when one exists.
+            if let Some(parent) = source.parent {
+                return Ok(ExceptionParent::Try(parent));
+            }
             return Err(RegionInvariantError::AmbiguousExceptionHandlerParent {
                 region: source.id,
                 handlers: minimal,
@@ -1408,9 +1566,45 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             candidates.sort();
-            let Some((_, _, owner)) = candidates.first().copied() else {
+            let Some((domain_size, depth, owner)) = candidates.first().copied() else {
                 continue;
             };
+            let equally_specific = candidates
+                .iter()
+                .take_while(|(candidate_size, candidate_depth, _)| {
+                    *candidate_size == domain_size && *candidate_depth == depth
+                })
+                .map(|(_, _, handler)| *handler)
+                .collect::<Vec<_>>();
+            if equally_specific.len() > 1 {
+                // This fragment is a suffix shared by several sibling
+                // handlers, not the lexical body of whichever handler happens
+                // to have the smallest RegionId. Since handlers are added
+                // incrementally, undo an earlier provisional placement under
+                // one of the now-tied candidates. Preserve an unrelated
+                // explicit parent, which can still be more specific than the
+                // handlers' common ancestor.
+                let nested_in_candidate = equally_specific
+                    .iter()
+                    .copied()
+                    .map(|handler| self.tree.is_ancestor(handler, current))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .any(|nested| nested);
+                if nested_in_candidate {
+                    let common = equally_specific
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .try_fold(equally_specific[0], |common, handler| {
+                            self.tree.common_ancestor(common, handler)
+                        })?;
+                    if current != common {
+                        self.tree.reparent(fragment, common)?;
+                    }
+                }
+                continue;
+            }
             if current == owner || self.tree.is_ancestor(owner, current)? {
                 continue;
             }
@@ -1530,10 +1724,9 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
             .cloned()
             .unwrap_or_default()
         {
-            let merged_kind = self
-                .tree
-                .region(region)
-                .and_then(|existing| Self::merge_handler_kind(&existing.kind, kind));
+            let merged_kind = self.tree.region(region).and_then(|existing| {
+                Self::merge_handler_kind(&existing.kind, kind, existing.blocks == *blocks)
+            });
             let Some(merged_kind) = merged_kind else {
                 continue;
             };
@@ -1560,7 +1753,7 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
                     .region(region)
                     .ok_or(RegionInvariantError::UnknownRegion(region))?;
                 (existing.blocks == *blocks)
-                    .then(|| Self::merge_handler_kind(&existing.kind, kind))
+                    .then(|| Self::merge_handler_kind(&existing.kind, kind, true))
                     .flatten()
             };
             let Some(merged_kind) = merged_kind else {
@@ -1575,16 +1768,36 @@ impl<'a> ExceptionRegionTreeBuilder<'a> {
         Ok(None)
     }
 
-    fn merge_handler_kind(left: &RegionKind, right: &RegionKind) -> Option<RegionKind> {
+    fn merge_handler_kind(
+        left: &RegionKind,
+        right: &RegionKind,
+        same_component: bool,
+    ) -> Option<RegionKind> {
         match (left, right) {
             (RegionKind::Finally, RegionKind::Finally)
             | (RegionKind::Finally, RegionKind::Cleanup(_))
             | (RegionKind::Cleanup(_), RegionKind::Finally) => Some(RegionKind::Finally),
-            (RegionKind::Catch(left), RegionKind::Catch(right)) => (left.exception_types
-                == right.exception_types
-                && left.exception_value == right.exception_value
-                && left.continuation == right.continuation)
-                .then(|| RegionKind::Catch(left.clone())),
+            (RegionKind::Catch(left), RegionKind::Catch(right))
+                if left.exception_types == right.exception_types
+                    && left.exception_value == right.exception_value =>
+            {
+                let continuation = match (left.continuation, right.continuation) {
+                    (left, right) if left == right => left,
+                    // DEX may route nested fallback catches to the same
+                    // physical body. A protection-relative analysis can see
+                    // the body's ordinary re-entry as a continuation for one
+                    // range but not the other. Identical owned components
+                    // prove that the present continuation is the shared
+                    // lexical boundary rather than context-specific code.
+                    (Some(continuation), None) | (None, Some(continuation)) if same_component => {
+                        Some(continuation)
+                    }
+                    _ => return None,
+                };
+                let mut merged = left.clone();
+                merged.continuation = continuation;
+                Some(RegionKind::Catch(merged))
+            }
             (RegionKind::Cleanup(left), RegionKind::Cleanup(right)) => (left.exception_types
                 == right.exception_types
                 && left.exception_value == right.exception_value
@@ -1881,6 +2094,7 @@ impl<'a> SingleEntryTryFragments<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::exception::CleanupProofDiagnostic;
     use crate::ir::{Block, EdgeKind, HandlerKind, InsnNode, InsnType};
 
     fn catch_handler(entry: BlockId, adapters: impl IntoIterator<Item = BlockId>) -> CatchHandler {
@@ -1902,6 +2116,103 @@ mod tests {
             rethrow_blocks: BTreeSet::new(),
             kind: HandlerKind::Catch,
         }
+    }
+
+    fn finally_handler(entry: BlockId) -> CatchHandler {
+        let mut handler = catch_handler(entry, []);
+        handler.catch_type = None;
+        handler.kind = HandlerKind::Finally;
+        handler
+    }
+
+    #[test]
+    fn proven_split_finally_family_recovers_one_outer_try() {
+        let entry = BlockId::new(0);
+        let first_entry = BlockId::new(1);
+        let second_entry = BlockId::new(2);
+        let normal_cleanup = BlockId::new(3);
+        let finally_entry = BlockId::new(4);
+        let mut cfg = CFG::new("split_finally_family");
+        cfg.entry = entry;
+        for block in [
+            entry,
+            first_entry,
+            second_entry,
+            normal_cleanup,
+            finally_entry,
+        ] {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(entry, first_entry, EdgeKind::Normal);
+        cfg.add_edge(first_entry, second_entry, EdgeKind::Normal);
+        cfg.add_edge(second_entry, normal_cleanup, EdgeKind::Normal);
+        cfg.add_edge(first_entry, finally_entry, EdgeKind::Exception);
+        cfg.add_edge(second_entry, finally_entry, EdgeKind::Exception);
+
+        let mut tree = RegionTree::new(Some(entry));
+        tree.cover_method(&cfg).expect("method ownership");
+        let root = tree.root();
+        let first = tree
+            .add_child(root, RegionKind::Try, Some(first_entry))
+            .expect("first split try");
+        tree.add_block(first, first_entry).expect("first try block");
+        let second = tree
+            .add_child(root, RegionKind::Try, Some(second_entry))
+            .expect("second split try");
+        tree.add_block(second, second_entry)
+            .expect("second try block");
+        let finally = tree
+            .add_child(root, RegionKind::Finally, Some(finally_entry))
+            .expect("shared finally");
+        tree.add_block(finally, finally_entry)
+            .expect("finally block");
+
+        let source = |id, block: BlockId| crate::ir::exception::TryRegion {
+            id,
+            start_offset: block.raw(),
+            end_offset: block.raw() + 1,
+            blocks: vec![block],
+            handlers: vec![finally_handler(finally_entry)],
+            parent: None,
+            children: Vec::new(),
+            normal_exit_blocks: vec![normal_cleanup],
+        };
+        let analysis = ExceptionAnalysis {
+            regions: vec![source(10, first_entry), source(11, second_entry)],
+            cleanup_proofs: vec![CleanupProofDiagnostic {
+                region: 10,
+                handler: finally_entry.raw(),
+                normal_entry: normal_cleanup,
+                candidate: normal_cleanup,
+                outcome: CleanupProofOutcome::Proven,
+                mismatch: None,
+            }],
+            ..ExceptionAnalysis::default()
+        };
+        let mut handlers = BTreeMap::from([(first, vec![finally]), (second, vec![finally])]);
+
+        ExceptionRegionCanonicalizer::coalesce_finally_families(
+            &analysis,
+            &cfg,
+            &mut tree,
+            &mut handlers,
+        )
+        .expect("finally family coalescing");
+
+        let synthetic = tree.region(first).unwrap().parent.unwrap();
+        assert_ne!(synthetic, root);
+        assert_eq!(tree.region(second).unwrap().parent, Some(synthetic));
+        assert!(matches!(
+            tree.region(synthetic).unwrap().kind,
+            RegionKind::Try
+        ));
+        assert_eq!(
+            tree.region(synthetic).unwrap().blocks,
+            BTreeSet::from([first_entry, second_entry])
+        );
+        assert_eq!(handlers.get(&synthetic), Some(&vec![finally]));
+        assert!(handlers.get(&first).is_some_and(Vec::is_empty));
+        assert!(handlers.get(&second).is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -1978,6 +2289,190 @@ mod tests {
                 .expect("cleanup component"),
             BTreeSet::from([handler_entry])
         );
+    }
+
+    #[test]
+    fn explicit_try_parent_owns_a_suffix_shared_by_multiple_handlers() {
+        let entry = BlockId::new(0);
+        let mut cfg = CFG::new("shared_handler_suffix_parent");
+        cfg.add_block(Block::new(entry.raw()));
+        let facts = ControlFlowFacts::analyze(&cfg).expect("control-flow facts");
+
+        let shared = [BlockId::new(104), BlockId::new(105)];
+        let owner = |id, handler_entry| {
+            let mut handler = catch_handler(handler_entry, []);
+            handler.lexical_blocks = std::iter::once(handler_entry).chain(shared).collect();
+            crate::ir::exception::TryRegion {
+                id,
+                start_offset: id,
+                end_offset: id + 1,
+                blocks: vec![BlockId::new(id)],
+                handlers: vec![handler],
+                parent: None,
+                children: Vec::new(),
+                normal_exit_blocks: Vec::new(),
+            }
+        };
+        let explicit_parent = crate::ir::exception::TryRegion {
+            id: 11,
+            start_offset: 11,
+            end_offset: 12,
+            blocks: vec![
+                BlockId::new(100),
+                BlockId::new(101),
+                BlockId::new(104),
+                BlockId::new(105),
+            ],
+            handlers: Vec::new(),
+            parent: None,
+            children: vec![12],
+            normal_exit_blocks: Vec::new(),
+        };
+        let nested = crate::ir::exception::TryRegion {
+            id: 12,
+            start_offset: 12,
+            end_offset: 13,
+            blocks: shared.to_vec(),
+            handlers: Vec::new(),
+            parent: Some(11),
+            children: Vec::new(),
+            normal_exit_blocks: Vec::new(),
+        };
+        let analysis = ExceptionAnalysis {
+            regions: vec![
+                owner(3, BlockId::new(76)),
+                owner(4, BlockId::new(71)),
+                owner(6, BlockId::new(66)),
+                explicit_parent,
+                nested,
+            ],
+            ..ExceptionAnalysis::default()
+        };
+        let sources = analysis
+            .regions
+            .iter()
+            .map(|region| (region.id, region))
+            .collect::<BTreeMap<_, _>>();
+        let tree = RegionTree::new(Some(entry));
+        let representatives = BTreeMap::new();
+        let builder = ExceptionRegionTreeBuilder::new(
+            &analysis,
+            &cfg,
+            &facts,
+            &cfg,
+            &facts,
+            &representatives,
+            tree,
+        );
+
+        assert!(matches!(
+            builder.parent_of(sources[&12], &sources),
+            Ok(ExceptionParent::Try(11))
+        ));
+    }
+
+    #[test]
+    fn shared_handler_suffix_is_not_owned_by_region_id_tie_breaking() {
+        let entry = BlockId::new(0);
+        let suffix = BTreeSet::from([BlockId::new(10), BlockId::new(11)]);
+        let mut cfg = CFG::new("shared_handler_suffix_nesting");
+        for block in [entry, BlockId::new(1), BlockId::new(2)]
+            .into_iter()
+            .chain(suffix.iter().copied())
+        {
+            cfg.add_block(Block::new(block.raw()));
+        }
+        cfg.add_edge(entry, BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(2), BlockId::new(10), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(10), BlockId::new(11), EdgeKind::Normal);
+        let facts = ControlFlowFacts::analyze(&cfg).expect("control-flow facts");
+        let mut tree = RegionTree::new(Some(entry));
+        tree.cover_method(&cfg).expect("method ownership");
+        let root = tree.root();
+        let fragment = tree
+            .add_child(root, RegionKind::Try, Some(BlockId::new(10)))
+            .expect("shared try fragment");
+        for block in &suffix {
+            tree.add_block(fragment, *block).expect("fragment block");
+        }
+
+        let analysis = ExceptionAnalysis::default();
+        let representatives = BTreeMap::new();
+        let mut builder = ExceptionRegionTreeBuilder::new(
+            &analysis,
+            &cfg,
+            &facts,
+            &cfg,
+            &facts,
+            &representatives,
+            tree,
+        );
+        let handler_kind = || {
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![crate::ir::ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            })
+        };
+        let first = builder
+            .tree
+            .add_child(root, handler_kind(), Some(BlockId::new(1)))
+            .expect("first handler");
+        builder.handler_domains.insert(
+            first,
+            suffix.iter().copied().chain([BlockId::new(1)]).collect(),
+        );
+        builder
+            .nest_regions_in_handlers()
+            .expect("provisional nesting");
+        assert_eq!(builder.tree.region(fragment).unwrap().parent, Some(first));
+
+        let second = builder
+            .tree
+            .add_child(root, handler_kind(), Some(BlockId::new(2)))
+            .expect("second handler");
+        builder.handler_domains.insert(
+            second,
+            suffix.iter().copied().chain([BlockId::new(2)]).collect(),
+        );
+        builder
+            .nest_regions_in_handlers()
+            .expect("shared-suffix nesting");
+
+        assert_eq!(builder.tree.region(fragment).unwrap().parent, Some(root));
+    }
+
+    #[test]
+    fn same_catch_component_preserves_present_continuation() {
+        let continuation = BlockId::new(7);
+        let catch = |continuation| {
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![crate::ir::ArgType::object("java/lang/NoSuchFieldException")],
+                exception_value: None,
+                continuation,
+            })
+        };
+
+        let merged = ExceptionRegionTreeBuilder::merge_handler_kind(
+            &catch(Some(continuation)),
+            &catch(None),
+            true,
+        )
+        .expect("same physical catch component");
+        assert!(matches!(
+            merged,
+            RegionKind::Catch(CatchRegion {
+                continuation: Some(actual),
+                ..
+            }) if actual == continuation
+        ));
+        assert!(ExceptionRegionTreeBuilder::merge_handler_kind(
+            &catch(Some(continuation)),
+            &catch(None),
+            false,
+        )
+        .is_none());
     }
 
     #[test]

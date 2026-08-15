@@ -225,7 +225,10 @@ impl RegionTransfer {
             RegionExitKind::Return => true,
             RegionExitKind::Break => true,
             RegionExitKind::Continue => true,
-            RegionExitKind::Throw => false,
+            // Ordinary throw instructions have no normal transfer. A Throw
+            // transfer denotes a proven cleanup adapter whose physical edge
+            // enters an enclosing finally before rethrowing.
+            RegionExitKind::Throw => self.kind == RegionTransferKind::Leave,
         }
     }
 }

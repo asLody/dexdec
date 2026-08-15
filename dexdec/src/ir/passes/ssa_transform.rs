@@ -951,4 +951,78 @@ mod tests {
             phi.result.as_ref().unwrap().ssa_version
         );
     }
+
+    #[test]
+    fn throwing_result_preserves_prior_phi_on_exception_edge() {
+        let mut cfg = CFG::new("exception_result_after_join");
+        cfg.registers = 1;
+        cfg.ins = 0;
+        cfg.set_method(MethodContext::new(
+            ArgType::object("Owner"),
+            "call",
+            MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::INT,
+            },
+            true,
+        ));
+
+        cfg.add_block(Block::new(0u32));
+        let mut left = Block::new(1u32);
+        left.push(InsnNode::const_value(RegisterArg::new(0, ArgType::INT), 1));
+        cfg.add_block(left);
+        let mut right = Block::new(2u32);
+        right.push(InsnNode::const_value(RegisterArg::new(0, ArgType::INT), 2));
+        cfg.add_block(right);
+
+        let mut throwing = Block::new(3u32);
+        let mut invoke = InsnNode::new(InsnType::Invoke, 0);
+        invoke.set_result(RegisterArg::new(0, ArgType::INT));
+        throwing.push(invoke);
+        cfg.add_block(throwing);
+        let mut handler = Block::new(4u32);
+        handler.push(InsnNode::ret(Some(InsnArg::reg(0, ArgType::INT))));
+        cfg.add_block(handler);
+        let mut normal = Block::new(5u32);
+        normal.push(InsnNode::ret(Some(InsnArg::reg(0, ArgType::INT))));
+        cfg.add_block(normal);
+
+        cfg.add_edge(BlockId(0), BlockId(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId(0), BlockId(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId(1), BlockId(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId(2), BlockId(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId(3), BlockId(4), EdgeKind::Exception);
+        cfg.add_edge(BlockId(3), BlockId(5), EdgeKind::Normal);
+        cfg.entry = BlockId(0);
+
+        SSATransform.run(&mut cfg).unwrap();
+
+        let throwing = cfg.block(BlockId(3)).unwrap();
+        let prior = throwing
+            .insns
+            .iter()
+            .find(|instruction| instruction.insn_type == InsnType::Phi)
+            .and_then(|phi| phi.result.as_ref())
+            .and_then(|result| result.ssa_version)
+            .expect("joined value before throwing invoke");
+        let invoke_result = throwing
+            .insns
+            .last()
+            .and_then(|invoke| invoke.result.as_ref())
+            .and_then(|result| result.ssa_version)
+            .expect("normal invoke result");
+        let exceptional = cfg
+            .block(BlockId(4))
+            .unwrap()
+            .insns
+            .iter()
+            .find(|instruction| instruction.insn_type == InsnType::Phi)
+            .and_then(|phi| phi.args.first())
+            .and_then(InsnArg::as_register)
+            .and_then(|argument| argument.ssa_version)
+            .expect("exception edge value");
+
+        assert_eq!(exceptional, prior);
+        assert_ne!(exceptional, invoke_result);
+    }
 }

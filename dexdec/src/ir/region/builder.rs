@@ -180,13 +180,7 @@ impl<'a> RegionGraphBuilder<'a> {
                     .extend(inherited);
             }
             for handlers in exception_handlers.values_mut() {
-                for handler in handlers.iter_mut() {
-                    if removed.contains(handler) {
-                        *handler = region_id;
-                    }
-                }
-                handlers.sort();
-                handlers.dedup();
+                remap_removed_handlers(handlers, &removed, region_id);
             }
             elisions.insert_source_equivalent(fact.enter_origin);
             elisions.extend_source_equivalent(fact.release_origins);
@@ -204,6 +198,8 @@ impl<'a> RegionGraphBuilder<'a> {
             &mut exception_handlers,
         )?;
         ExceptionRegionCanonicalizer::apply(
+            analysis,
+            cfg,
             &mut tree,
             &mut exception_region_map,
             &mut exception_handlers,
@@ -260,6 +256,41 @@ impl<'a> RegionGraphBuilder<'a> {
         };
         graph.verify(cfg)?;
         Ok(graph)
+    }
+}
+
+fn remap_removed_handlers(
+    handlers: &mut Vec<RegionId>,
+    removed: &BTreeSet<RegionId>,
+    replacement: RegionId,
+) {
+    for handler in handlers.iter_mut() {
+        if removed.contains(handler) {
+            *handler = replacement;
+        }
+    }
+    // Catch order comes from the DEX handler table. Region ids only reflect
+    // construction order, so sorting here can move a catch-all before typed
+    // catches and make the emitted Java clauses unreachable.
+    let mut seen = BTreeSet::new();
+    handlers.retain(|handler| seen.insert(*handler));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synchronization_handler_remapping_preserves_catch_order() {
+        let typed = RegionId::new(6);
+        let broader_typed = RegionId::new(7);
+        let catch_all = RegionId::new(2);
+        let removed = RegionId::new(8);
+        let mut handlers = vec![typed, broader_typed, catch_all, removed];
+
+        remap_removed_handlers(&mut handlers, &BTreeSet::from([removed]), broader_typed);
+
+        assert_eq!(handlers, vec![typed, broader_typed, catch_all]);
     }
 }
 

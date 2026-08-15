@@ -54,14 +54,8 @@ impl SourceVariableAllocation {
         regions: &RegionGraph,
     ) -> Result<Self, SourceVariableError> {
         let contractions = ControlContractions::for_edge_arguments(cfg, regions);
-        let required_phis = RequiredPhiValues::collect(
-            cfg,
-            values,
-            root,
-            constants,
-            recovered_phis,
-            &contractions,
-        )?;
+        let required_phis =
+            RequiredPhiValues::collect(cfg, values, root, constants, &contractions)?;
         let statement_definitions = StatementDefinitions::collect(root);
         let mut cleanup_values = regions
             .cleanup_value_bindings()

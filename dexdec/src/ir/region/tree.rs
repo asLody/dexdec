@@ -743,6 +743,39 @@ impl RegionTree {
             .ok_or(RegionInvariantError::MissingOwner(block))
     }
 
+    /// Region entered when control transfers from `source` to `block`.
+    ///
+    /// Prefer the outermost loop/switch under `source` that uses `block` as its
+    /// entry. Nested tries frequently share a loop header; entering the try
+    /// would skip the loop and leave later continue/break transfers inactive.
+    pub(super) fn enter_destination(
+        &self,
+        source: RegionId,
+        block: BlockId,
+    ) -> Result<RegionId, RegionInvariantError> {
+        let innermost = self.owner(block)?;
+        if source != innermost && !self.is_ancestor(source, innermost)? {
+            return Ok(innermost);
+        }
+        let mut preferred = innermost;
+        let mut current = Some(innermost);
+        while let Some(region_id) = current {
+            if region_id == source {
+                break;
+            }
+            let region = self
+                .region(region_id)
+                .ok_or(RegionInvariantError::UnknownRegion(region_id))?;
+            if matches!(&region.kind, RegionKind::Loop(_) | RegionKind::Switch(_))
+                && region.entry == Some(block)
+            {
+                preferred = region_id;
+            }
+            current = region.parent;
+        }
+        Ok(preferred)
+    }
+
     pub(super) fn verify(&self, cfg: &CFG) -> Result<(), RegionInvariantError> {
         let root = self
             .region(self.root)
@@ -934,14 +967,7 @@ impl SynchronizationPlacement {
         // source body. Nested release handlers remain lexically enclosed by
         // every outer synchronization, even though their inner owner elides
         // them during semantic lowering.
-        let own_release_blocks = release_handlers
-            .iter()
-            .flat_map(|handler| {
-                tree.region(*handler)
-                    .into_iter()
-                    .flat_map(|region| region.blocks.iter().copied())
-            })
-            .collect::<BTreeSet<_>>();
+        let own_release_blocks = Self::region_subtree_blocks(tree, &release_handlers)?;
         let user_handlers = handlers
             .iter()
             .copied()
@@ -949,10 +975,23 @@ impl SynchronizationPlacement {
                 !release_handlers.contains(handler) && !nested_release_handlers.contains(handler)
             })
             .collect::<BTreeSet<_>>();
-        let mut blocks = blocks
-            .difference(&own_release_blocks)
-            .copied()
-            .collect::<BTreeSet<_>>();
+        // A declared-synchronized method is one source-level lexical scope.
+        // Runtime monitor analysis stops at each synthetic monitor-exit, so it
+        // omits return/throw tails split after the exit. Those tails still
+        // belong to the method body and can otherwise cross a user handler at
+        // the same region depth. Keep only the synthetic enter and this
+        // monitor's release handler outside the recovered source scope.
+        let mut blocks = if method {
+            cfg.block_ids()
+                .into_iter()
+                .filter(|block| *block != enter && !own_release_blocks.contains(block))
+                .collect::<BTreeSet<_>>()
+        } else {
+            blocks
+                .difference(&own_release_blocks)
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
         blocks.extend(user_handlers.iter().flat_map(|handler| {
             tree.region(*handler)
                 .into_iter()
@@ -989,7 +1028,7 @@ impl SynchronizationPlacement {
     }
 
     fn apply(
-        self,
+        mut self,
         tree: &mut RegionTree,
         cfg: &CFG,
         region_handlers: &BTreeMap<RegionId, Vec<RegionId>>,
@@ -1001,6 +1040,12 @@ impl SynchronizationPlacement {
         let handler_splits = self.preserve_user_handlers(tree, cfg, region_handlers)?;
         self.partition_handler_regions(tree, cfg)?;
         let splits = self.partition_try_regions(tree, cfg)?;
+        // Closing over a loop or switch can temporarily pull a synthetic
+        // release subtree back into the recovered source body. Once handler
+        // boundaries have been partitioned, exclude the final release tree so
+        // monitor-exit retries remain represented by `synchronized` itself.
+        let release_blocks = Self::region_subtree_blocks(tree, &self.release_handlers)?;
+        self.blocks.retain(|block| !release_blocks.contains(block));
         self.place_owner(tree)?;
         self.reparent_contained_regions(tree)?;
         self.mark_release_handlers(tree)?;
@@ -1022,6 +1067,26 @@ impl SynchronizationPlacement {
             splits,
             handler_splits,
         })
+    }
+
+    fn region_subtree_blocks(
+        tree: &RegionTree,
+        roots: &BTreeSet<RegionId>,
+    ) -> Result<BTreeSet<BlockId>, RegionInvariantError> {
+        let mut blocks = BTreeSet::new();
+        let mut pending = roots.iter().copied().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(region_id) = pending.pop() {
+            if !visited.insert(region_id) {
+                continue;
+            }
+            let region = tree
+                .region(region_id)
+                .ok_or(RegionInvariantError::UnknownRegion(region_id))?;
+            blocks.extend(region.blocks.iter().copied());
+            pending.extend(region.children.iter().copied());
+        }
+        Ok(blocks)
     }
 
     fn preserve_user_handlers(
@@ -1198,6 +1263,11 @@ impl SynchronizationPlacement {
         tree: &mut RegionTree,
         cfg: &CFG,
     ) -> Result<Vec<(RegionId, RegionId)>, RegionInvariantError> {
+        // Catch/cleanup continuations may sit after monitor-exit. Private
+        // non-throwing closure can still pull those tails into an enclosing
+        // try, which then only partially overlaps the recovered synchronized
+        // body. Drop them before looking for a lexical cut.
+        Self::strip_external_handler_continuations(tree, cfg, &self.blocks)?;
         let mut candidates = tree
             .regions
             .values()
@@ -1225,11 +1295,31 @@ impl SynchronizationPlacement {
                 .region(candidate)
                 .cloned()
                 .ok_or(RegionInvariantError::UnknownRegion(candidate))?;
-            if region.blocks.contains(&self.enter) || region.blocks.contains(&self.entry) {
-                tree.region_mut(candidate)
-                    .ok_or(RegionInvariantError::UnknownRegion(candidate))?
-                    .blocks
-                    .extend(self.blocks.iter().copied());
+            if region.blocks.contains(&self.enter)
+                || region.blocks.contains(&self.entry)
+                || tree.is_ancestor(candidate, self.owner)?
+            {
+                // An enclosing try of the synchronization owner may omit the
+                // post-monitor-enter split block (especially for declared-
+                // synchronized methods whose enter stays on the method entry).
+                // Close that try over the recovered synchronized scope instead
+                // of demanding an impossible lexical cut.
+                //
+                // Also realign the try entry onto the synchronized body entry.
+                // After monitor-enter splitting the try often still points at a
+                // later body block (e.g. B1 while sync enters at B724). Leaving
+                // that stale entry creates a second synchronized port and emits
+                // an empty `synchronized` prefix before the real monitor body.
+                let closed = tree
+                    .region_mut(candidate)
+                    .ok_or(RegionInvariantError::UnknownRegion(candidate))?;
+                closed.blocks.extend(self.blocks.iter().copied());
+                if closed
+                    .entry
+                    .is_some_and(|entry| entry != self.entry && self.blocks.contains(&entry))
+                {
+                    closed.entry = Some(self.entry);
+                }
                 continue;
             }
             let entry = region
@@ -1305,6 +1395,80 @@ impl SynchronizationPlacement {
         Ok(splits)
     }
 
+    fn strip_external_handler_continuations(
+        tree: &mut RegionTree,
+        cfg: &CFG,
+        sync_blocks: &BTreeSet<BlockId>,
+    ) -> Result<(), RegionInvariantError> {
+        let predecessors = cfg.normal_predecessor_snapshot();
+        let tries = tree
+            .regions
+            .values()
+            .filter(|region| matches!(region.kind, RegionKind::Try))
+            .map(|region| region.id)
+            .collect::<Vec<_>>();
+        for try_region in tries {
+            let children = tree
+                .region(try_region)
+                .ok_or(RegionInvariantError::UnknownRegion(try_region))?
+                .children
+                .clone();
+            let mut pending = children;
+            let mut visited = BTreeSet::new();
+            let mut external = BTreeSet::new();
+            while let Some(child) = pending.pop() {
+                if !visited.insert(child) {
+                    continue;
+                }
+                let Some(region) = tree.region(child) else {
+                    continue;
+                };
+                pending.extend(region.children.iter().copied());
+                let continuation = match &region.kind {
+                    RegionKind::Catch(catch) | RegionKind::Cleanup(catch) => catch.continuation,
+                    _ => None,
+                };
+                if let Some(block) = continuation {
+                    if !sync_blocks.contains(&block) {
+                        external.insert(block);
+                    }
+                }
+            }
+            if external.is_empty() {
+                continue;
+            }
+            let region = tree
+                .region_mut(try_region)
+                .ok_or(RegionInvariantError::UnknownRegion(try_region))?;
+            region.blocks.retain(|block| !external.contains(block));
+            // Catch continuations that restart a surrounding loop may also be
+            // the try's lexical entry (via entry_connectors). Dropping them
+            // without repairing entry leaves `entry` outside `blocks`.
+            if let Some(entry) = region.entry {
+                if !region.blocks.contains(&entry) {
+                    let remaining = region.blocks.clone();
+                    region.entry = remaining
+                        .iter()
+                        .copied()
+                        .filter(|block| {
+                            *block == cfg.entry
+                                || predecessors
+                                    .get(block)
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|predecessor| !remaining.contains(predecessor))
+                        })
+                        .min_by_key(|block| {
+                            cfg.block(*block)
+                                .map(|block| (block.offset, block.id.raw()))
+                                .unwrap_or((u32::MAX, block.raw()))
+                        });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn remove_release_segments(
         &self,
         tree: &mut RegionTree,
@@ -1368,11 +1532,6 @@ impl SynchronizationPlacement {
             let Some(entry) = region.entry else {
                 continue;
             };
-            let boundary =
-                LexicalBoundaryAnalysis::new(cfg).partition(entry, &region.blocks, blocks);
-            let Some(boundary) = boundary else {
-                continue;
-            };
             let parent = region
                 .parent
                 .ok_or(RegionInvariantError::MissingRegionParent {
@@ -1380,6 +1539,12 @@ impl SynchronizationPlacement {
                     parent: tree.root,
                 })?;
             let children = region.children.clone();
+            let region_blocks = region.blocks.clone();
+            let boundary =
+                LexicalBoundaryAnalysis::new(cfg).partition(entry, &region_blocks, blocks);
+            let Some(boundary) = boundary else {
+                continue;
+            };
             let mut promote = Vec::new();
             let mut crossing = None;
             for child in children {
@@ -1411,6 +1576,10 @@ impl SynchronizationPlacement {
                 });
             }
 
+            let removed = region_blocks
+                .difference(&boundary.blocks)
+                .copied()
+                .collect::<BTreeSet<_>>();
             let kind = &mut tree
                 .region_mut(candidate)
                 .ok_or(RegionInvariantError::UnknownRegion(candidate))?
@@ -1426,6 +1595,21 @@ impl SynchronizationPlacement {
             tree.region_mut(candidate)
                 .ok_or(RegionInvariantError::UnknownRegion(candidate))?
                 .blocks = boundary.blocks;
+
+            // Keep enclosing tries laminar with the monitor: they must not
+            // retain the continuation that now sits outside the synchronized
+            // body.
+            let mut ancestor = Some(parent);
+            while let Some(region_id) = ancestor {
+                if Some(region_id) == owner || region_id == tree.root {
+                    break;
+                }
+                let current = tree
+                    .region_mut(region_id)
+                    .ok_or(RegionInvariantError::UnknownRegion(region_id))?;
+                ancestor = current.parent;
+                current.blocks.retain(|block| !removed.contains(block));
+            }
 
             for child in promote {
                 Self::unlink(tree, candidate, child)?;
@@ -1672,10 +1856,21 @@ impl SynchronizationPlacement {
         &self,
         tree: &mut RegionTree,
     ) -> Result<(), RegionInvariantError> {
+        let owner_ancestors = tree
+            .parent_chain(self.owner)?
+            .into_iter()
+            .skip(1)
+            .collect::<BTreeSet<_>>();
         let contained = tree
             .regions
             .values()
             .filter(|region| region.id != tree.root && region.id != self.owner)
+            // An enclosing try can cover exactly the synchronized body while
+            // providing source catches outside the monitor. It contains the
+            // same blocks, but moving it below its own synchronized child
+            // creates a parent cycle and inverts the release-before-catch
+            // semantics.
+            .filter(|region| !owner_ancestors.contains(&region.id))
             .filter(|region| !region.blocks.is_empty() && region.blocks.is_subset(&self.blocks))
             .map(|region| region.id)
             .collect::<BTreeSet<_>>();
@@ -1784,6 +1979,46 @@ mod tests {
     }
 
     #[test]
+    fn synchronization_reparenting_preserves_coincident_try_ancestor() {
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        let root = tree.root();
+        let outer_try = add_region(&mut tree, root, RegionKind::Try, 1, [1, 2]);
+        let owner = add_region(&mut tree, outer_try, RegionKind::Try, 1, [1, 2]);
+        let contained = add_region(
+            &mut tree,
+            outer_try,
+            RegionKind::Loop(LoopRegion {
+                follow: None,
+                latches: blocks([2]),
+            }),
+            2,
+            [2],
+        );
+        let placement = SynchronizationPlacement {
+            owner,
+            enter: BlockId::new(0),
+            lock: InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object"))),
+            entry: BlockId::new(1),
+            blocks: blocks([1, 2]),
+            release_handlers: BTreeSet::new(),
+            user_handlers: BTreeSet::new(),
+            release_segments: BTreeSet::new(),
+            duplicate_handlers: Vec::new(),
+            method: false,
+        };
+
+        placement.reparent_contained_regions(&mut tree).unwrap();
+
+        assert_eq!(tree.region(outer_try).unwrap().parent, Some(root));
+        assert_eq!(tree.region(owner).unwrap().parent, Some(outer_try));
+        assert_eq!(tree.region(contained).unwrap().parent, Some(owner));
+        assert_eq!(
+            tree.parent_chain(owner).unwrap(),
+            vec![owner, outer_try, root]
+        );
+    }
+
+    #[test]
     fn strict_subsets_follow_lexical_nesting() {
         let mut tree = RegionTree::new(Some(BlockId::new(0)));
         let root = tree.root();
@@ -1878,6 +2113,76 @@ mod tests {
     }
 
     #[test]
+    fn synchronization_strips_nested_try_handler_continuations_outside_monitor() {
+        let mut cfg = CFG::new("synchronized_try_external_continuation");
+        for id in 0..=6 {
+            cfg.add_block(Block::new(id));
+        }
+        for (source, target) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            cfg.add_edge(BlockId::new(source), BlockId::new(target), EdgeKind::Normal);
+        }
+        for source in 1..=3 {
+            cfg.add_edge(BlockId::new(source), BlockId::new(5), EdgeKind::Exception);
+        }
+        cfg.add_edge(BlockId::new(5), BlockId::new(6), EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let owner = add_region(&mut tree, root, RegionKind::Try, 1, [1, 2, 3]);
+        let nested = add_region(&mut tree, owner, RegionKind::Try, 2, [2, 3, 4]);
+        let catch = add_region(
+            &mut tree,
+            nested,
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![ArgType::object("java/lang/Exception")],
+                exception_value: None,
+                continuation: Some(BlockId::new(4)),
+            }),
+            3,
+            [3],
+        );
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            5,
+            [5, 6],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::from([(owner, vec![catch, release])]),
+            owner,
+            &[catch, release],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3]),
+            &blocks([5]),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tree.region(owner).map(|region| &region.kind),
+            Some(RegionKind::Synchronized(_))
+        ));
+        assert_eq!(tree.region(nested).unwrap().blocks, blocks([2, 3]));
+        assert!(!tree
+            .region(nested)
+            .unwrap()
+            .blocks
+            .contains(&BlockId::new(4)));
+    }
+
+    #[test]
     fn standalone_synchronization_partitions_a_handler_return_continuation() {
         let mut cfg = CFG::new("synchronized_handler_return");
         for id in 0..=8 {
@@ -1934,6 +2239,176 @@ mod tests {
             Some(RegionKind::Synchronized(_))
         ));
         assert_eq!(tree.region(synchronization).unwrap().blocks, scope);
+    }
+
+    #[test]
+    fn synchronization_closes_ancestor_try_missing_split_entry() {
+        let mut cfg = CFG::new("declared_synchronized_split_entry");
+        for id in 0..=5 {
+            cfg.add_block(Block::new(id));
+        }
+        for (source, target) in [(0, 1), (1, 2), (2, 3)] {
+            cfg.add_edge(BlockId::new(source), BlockId::new(target), EdgeKind::Normal);
+        }
+        for source in 1..=2 {
+            cfg.add_edge(BlockId::new(source), BlockId::new(4), EdgeKind::Exception);
+        }
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        // Outer try owns the original body but not the post-enter split block.
+        let outer = add_region(&mut tree, root, RegionKind::Try, 2, [2, 3, 4]);
+        let owner = add_region(&mut tree, outer, RegionKind::Try, 2, [2, 3]);
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4, 5],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::from([(owner, vec![release])]),
+            owner,
+            &[release],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3]),
+            &blocks([4]),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            tree.region(owner).map(|region| &region.kind),
+            Some(RegionKind::Synchronized(_))
+        ));
+        assert!(tree
+            .region(outer)
+            .unwrap()
+            .blocks
+            .is_superset(&blocks([1, 2, 3])));
+        assert_eq!(
+            tree.region(outer).and_then(|region| region.entry),
+            Some(BlockId::new(1)),
+            "enclosing try must enter at the synchronized body entry after split"
+        );
+    }
+
+    #[test]
+    fn declared_synchronization_owns_split_return_tails() {
+        let mut cfg = CFG::new("declared_synchronized_return_tails");
+        for id in 0..=7 {
+            cfg.add_block(Block::new(id));
+        }
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4, 5],
+        );
+        let user_handler = add_region(
+            &mut tree,
+            root,
+            RegionKind::Catch(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            6,
+            [6, 7],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        let placement = SynchronizationPlacement::analyze(
+            &tree,
+            &cfg,
+            root,
+            &[release, user_handler],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 4, 6]),
+            &blocks([4]),
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(placement.blocks, blocks([1, 2, 3, 6, 7]));
+    }
+
+    #[test]
+    fn synchronization_excludes_release_blocks_reintroduced_by_control_closure() {
+        let mut cfg = CFG::new("synchronized_release_retry_loop");
+        for id in 0..=4 {
+            cfg.add_block(Block::new(id));
+        }
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let owner = add_region(&mut tree, root, RegionKind::Try, 1, [1, 2, 3, 4]);
+        let release = add_region(
+            &mut tree,
+            root,
+            RegionKind::Cleanup(CatchRegion {
+                exception_types: vec![ArgType::throwable()],
+                exception_value: None,
+                continuation: None,
+            }),
+            4,
+            [4],
+        );
+        let retry_loop = add_region(
+            &mut tree,
+            root,
+            RegionKind::Loop(LoopRegion {
+                follow: None,
+                latches: blocks([4]),
+            }),
+            3,
+            [3, 4],
+        );
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::new(),
+            owner,
+            &[release],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3, 4]),
+            &blocks([4]),
+            &BTreeSet::from([retry_loop]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(tree.region(owner).unwrap().blocks, blocks([1, 2, 3]));
+        assert_eq!(tree.region(release).unwrap().blocks, blocks([4]));
+        tree.verify(&cfg).unwrap();
     }
 
     #[test]

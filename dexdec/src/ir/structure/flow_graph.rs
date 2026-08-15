@@ -1677,8 +1677,14 @@ impl SemanticFolder for TerminalContinuationBinding<'_> {
 ///
 /// Exclusive paths are moved into the fragment. Shared paths are duplicated,
 /// which is the standard tail-duplication step used to recover a single-entry,
-/// single-exit region. Only transfer-free, normally completing nodes qualify,
-/// and a hard path budget bounds code growth.
+/// single-exit region. Only transfer-free, normally completing adapter nodes
+/// qualify, and a hard path budget bounds code growth.
+///
+/// Nodes that already carry lexical labels are never absorbed. After a fragment
+/// collapses to a single open exit, [`FragmentNormalizer::normalize`] wraps its
+/// body in a label; treating that structured unit as an Exclusive adapter would
+/// inline whole try/catch regions into earlier fragments and cascade into
+/// exponential duplication on sequential open-flow methods.
 struct LinearContinuation {
     source: BlockId,
     target: BlockId,
@@ -1695,6 +1701,13 @@ enum ContinuationUse {
 
 impl LinearContinuation {
     const DUPLICATION_BUDGET: usize = 32;
+
+    fn is_absorbable_adapter(body: &SemanticNode) -> bool {
+        let completion = SemanticCompletion::analyze(body);
+        completion.can_complete_normally()
+            && completion.is_transfer_free()
+            && LexicalIdentities::collect(body).labels.is_empty()
+    }
 
     fn analyze(graph: &SemanticFlowGraph) -> Result<Option<Self>, StructureError> {
         let predecessors = graph.predecessors();
@@ -1732,8 +1745,7 @@ impl LinearContinuation {
                     let Some(continuation) = graph.nodes.get(&current) else {
                         break;
                     };
-                    let completion = SemanticCompletion::analyze(&continuation.body);
-                    if !completion.can_complete_normally() || !completion.is_transfer_free() {
+                    if !Self::is_absorbable_adapter(&continuation.body) {
                         break;
                     }
                     let FlowTransfer::Jump(next) = &continuation.transfer else {
@@ -1744,15 +1756,6 @@ impl LinearContinuation {
                     current = *next;
                 }
                 if !blocks.is_empty() && !blocks.contains(&current) {
-                    if use_kind == ContinuationUse::Shared
-                        && blocks.iter().any(|block| {
-                            graph.nodes.get(block).is_some_and(|node| {
-                                !LexicalIdentities::collect(&node.body).labels.is_empty()
-                            })
-                        })
-                    {
-                        continue;
-                    }
                     return Ok(Some(Self {
                         source: *source,
                         target,
@@ -3845,6 +3848,97 @@ mod tests {
         assert_eq!(branch.join, join);
         assert_eq!(branch.true_arm.nodes, BTreeSet::from([when_true]));
         assert_eq!(branch.false_arm.nodes, BTreeSet::from([when_false]));
+    }
+
+    #[test]
+    fn linear_continuation_does_not_absorb_labeled_successor_fragments() {
+        // Sequential open-flow fragments collapse to labeled Jump nodes. Exclusive
+        // LinearContinuation must not treat those structured units as adapters, or
+        // each earlier fragment inlines the next and duplication cascades.
+        let first = BlockId::new(0);
+        let second = BlockId::new(1);
+        let join = BlockId::new(2);
+        let region = RegionId::new(0);
+        let second_label = SemanticLabel::block(region, BlockId::new(10));
+        let jump = |target| {
+            SemanticNode::Leave(crate::ir::SemanticLeave {
+                site: None,
+                condition: None,
+                kind: SemanticLeaveKind::Jump(target),
+                edge: None,
+                origin: None,
+                source: region,
+                destination: region,
+                target: region,
+                cleanup: Vec::new(),
+            })
+        };
+        let labeled_second = SemanticNode::Label {
+            label: second_label,
+            body: Box::new(SemanticNode::sequence([
+                SemanticNode::BasicBlock(crate::ir::SemanticBlock {
+                    id: second,
+                    statements: Vec::new(),
+                }),
+                SemanticNode::Leave(crate::ir::SemanticLeave {
+                    site: None,
+                    condition: None,
+                    kind: SemanticLeaveKind::BreakLabel(second_label),
+                    edge: None,
+                    origin: None,
+                    source: region,
+                    destination: region,
+                    target: region,
+                    cleanup: Vec::new(),
+                }),
+            ])),
+        };
+        let mut graph = SemanticFlowGraph {
+            region,
+            entry: first,
+            nodes: BTreeMap::from([
+                (
+                    first,
+                    FlowNode {
+                        body: SemanticNode::sequence([jump(second), jump(join)]),
+                        transfer: FlowTransfer::Fragment {
+                            normal: None,
+                            open: BTreeSet::from([second, join]),
+                        },
+                    },
+                ),
+                (
+                    second,
+                    FlowNode {
+                        body: labeled_second,
+                        transfer: FlowTransfer::Jump(join),
+                    },
+                ),
+                (
+                    join,
+                    FlowNode {
+                        body: SemanticNode::Empty,
+                        transfer: FlowTransfer::Stop,
+                    },
+                ),
+            ]),
+            next_id: 11,
+            continues: BTreeMap::new(),
+            exits: BTreeSet::new(),
+        };
+
+        FragmentNormalizer::apply(&mut graph).expect("fragment normalization");
+
+        assert!(
+            graph.nodes.contains_key(&second),
+            "labeled successor fragment must remain a separate graph node"
+        );
+        let first_weight = SemanticWeight::of(&graph.nodes[&first].body);
+        let second_weight = SemanticWeight::of(&graph.nodes[&second].body);
+        assert!(
+            first_weight < second_weight.saturating_mul(2).saturating_add(16),
+            "first fragment must not absorb the labeled successor body"
+        );
     }
 
     #[test]

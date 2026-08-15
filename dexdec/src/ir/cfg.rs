@@ -561,6 +561,14 @@ impl CFG {
         self.preds_dirty = true;
     }
 
+    /// Remove one typed edge while preserving parallel edges with a different kind.
+    pub fn remove_edge_with_kind(&mut self, from: BlockId, to: BlockId, kind: EdgeKind) {
+        if let Some(successors) = self.successors.get_mut(&from) {
+            successors.retain(|edge| *edge != (to, kind));
+        }
+        self.preds_dirty = true;
+    }
+
     /// Get the kind of edge between two blocks, if it exists.
     pub fn get_edge_kind(&self, from: BlockId, to: BlockId) -> Option<EdgeKind> {
         self.successors

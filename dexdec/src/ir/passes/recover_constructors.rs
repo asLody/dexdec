@@ -610,21 +610,13 @@ impl Pass for RecoverConstructors<'_> {
         let mut exceptional_merges = facts
             .discarded_allocations()
             .iter()
-            .map(|allocation| {
-                let successors = cfg.successors_with_kind(allocation.block);
-                ExceptionalAllocationMerge {
-                    allocation: allocation.block,
-                    handlers: successors
-                        .iter()
-                        .filter_map(|(target, kind)| {
-                            (*kind == EdgeKind::Exception
-                                && !successors.iter().any(|(normal_target, normal_kind)| {
-                                    normal_target == target && *normal_kind != EdgeKind::Exception
-                                }))
-                            .then_some(*target)
-                        })
-                        .collect(),
-                }
+            .map(|allocation| ExceptionalAllocationMerge {
+                allocation: allocation.block,
+                handlers: cfg
+                    .successors_with_kind(allocation.block)
+                    .iter()
+                    .filter_map(|(target, kind)| (*kind == EdgeKind::Exception).then_some(*target))
+                    .collect(),
             })
             .collect::<Vec<_>>();
         let mut versions = SyntheticVersions::new(&values);
@@ -759,7 +751,7 @@ struct ExceptionalAllocationMerge {
 impl ExceptionalAllocationMerge {
     fn apply(self, cfg: &mut CFG) -> Result<(), ConstructorRecoveryError> {
         for handler in self.handlers {
-            cfg.remove_edge(self.allocation, handler);
+            cfg.remove_edge_with_kind(self.allocation, handler, EdgeKind::Exception);
             let block = cfg
                 .block_mut(handler)
                 .ok_or(ConstructorRecoveryError::MissingHandler(handler))?;
@@ -884,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_allocation_preserves_shared_normal_and_exception_target() {
+    fn discarded_allocation_removes_exception_edge_to_shared_normal_target() {
         let entry_id = BlockId::new(2);
         let allocation_id = BlockId::new(0);
         let continuation_id = BlockId::new(1);
@@ -930,10 +922,16 @@ mod tests {
 
         assert_eq!(result, PassResult::Changed);
         assert!(cfg.has_edge(allocation_id, continuation_id));
-        assert_eq!(cfg.successors_with_kind(allocation_id).len(), 2);
+        assert_eq!(
+            cfg.successors_with_kind(allocation_id),
+            &[(continuation_id, EdgeKind::Normal)]
+        );
         assert!(cfg.block(allocation_id).unwrap().insns.is_empty());
         let phi = &cfg.block(continuation_id).unwrap().insns[0];
-        assert_eq!(phi.args.len(), 2);
-        assert_eq!(phi.payload.phi_edges.len(), 2);
+        assert_eq!(phi.args.len(), 1);
+        assert_eq!(
+            phi.payload.phi_edges,
+            vec![(allocation_id, EdgeKind::Normal)]
+        );
     }
 }
