@@ -4588,6 +4588,14 @@ impl JavaDialect for DexJavaDialect {
         };
         let ty = self
             .source_register_type(register)
+            // A source variable can span disjoint DEX register lifetimes. Do
+            // not let an earlier primitive lifetime type a reference-valued
+            // enhanced-for binding (or vice versa).
+            .filter(|source| {
+                let source_is_primitive = matches!(source, JavaType::Primitive(_));
+                !(source_is_primitive && binding_type.is_reference()
+                    || !source_is_primitive && binding_type.is_primitive())
+            })
             .cloned()
             .map(Ok)
             .unwrap_or_else(|| self.source_type(binding_type))?;
@@ -4887,6 +4895,73 @@ impl JavaDialect for DexJavaDialect {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use crate::ir::analysis::SourceTypeEnvironment;
+    use crate::ir::{ArgType, RegisterArg};
+
+    use super::{DexJavaDialect, JavaDialect, JavaMemberNames, JavaType};
+
+    #[test]
+    fn foreach_binding_ignores_a_reused_primitive_source_variable_type() {
+        let erased = ArgType::object("java/util/ArrayList");
+        let reference = JavaType::source_class("java.util.ArrayList");
+        let mut dialect = DexJavaDialect::new(
+            true,
+            None,
+            &[],
+            &[],
+            &SourceTypeEnvironment::default(),
+            BTreeMap::from([(erased.clone(), reference.clone())]),
+            Arc::new(JavaMemberNames::default()),
+        )
+        .expect("static dialect");
+        dialect.source_variable_types.insert(6, JavaType::int());
+        let register = RegisterArg {
+            reg_num: 1,
+            ty: erased,
+            ssa_version: Some(3),
+            code_var: Some(6),
+        };
+
+        let (ty, _) = JavaDialect::loop_variable(&mut dialect, &register)
+            .expect("reference-valued foreach binding");
+
+        assert_eq!(ty, reference);
+    }
+
+    #[test]
+    fn foreach_binding_keeps_a_reference_source_type_over_object_erasure() {
+        let erased = ArgType::object("java/lang/Object");
+        let reference = JavaType::source_class("example.Element");
+        let mut dialect = DexJavaDialect::new(
+            true,
+            None,
+            &[],
+            &[],
+            &SourceTypeEnvironment::default(),
+            BTreeMap::from([(erased.clone(), JavaType::source_class("java.lang.Object"))]),
+            Arc::new(JavaMemberNames::default()),
+        )
+        .expect("static dialect");
+        dialect.source_variable_types.insert(6, reference.clone());
+        let register = RegisterArg {
+            reg_num: 1,
+            ty: erased,
+            ssa_version: Some(3),
+            code_var: Some(6),
+        };
+
+        let (ty, _) =
+            JavaDialect::loop_variable(&mut dialect, &register).expect("reference source type");
+
+        assert_eq!(ty, reference);
     }
 }
 

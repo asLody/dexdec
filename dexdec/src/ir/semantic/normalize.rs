@@ -735,9 +735,142 @@ impl SemanticFolder for SourceSemanticNormalizer {
             SemanticNode::BasicBlock(block) if block.statements.is_empty() => SemanticNode::Empty,
             node => node,
         };
+        let node = RedundantVacuousPredicate::rewrite(node);
         let node = BranchLinearizer::rewrite(node);
         let node = TryLexicalScope::extend(node);
         SemanticNormalizer::new(ReachabilityMode::PruneUnreachable).finish_node(node)
+    }
+}
+
+/// Remove a vacuous predicate when source-value recovery has transferred its
+/// evaluation into the immediately following condition.
+///
+/// The shared instruction identity is important: two bytecode comparisons
+/// that happen to look alike must still be emitted twice. We also require the
+/// replay to occur before any other effect in the following condition so that
+/// deleting the stale evaluation cannot reorder throws or side effects.
+struct RedundantVacuousPredicate;
+
+impl RedundantVacuousPredicate {
+    fn rewrite(node: SemanticNode) -> SemanticNode {
+        let SemanticNode::Sequence(nodes) = node else {
+            return node;
+        };
+        let redundant = nodes
+            .windows(2)
+            .map(|pair| {
+                Self::vacuous_test_id(&pair[0])
+                    .is_some_and(|test| Self::node_replays_before_effects(&pair[1], test))
+            })
+            .chain(std::iter::once(false))
+            .collect::<Vec<_>>();
+        let retained = nodes
+            .into_iter()
+            .zip(redundant)
+            .filter_map(|(node, redundant)| (!redundant).then_some(node));
+        SemanticNode::sequence(retained)
+    }
+
+    fn vacuous_test_id(node: &SemanticNode) -> Option<crate::ir::InstructionId> {
+        let SemanticNode::If {
+            condition,
+            then_node,
+            else_node: None,
+        } = node
+        else {
+            return None;
+        };
+        if !matches!(then_node.as_ref(), SemanticNode::Empty) {
+            return None;
+        }
+        Self::single_test_id(condition)
+    }
+
+    fn single_test_id(predicate: &SemanticPredicate) -> Option<crate::ir::InstructionId> {
+        let operation = match predicate {
+            SemanticPredicate::Test(operation) => operation,
+            SemanticPredicate::Not(inner) => return Self::single_test_id(inner),
+            SemanticPredicate::True
+            | SemanticPredicate::False
+            | SemanticPredicate::And(_)
+            | SemanticPredicate::Or(_) => return None,
+        };
+        operation.id.is_valid().then_some(operation.id)
+    }
+
+    fn node_replays_before_effects(node: &SemanticNode, target: crate::ir::InstructionId) -> bool {
+        match node {
+            SemanticNode::If { condition, .. } => {
+                Self::predicate_replays_before_effects(condition, target)
+            }
+            SemanticNode::Empty
+            | SemanticNode::Sequence(_)
+            | SemanticNode::BasicBlock(_)
+            | SemanticNode::Loop { .. }
+            | SemanticNode::For { .. }
+            | SemanticNode::ForEach { .. }
+            | SemanticNode::Switch { .. }
+            | SemanticNode::Try { .. }
+            | SemanticNode::Synchronized { .. }
+            | SemanticNode::Label { .. }
+            | SemanticNode::Leave(_) => false,
+        }
+    }
+
+    fn predicate_replays_before_effects(
+        predicate: &SemanticPredicate,
+        target: crate::ir::InstructionId,
+    ) -> bool {
+        if Self::single_test_id(predicate) == Some(target) {
+            return true;
+        }
+        match predicate {
+            SemanticPredicate::Test(operation) => {
+                let Ok(operands) = operation.evaluation_operands() else {
+                    return false;
+                };
+                for operand in operands {
+                    if Self::expression_replays_before_effects(operand, target) {
+                        return true;
+                    }
+                    if !operand.effects().is_pure() {
+                        return false;
+                    }
+                }
+                false
+            }
+            SemanticPredicate::Not(inner) => Self::predicate_replays_before_effects(inner, target),
+            SemanticPredicate::And(terms) | SemanticPredicate::Or(terms) => terms
+                .first()
+                .is_some_and(|term| Self::predicate_replays_before_effects(term, target)),
+            SemanticPredicate::True | SemanticPredicate::False => false,
+        }
+    }
+
+    fn expression_replays_before_effects(
+        expression: &SemanticExpression,
+        target: crate::ir::InstructionId,
+    ) -> bool {
+        match expression {
+            SemanticExpression::Register(_) | SemanticExpression::Literal(_) => false,
+            SemanticExpression::Select { condition, .. } => {
+                Self::predicate_replays_before_effects(condition, target)
+            }
+            SemanticExpression::Operation(operation) => {
+                let Ok(operands) = operation.evaluation_operands() else {
+                    return false;
+                };
+                for operand in operands {
+                    if Self::expression_replays_before_effects(operand, target) {
+                        return true;
+                    }
+                    if !operand.effects().is_pure() {
+                        return false;
+                    }
+                }
+                false
+            }
+        }
     }
 }
 
@@ -1537,5 +1670,94 @@ impl SemanticSize {
 impl SemanticVisitor for SemanticSize {
     fn enter_node(&mut self, _node: &SemanticNode) {
         self.nodes = self.nodes.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod redundant_vacuous_predicate_tests {
+    use super::*;
+    use crate::ir::{
+        ArgType, IfOp, InsnNode, InsnType, InstructionId, InvokeType, LiteralArg, RegisterArg,
+        SemanticOperand, SemanticOperation,
+    };
+
+    fn invoke_predicate(id: usize) -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::Invoke, 0);
+        instruction.id = InstructionId::new(id);
+        instruction.payload.invoke_type = Some(InvokeType::Static);
+        instruction.result = Some(RegisterArg::new_ssa(0, id as u32, ArgType::BOOLEAN));
+        SemanticPredicate::Test(SemanticOperation::from_parts(instruction, Vec::new(), None))
+    }
+
+    fn replaying_predicate(
+        id: usize,
+        replayed: SemanticPredicate,
+        prefix: Option<SemanticExpression>,
+    ) -> SemanticPredicate {
+        let selected = SemanticExpression::select(
+            replayed,
+            SemanticExpression::Literal(LiteralArg::int(0)),
+            SemanticExpression::Literal(LiteralArg::int(1)),
+        );
+        let mut operands = Vec::new();
+        operands.extend(prefix);
+        operands.push(selected);
+        operands.push(SemanticExpression::Literal(LiteralArg::int(0)));
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(id);
+        instruction.payload.if_op = Some(IfOp::Eq);
+        SemanticPredicate::Test(SemanticOperation::from_parts(instruction, operands, None))
+    }
+
+    fn vacuous(condition: SemanticPredicate) -> SemanticNode {
+        SemanticNode::If {
+            condition: SemanticOperand::new(condition),
+            then_node: Box::new(SemanticNode::Empty),
+            else_node: None,
+        }
+    }
+
+    #[test]
+    fn removes_vacuous_predicate_replayed_by_following_condition() {
+        let predicate = invoke_predicate(1);
+        let following = vacuous(replaying_predicate(2, predicate.clone(), None));
+        let rewritten = RedundantVacuousPredicate::rewrite(SemanticNode::Sequence(vec![
+            vacuous(predicate),
+            following,
+        ]));
+
+        let SemanticNode::If { condition, .. } = rewritten else {
+            panic!("expected only the following condition, got {rewritten:?}");
+        };
+        assert_eq!(
+            RedundantVacuousPredicate::single_test_id(&condition),
+            Some(InstructionId::new(2))
+        );
+    }
+
+    #[test]
+    fn keeps_vacuous_predicate_without_a_replay() {
+        let rewritten = RedundantVacuousPredicate::rewrite(SemanticNode::Sequence(vec![
+            vacuous(invoke_predicate(1)),
+            vacuous(invoke_predicate(2)),
+        ]));
+
+        assert!(matches!(rewritten, SemanticNode::Sequence(nodes) if nodes.len() == 2));
+    }
+
+    #[test]
+    fn keeps_vacuous_predicate_when_an_effect_precedes_the_replay() {
+        let predicate = invoke_predicate(1);
+        let prefix = SemanticExpression::Operation(Box::new(match invoke_predicate(3) {
+            SemanticPredicate::Test(operation) => operation,
+            _ => unreachable!(),
+        }));
+        let following = vacuous(replaying_predicate(2, predicate.clone(), Some(prefix)));
+        let rewritten = RedundantVacuousPredicate::rewrite(SemanticNode::Sequence(vec![
+            vacuous(predicate),
+            following,
+        ]));
+
+        assert!(matches!(rewritten, SemanticNode::Sequence(nodes) if nodes.len() == 2));
     }
 }

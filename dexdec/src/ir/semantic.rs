@@ -1018,16 +1018,28 @@ impl SemanticNode {
     }
 
     pub fn guard(condition: SemanticPredicate, node: SemanticNode) -> Self {
-        if condition.constant_value() == Some(true) || matches!(node, Self::Empty) {
-            node
-        } else if condition.constant_value() == Some(false) {
-            Self::Empty
-        } else {
-            Self::If {
-                condition: SemanticOperand::new(condition),
-                then_node: Box::new(node),
-                else_node: None,
+        match condition.constant_value() {
+            Some(true) => return node,
+            Some(false) => return Self::Empty,
+            None => {}
+        }
+        if matches!(node, Self::Empty) {
+            // Vacuous branches must still evaluate effectful predicates.
+            // Value recovery can inline invokes into `If` conditions and leave
+            // both arms empty; dropping the condition would erase those effects.
+            if condition.effects().is_pure() {
+                return Self::Empty;
             }
+            return Self::If {
+                condition: SemanticOperand::new(condition),
+                then_node: Box::new(Self::Empty),
+                else_node: None,
+            };
+        }
+        Self::If {
+            condition: SemanticOperand::new(condition),
+            then_node: Box::new(node),
+            else_node: None,
         }
     }
 
@@ -1042,7 +1054,17 @@ impl SemanticNode {
             None => {}
         }
         match (then_node, else_node) {
-            (Self::Empty, None | Some(Self::Empty)) => Self::Empty,
+            (Self::Empty, None | Some(Self::Empty)) => {
+                if condition.effects().is_pure() {
+                    Self::Empty
+                } else {
+                    Self::If {
+                        condition: SemanticOperand::new(condition),
+                        then_node: Box::new(Self::Empty),
+                        else_node: None,
+                    }
+                }
+            }
             (Self::Empty, Some(else_node)) => Self::guard(condition.negate(), else_node),
             (then_node, None | Some(Self::Empty)) => Self::guard(condition, then_node),
             (then_node, Some(else_node)) => Self::If {
@@ -1051,6 +1073,70 @@ impl SemanticNode {
                 else_node: Some(Box::new(else_node)),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod branch_effect_tests {
+    use super::*;
+    use crate::ir::{
+        ArgType, InstructionId, InvokeType, LiteralArg, MemberReference, MethodDescriptor,
+        MethodReference,
+    };
+
+    fn invoke_predicate() -> SemanticPredicate {
+        let mut instruction = InsnNode::new(InsnType::Invoke, 0);
+        instruction.id = InstructionId::new(1);
+        instruction.payload.invoke_type = Some(InvokeType::Virtual);
+        instruction.payload.reference = Some(MemberReference::Method(MethodReference {
+            owner: ArgType::object("java/util/ArrayList"),
+            name: "remove".into(),
+            descriptor: MethodDescriptor {
+                parameters: vec![ArgType::object("java/lang/Object")],
+                return_type: ArgType::BOOLEAN,
+            },
+        }));
+        instruction.result = Some(RegisterArg::new_ssa(0, 0, ArgType::BOOLEAN));
+        let operation = SemanticOperation::from_instruction(instruction).expect("invoke");
+        SemanticPredicate::Test(operation)
+    }
+
+    #[test]
+    fn branch_keeps_effectful_predicate_when_arms_are_empty() {
+        let node = SemanticNode::branch(invoke_predicate(), SemanticNode::Empty, None);
+        match node {
+            SemanticNode::If {
+                condition,
+                then_node,
+                else_node,
+            } => {
+                assert!(matches!(then_node.as_ref(), SemanticNode::Empty));
+                assert!(else_node.is_none());
+                assert!(!condition.value.effects().is_pure());
+            }
+            other => panic!("expected vacuous if, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_drops_pure_predicate_when_arms_are_empty() {
+        let mut instruction = InsnNode::new(InsnType::If, 0);
+        instruction.id = InstructionId::new(2);
+        instruction.payload.if_op = Some(IfOp::Ne);
+        let operation = SemanticOperation::from_parts(
+            instruction,
+            vec![
+                SemanticExpression::Register(RegisterArg::new_ssa(1, 0, ArgType::INT)),
+                SemanticExpression::Literal(LiteralArg::int(0)),
+            ],
+            None,
+        );
+        let node = SemanticNode::branch(
+            SemanticPredicate::Test(operation),
+            SemanticNode::Empty,
+            None,
+        );
+        assert!(matches!(node, SemanticNode::Empty));
     }
 }
 
