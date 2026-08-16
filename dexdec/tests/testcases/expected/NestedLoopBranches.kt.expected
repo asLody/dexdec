@@ -1,15 +1,15 @@
 public open class NestedLoopBranches {
     companion object {
-        public fun compute(values: IntArray, valueses: Array<IntArray?>, p2: Int): Int {
+        public fun compute(iArr: IntArray, iArrArr: Array<IntArray?>, i: Int): Int {
             var index: Int = 0
             var total: Int = 0
-            while (index < values.size) {
-                if (values[index] >= 0) {
-                    val values2: IntArray? = valueses[index]
+            while (index < iArr.size) {
+                if (iArr[index] >= 0) {
+                    val iArr2: IntArray? = iArrArr[index]
                     var index2: Int = 0
-                    while (index2 < values2!!.size) {
-                        val step: Int = values2[index2]
-                        if (step == p2) {
+                    while (index2 < iArr2!!.size) {
+                        val step: Int = iArr2[index2]
+                        if (step == i) {
                             return total + step
                         }
                         if (step % 2 != 0) {

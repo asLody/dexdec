@@ -677,6 +677,50 @@ impl OuterInstanceBinding {
     }
 }
 
+fn jadx_name_for_kotlin_type(ty: &KotlinType) -> Option<String> {
+    match ty {
+        KotlinType::Primitive(primitive) => {
+            crate::analysis::jadx_local_names::primitive_local_name(match primitive {
+                crate::language::kotlin::KotlinPrimitiveType::Void => return None,
+                crate::language::kotlin::KotlinPrimitiveType::Boolean => {
+                    crate::ir::PrimitiveType::Boolean
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Byte => {
+                    crate::ir::PrimitiveType::Byte
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Short => {
+                    crate::ir::PrimitiveType::Short
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Char => {
+                    crate::ir::PrimitiveType::Char
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Int => crate::ir::PrimitiveType::Int,
+                crate::language::kotlin::KotlinPrimitiveType::Long => {
+                    crate::ir::PrimitiveType::Long
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Float => {
+                    crate::ir::PrimitiveType::Float
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Double => {
+                    crate::ir::PrimitiveType::Double
+                }
+            })
+            .map(str::to_string)
+        }
+        KotlinType::Class(class) => Some(
+            crate::analysis::jadx_local_names::class_local_name_from_segments(
+                class.segments.iter().map(|segment| segment.name.as_str()),
+            ),
+        ),
+        KotlinType::Variable(name) => Some(crate::analysis::jadx_local_names::class_local_name(
+            name.as_str(),
+        )),
+        KotlinType::Array(element) => Some(crate::analysis::jadx_local_names::array_local_name(
+            &jadx_name_for_kotlin_type(element.as_type())?,
+        )),
+    }
+}
+
 impl DexKotlinDialect {
     pub fn new(
         is_static: bool,
@@ -1025,11 +1069,19 @@ impl DexKotlinDialect {
         if let Some(name) = self.names.get(&key) {
             return Ok(name.clone());
         }
-        let name = self
-            .name_scope
-            .claim(KotlinIdentifier::from_dex(&format!("v{}", key.raw())));
+        let name = self.name_scope.claim(self.fallback_local_name(register));
         self.names.insert(key, name.clone());
         Ok(name)
+    }
+
+    fn fallback_local_name(&self, register: &RegisterArg) -> KotlinIdentifier {
+        self.source_register_type(register)
+            .and_then(Self::fallback_name_for_type)
+            .unwrap_or_else(|| KotlinIdentifier::from_hint("value"))
+    }
+
+    fn fallback_name_for_type(ty: &KotlinType) -> Option<KotlinIdentifier> {
+        Some(KotlinIdentifier::from_hint(&jadx_name_for_kotlin_type(ty)?))
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<KotlinExpr, KotlinLoweringError> {

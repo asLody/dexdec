@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::analysis::jadx_local_names;
 use crate::ir::{
     analysis::{
         StructuralVariableRoleAnalysis, VariableNode, VariableRole, VariableRoleAnalysis,
         VariableRoleScores, VariableSemanticGraph,
     },
-    ArgType, InsnType, MemberReference, SemanticNode,
+    ArgType, InsnType, MemberReference, PrimitiveType, SemanticNode,
 };
-use crate::language::kotlin::{KotlinIdentifier, KotlinType};
+use crate::language::kotlin::{KotlinIdentifier, KotlinPrimitiveType, KotlinType};
 
 use super::type_names::KotlinTypeNameResolver;
 
@@ -106,15 +107,9 @@ impl MethodResultSemantics for KotlinMethodResultSemantics {
             return None;
         }
         let identifier = KotlinIdentifier::from_hint(name);
-        if let Some(noun) = name.strip_prefix("get").filter(|noun| {
-            noun.chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_uppercase())
-        }) {
+        if let Some(name) = jadx_local_names::invoke_local_name(name) {
             return Some(NameCandidate {
-                name: self
-                    .morphology
-                    .lower_camel(&KotlinIdentifier::from_hint(noun)),
+                name: KotlinIdentifier::from_hint(&name),
                 score: 85,
             });
         }
@@ -188,21 +183,7 @@ impl<'a> StructuralNameModel<'a> {
     }
 
     fn java_type_name(&self, ty: &KotlinType) -> Option<KotlinIdentifier> {
-        match ty {
-            KotlinType::Class(class) => {
-                let name = &class.segments.last()?.name;
-                (name.as_str() != "Object").then(|| self.morphology.lower_camel(name))
-            }
-            KotlinType::Array(element) => self
-                .java_type_name(element)
-                .map(|name| self.morphology.plural(&name))
-                .or_else(|| Some(KotlinIdentifier::from_hint("values"))),
-            KotlinType::Variable(name) => Some(self.morphology.lower_camel(name)),
-            KotlinType::Primitive(crate::language::kotlin::KotlinPrimitiveType::Boolean) => {
-                Some(KotlinIdentifier::from_hint("flag"))
-            }
-            KotlinType::Primitive(_) => None,
-        }
+        Some(KotlinIdentifier::from_hint(&kotlin_jadx_type_name(ty)?))
     }
 
     fn lower_camel(name: &KotlinIdentifier) -> KotlinIdentifier {
@@ -427,9 +408,7 @@ impl<'a> ParameterNameRecovery<'a> {
     }
 
     pub(super) fn candidate(&self, ty: &ArgType) -> Option<KotlinIdentifier> {
-        ty.is_reference()
-            .then(|| self.model.type_name(ty))
-            .flatten()
+        self.model.type_name(ty)
     }
 }
 
@@ -550,17 +529,100 @@ impl<'a> SemanticNameRecovery<'a> {
     ) -> BTreeMap<u32, KotlinIdentifier> {
         let graph = VariableSemanticGraph::analyze(root, source_types);
         let roles = StructuralVariableRoleAnalysis.analyze(&graph);
+        let intrinsic_names = jadx_local_names::intrinsic_local_names(root);
         let excluded = parameter_variables
             .iter()
             .copied()
             .flatten()
             .chain(this_variable)
+            .chain(intrinsic_names.keys().copied())
             .collect::<BTreeSet<_>>();
-        ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35).solve(
+        let model = StructuralNameModel::for_graph(self.types, &graph);
+        let mut names =
+            ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35)
+                .solve(&graph, &roles, parameter_names, &excluded);
+        for (identity, name) in intrinsic_names {
+            names
+                .entry(identity)
+                .or_insert_with(|| KotlinIdentifier::from_hint(&name));
+        }
+        fill_remaining_source_names(
             &graph,
             &roles,
+            &model,
             parameter_names,
             &excluded,
-        )
+            &mut names,
+        );
+        names
+    }
+}
+
+fn kotlin_jadx_type_name(ty: &KotlinType) -> Option<String> {
+    match ty {
+        KotlinType::Primitive(primitive) => {
+            jadx_local_names::primitive_local_name(kotlin_primitive(*primitive)).map(str::to_string)
+        }
+        KotlinType::Class(class) => Some(jadx_local_names::class_local_name_from_segments(
+            class.segments.iter().map(|segment| segment.name.as_str()),
+        )),
+        KotlinType::Variable(name) => Some(jadx_local_names::class_local_name(name.as_str())),
+        KotlinType::Array(element) => Some(jadx_local_names::array_local_name(
+            &kotlin_jadx_type_name(element.as_type())?,
+        )),
+    }
+}
+
+fn kotlin_primitive(primitive: KotlinPrimitiveType) -> PrimitiveType {
+    match primitive {
+        KotlinPrimitiveType::Void => PrimitiveType::Void,
+        KotlinPrimitiveType::Boolean => PrimitiveType::Boolean,
+        KotlinPrimitiveType::Byte => PrimitiveType::Byte,
+        KotlinPrimitiveType::Short => PrimitiveType::Short,
+        KotlinPrimitiveType::Char => PrimitiveType::Char,
+        KotlinPrimitiveType::Int => PrimitiveType::Int,
+        KotlinPrimitiveType::Long => PrimitiveType::Long,
+        KotlinPrimitiveType::Float => PrimitiveType::Float,
+        KotlinPrimitiveType::Double => PrimitiveType::Double,
+    }
+}
+
+fn fill_remaining_source_names(
+    graph: &VariableSemanticGraph,
+    roles: &VariableRoleScores,
+    model: &StructuralNameModel<'_>,
+    reserved: &[KotlinIdentifier],
+    excluded: &BTreeSet<u32>,
+    names: &mut BTreeMap<u32, KotlinIdentifier>,
+) {
+    let mut used = names.values().cloned().collect::<BTreeSet<_>>();
+    for name in reserved {
+        used.insert(name.clone());
+    }
+    for variable in graph.variables() {
+        if !variable.is_source_binding() || excluded.contains(&variable.identity()) {
+            continue;
+        }
+        if names.contains_key(&variable.identity()) {
+            continue;
+        }
+        let preferred = model
+            .type_name(variable.ty())
+            .or_else(|| {
+                roles
+                    .roles(variable.identity())
+                    .max_by_key(|(_, score)| *score)
+                    .filter(|(_, score)| *score > 0)
+                    .map(|(role, _)| {
+                        KotlinIdentifier::from_hint(StructuralNameModel::role_name(role))
+                    })
+            })
+            .unwrap_or_else(|| KotlinIdentifier::from_hint("value"));
+        let name = if used.insert(preferred.clone()) {
+            preferred
+        } else {
+            ConstrainedNameSolver::<StructuralNameModel>::claim_variant(&preferred, &mut used)
+        };
+        names.insert(variable.identity(), name);
     }
 }

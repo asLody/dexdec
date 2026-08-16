@@ -1,16 +1,16 @@
 public open class ExceptionControlFlow {
     companion object {
-        public fun finallySideEffect(values: IntArray?): Int {
+        public fun finallySideEffect(iArr: IntArray?): Int {
             try {
-                values!![0] = 1
-                return values[0]
+                iArr!![0] = 1
+                return iArr[0]
             } finally {
-                values!![0] = values!![0] + 1
+                iArr!![0] = iArr!![0] + 1
             }
         }
 
-        public fun nestedTry(p0: Int): Int {
-            if (p0 >= 0) {
+        public fun nestedTry(i: Int): Int {
+            if (i >= 0) {
                 return 1
             }
             try {
@@ -22,9 +22,9 @@ public open class ExceptionControlFlow {
             }
         }
 
-        public fun nestedTryFinally(p0: Int): Int {
+        public fun nestedTryFinally(i: Int): Int {
             var result: Int = 0
-            if (p0 >= 0) {
+            if (i >= 0) {
                 result = 11
                 return result
             }
@@ -40,12 +40,12 @@ public open class ExceptionControlFlow {
             }
         }
 
-        public fun tryCatchFinally(p0: Int, p1: Int): Int {
+        public fun tryCatchFinally(i: Int, i2: Int): Int {
             try {
-                if (p1 == 0) {
+                if (i2 == 0) {
                     throw ArithmeticException()
                 }
-                return p0 / p1
+                return i / i2
             } catch (exception2: ArithmeticException) {
                 return -1
             } catch (exception: Throwable) {
@@ -53,15 +53,15 @@ public open class ExceptionControlFlow {
             }
         }
 
-        public fun tryCatchFinallyWithContinue(values: IntArray?): Int {
+        public fun tryCatchFinallyWithContinue(iArr: IntArray?): Int {
             var index: Int = 0
             var total: Int = 0
-            while (index < values!!.size) {
+            while (index < iArr!!.size) {
                 var condition: Boolean = false
-                var v12: Int = 0
+                var i: Int = 0
                 try {
-                    if (values[index] != 0) {
-                        v12 = 100 / values[index]
+                    if (iArr[index] != 0) {
+                        i = 100 / iArr[index]
                     } else {
                         total += 2
                         index++
@@ -75,7 +75,7 @@ public open class ExceptionControlFlow {
                     throw exception
                 }
                 if (!condition) {
-                    val step: Int = total + v12
+                    val step: Int = total + i
                     if (step > 50) {
                         return step
                     }
@@ -86,13 +86,13 @@ public open class ExceptionControlFlow {
             return total
         }
 
-        public fun tryInLoop(values: IntArray?): Int {
+        public fun tryInLoop(iArr: IntArray?): Int {
             var index: Int = 0
             var total: Int = 0
-            while (index < values!!.size) {
+            while (index < iArr!!.size) {
                 try {
-                    if (values[index] != 0) {
-                        total += 10 / values[index]
+                    if (iArr[index] != 0) {
+                        total += 10 / iArr[index]
                     }
                     index++
                 } catch (exception: ArithmeticException) {

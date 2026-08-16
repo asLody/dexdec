@@ -1,9 +1,9 @@
 public open class BreakContinue {
     companion object {
-        public fun findFirst(values: IntArray, p1: Int): Int {
+        public fun findFirst(iArr: IntArray, i: Int): Int {
             var index: Int = 0
-            while (index < values.size) {
-                if (values[index] == p1) {
+            while (index < iArr.size) {
+                if (iArr[index] == i) {
                     return index
                 }
                 index++
@@ -12,35 +12,35 @@ public open class BreakContinue {
             return index
         }
 
-        public fun findPair(values: IntArray, p1: Int): Boolean {
+        public fun findPair(iArr: IntArray, i: Int): Boolean {
             var index: Int = 0
-            while (index < values.size) {
-                val v3: Int = index + 1
-                var index2: Int = v3
-                while (index2 < values.size) {
-                    if (values[index] + values[index2] == p1) {
+            while (index < iArr.size) {
+                val i2: Int = index + 1
+                var index2: Int = i2
+                while (index2 < iArr.size) {
+                    if (iArr[index] + iArr[index2] == i) {
                         return true
                     }
                     index2++
                 }
-                index = v3
+                index = i2
             }
             return false
         }
 
-        public fun sumPositive(values: IntArray): Int {
+        public fun sumPositive(iArr: IntArray): Int {
             var index: Int = 0
-            var result: Int = 0
-            while (index < values.size) {
-                if (values[index] > 0) {
-                    val v6: Int = result + values[index]
+            var i: Int = 0
+            while (index < iArr.size) {
+                if (iArr[index] > 0) {
+                    val i2: Int = i + iArr[index]
                     index++
-                    result = v6
+                    i = i2
                 } else {
                     index++
                 }
             }
-            return result
+            return i
         }
     }
 }

@@ -290,6 +290,40 @@ impl OuterInstanceBinding {
     }
 }
 
+fn jadx_name_for_java_type(ty: &JavaType) -> Option<String> {
+    match ty {
+        JavaType::Primitive(primitive) => {
+            crate::analysis::jadx_local_names::primitive_local_name(match primitive {
+                crate::language::java::JavaPrimitiveType::Void => return None,
+                crate::language::java::JavaPrimitiveType::Boolean => {
+                    crate::ir::PrimitiveType::Boolean
+                }
+                crate::language::java::JavaPrimitiveType::Byte => crate::ir::PrimitiveType::Byte,
+                crate::language::java::JavaPrimitiveType::Short => crate::ir::PrimitiveType::Short,
+                crate::language::java::JavaPrimitiveType::Char => crate::ir::PrimitiveType::Char,
+                crate::language::java::JavaPrimitiveType::Int => crate::ir::PrimitiveType::Int,
+                crate::language::java::JavaPrimitiveType::Long => crate::ir::PrimitiveType::Long,
+                crate::language::java::JavaPrimitiveType::Float => crate::ir::PrimitiveType::Float,
+                crate::language::java::JavaPrimitiveType::Double => {
+                    crate::ir::PrimitiveType::Double
+                }
+            })
+            .map(str::to_string)
+        }
+        JavaType::Class(class) => Some(
+            crate::analysis::jadx_local_names::class_local_name_from_segments(
+                class.segments.iter().map(|segment| segment.name.as_str()),
+            ),
+        ),
+        JavaType::Variable(name) => Some(crate::analysis::jadx_local_names::class_local_name(
+            name.as_str(),
+        )),
+        JavaType::Array(element) => Some(crate::analysis::jadx_local_names::array_local_name(
+            &jadx_name_for_java_type(element)?,
+        )),
+    }
+}
+
 impl DexJavaDialect {
     pub fn new(
         is_static: bool,
@@ -565,11 +599,19 @@ impl DexJavaDialect {
         if let Some(name) = self.names.get(&key) {
             return Ok(name.clone());
         }
-        let name = self
-            .name_scope
-            .claim(JavaIdentifier::from_dex(&format!("v{}", key.raw())));
+        let name = self.name_scope.claim(self.fallback_local_name(register));
         self.names.insert(key, name.clone());
         Ok(name)
+    }
+
+    fn fallback_local_name(&self, register: &RegisterArg) -> JavaIdentifier {
+        self.source_register_type(register)
+            .and_then(Self::fallback_name_for_type)
+            .unwrap_or_else(|| JavaIdentifier::from_hint("value"))
+    }
+
+    fn fallback_name_for_type(ty: &JavaType) -> Option<JavaIdentifier> {
+        Some(JavaIdentifier::from_hint(&jadx_name_for_java_type(ty)?))
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<JavaExpr, JavaLoweringError> {

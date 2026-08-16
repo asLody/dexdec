@@ -1,7 +1,7 @@
 public open class TryCatchFinally {
     companion object {
-        public fun simpleTryCatch(p0: Int): Int {
-            if (p0 != 0) {
+        public fun simpleTryCatch(i: Int): Int {
+            if (i != 0) {
                 return 1
             }
             try {

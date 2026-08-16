@@ -1,3 +1,4 @@
+pub(crate) mod jadx_local_names;
 #[path = "java_backend/mod.rs"]
 pub mod java_backend;
 #[path = "kotlin_backend/mod.rs"]

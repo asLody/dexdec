@@ -1,7 +1,7 @@
 public open class SimpleIf {
     companion object {
-        public fun test(p0: Int): Int {
-            if (p0 <= 0) {
+        public fun test(i: Int): Int {
+            if (i <= 0) {
                 return -1
             }
             return 1

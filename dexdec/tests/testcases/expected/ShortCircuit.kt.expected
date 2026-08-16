@@ -1,43 +1,43 @@
 public open class ShortCircuit {
     companion object {
-        public fun checkAnd(p0: Int, p1: Int): Boolean {
-            if (p0 <= 0) {
+        public fun checkAnd(i: Int, i2: Int): Boolean {
+            if (i <= 0) {
                 return false
             }
-            if (p1 <= 0) {
-                return false
-            }
-            return true
-        }
-
-        public fun checkComplex(p0: Int, p1: Int, p2: Int, p3: Int): Boolean {
-            if (p1 > 0 && p0 > 0) {
-                return true
-            }
-            if (p2 <= 0) {
-                return false
-            }
-            if (p3 <= 0) {
+            if (i2 <= 0) {
                 return false
             }
             return true
         }
 
-        public fun checkNegated(p0: Int, p1: Int): Boolean {
-            if (p0 <= 0) {
+        public fun checkComplex(i: Int, i2: Int, i3: Int, i4: Int): Boolean {
+            if (i2 > 0 && i > 0) {
                 return true
             }
-            if (p1 > 0) {
+            if (i3 <= 0) {
+                return false
+            }
+            if (i4 <= 0) {
                 return false
             }
             return true
         }
 
-        public fun checkOr(p0: Int, p1: Int): Boolean {
-            if (p0 > 0) {
+        public fun checkNegated(i: Int, i2: Int): Boolean {
+            if (i <= 0) {
                 return true
             }
-            if (p1 <= 0) {
+            if (i2 > 0) {
+                return false
+            }
+            return true
+        }
+
+        public fun checkOr(i: Int, i2: Int): Boolean {
+            if (i > 0) {
+                return true
+            }
+            if (i2 <= 0) {
                 return false
             }
             return true

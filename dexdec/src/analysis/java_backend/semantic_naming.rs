@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::analysis::jadx_local_names;
 use crate::ir::{
     analysis::{
         StructuralVariableRoleAnalysis, VariableNode, VariableRole, VariableRoleAnalysis,
         VariableRoleScores, VariableSemanticGraph,
     },
-    ArgType, InsnType, MemberReference, SemanticNode,
+    ArgType, InsnType, MemberReference, PrimitiveType, SemanticNode,
 };
-use crate::language::java::{JavaIdentifier, JavaType};
+use crate::language::java::{JavaIdentifier, JavaPrimitiveType, JavaType};
 
 use super::type_names::JavaTypeNameResolver;
 
@@ -106,15 +107,9 @@ impl MethodResultSemantics for JavaMethodResultSemantics {
             return None;
         }
         let identifier = JavaIdentifier::from_hint(name);
-        if let Some(noun) = name.strip_prefix("get").filter(|noun| {
-            noun.chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_uppercase())
-        }) {
+        if let Some(name) = jadx_local_names::invoke_local_name(name) {
             return Some(NameCandidate {
-                name: self
-                    .morphology
-                    .lower_camel(&JavaIdentifier::from_hint(noun)),
+                name: JavaIdentifier::from_hint(&name),
                 score: 85,
             });
         }
@@ -188,21 +183,7 @@ impl<'a> StructuralNameModel<'a> {
     }
 
     fn java_type_name(&self, ty: &JavaType) -> Option<JavaIdentifier> {
-        match ty {
-            JavaType::Class(class) => {
-                let name = &class.segments.last()?.name;
-                (name.as_str() != "Object").then(|| self.morphology.lower_camel(name))
-            }
-            JavaType::Array(element) => self
-                .java_type_name(element)
-                .map(|name| self.morphology.plural(&name))
-                .or_else(|| Some(JavaIdentifier::from_hint("values"))),
-            JavaType::Variable(name) => Some(self.morphology.lower_camel(name)),
-            JavaType::Primitive(crate::language::java::JavaPrimitiveType::Boolean) => {
-                Some(JavaIdentifier::from_hint("flag"))
-            }
-            JavaType::Primitive(_) => None,
-        }
+        Some(JavaIdentifier::from_hint(&java_jadx_type_name(ty)?))
     }
 
     fn lower_camel(name: &JavaIdentifier) -> JavaIdentifier {
@@ -427,9 +408,7 @@ impl<'a> ParameterNameRecovery<'a> {
     }
 
     pub(super) fn candidate(&self, ty: &ArgType) -> Option<JavaIdentifier> {
-        ty.is_reference()
-            .then(|| self.model.type_name(ty))
-            .flatten()
+        self.model.type_name(ty)
     }
 }
 
@@ -550,17 +529,100 @@ impl<'a> SemanticNameRecovery<'a> {
     ) -> BTreeMap<u32, JavaIdentifier> {
         let graph = VariableSemanticGraph::analyze(root, source_types);
         let roles = StructuralVariableRoleAnalysis.analyze(&graph);
+        let intrinsic_names = jadx_local_names::intrinsic_local_names(root);
         let excluded = parameter_variables
             .iter()
             .copied()
             .flatten()
             .chain(this_variable)
+            .chain(intrinsic_names.keys().copied())
             .collect::<BTreeSet<_>>();
-        ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35).solve(
+        let model = StructuralNameModel::for_graph(self.types, &graph);
+        let mut names =
+            ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35)
+                .solve(&graph, &roles, parameter_names, &excluded);
+        for (identity, name) in intrinsic_names {
+            names
+                .entry(identity)
+                .or_insert_with(|| JavaIdentifier::from_hint(&name));
+        }
+        fill_remaining_source_names(
             &graph,
             &roles,
+            &model,
             parameter_names,
             &excluded,
-        )
+            &mut names,
+        );
+        names
+    }
+}
+
+fn java_jadx_type_name(ty: &JavaType) -> Option<String> {
+    match ty {
+        JavaType::Primitive(primitive) => {
+            jadx_local_names::primitive_local_name(java_primitive(*primitive)).map(str::to_string)
+        }
+        JavaType::Class(class) => Some(jadx_local_names::class_local_name_from_segments(
+            class.segments.iter().map(|segment| segment.name.as_str()),
+        )),
+        JavaType::Variable(name) => Some(jadx_local_names::class_local_name(name.as_str())),
+        JavaType::Array(element) => Some(jadx_local_names::array_local_name(&java_jadx_type_name(
+            element,
+        )?)),
+    }
+}
+
+fn java_primitive(primitive: JavaPrimitiveType) -> PrimitiveType {
+    match primitive {
+        JavaPrimitiveType::Void => PrimitiveType::Void,
+        JavaPrimitiveType::Boolean => PrimitiveType::Boolean,
+        JavaPrimitiveType::Byte => PrimitiveType::Byte,
+        JavaPrimitiveType::Short => PrimitiveType::Short,
+        JavaPrimitiveType::Char => PrimitiveType::Char,
+        JavaPrimitiveType::Int => PrimitiveType::Int,
+        JavaPrimitiveType::Long => PrimitiveType::Long,
+        JavaPrimitiveType::Float => PrimitiveType::Float,
+        JavaPrimitiveType::Double => PrimitiveType::Double,
+    }
+}
+
+fn fill_remaining_source_names(
+    graph: &VariableSemanticGraph,
+    roles: &VariableRoleScores,
+    model: &StructuralNameModel<'_>,
+    reserved: &[JavaIdentifier],
+    excluded: &BTreeSet<u32>,
+    names: &mut BTreeMap<u32, JavaIdentifier>,
+) {
+    let mut used = names.values().cloned().collect::<BTreeSet<_>>();
+    for name in reserved {
+        used.insert(name.clone());
+    }
+    for variable in graph.variables() {
+        if !variable.is_source_binding() || excluded.contains(&variable.identity()) {
+            continue;
+        }
+        if names.contains_key(&variable.identity()) {
+            continue;
+        }
+        let preferred = model
+            .type_name(variable.ty())
+            .or_else(|| {
+                roles
+                    .roles(variable.identity())
+                    .max_by_key(|(_, score)| *score)
+                    .filter(|(_, score)| *score > 0)
+                    .map(|(role, _)| {
+                        JavaIdentifier::from_hint(StructuralNameModel::role_name(role))
+                    })
+            })
+            .unwrap_or_else(|| JavaIdentifier::from_hint("value"));
+        let name = if used.insert(preferred.clone()) {
+            preferred
+        } else {
+            ConstrainedNameSolver::<StructuralNameModel>::claim_variant(&preferred, &mut used)
+        };
+        names.insert(variable.identity(), name);
     }
 }

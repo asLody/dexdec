@@ -1,11 +1,11 @@
 public open class MultiCatch {
     companion object {
-        public fun process(p0: Int, p1: Int): Int {
+        public fun process(i: Int, i2: Int): Int {
             try {
-                if (p0 < 0) {
+                if (i < 0) {
                     throw IllegalArgumentException("negative a")
                 }
-                return p0 / p1
+                return i / i2
             } catch (exception2: IllegalArgumentException) {
                 return -1
             } catch (exception: ArithmeticException) {

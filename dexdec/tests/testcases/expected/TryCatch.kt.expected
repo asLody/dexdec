@@ -1,8 +1,8 @@
 public open class TryCatch {
     companion object {
-        public fun divide(p0: Int, p1: Int): Int {
+        public fun divide(i: Int, i2: Int): Int {
             try {
-                return p0 / p1
+                return i / i2
             } catch (exception: ArithmeticException) {
                 return 0
             }
