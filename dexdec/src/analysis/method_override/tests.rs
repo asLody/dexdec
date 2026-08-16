@@ -463,6 +463,156 @@ fn binds_outer_and_inner_generic_scopes() {
     );
 }
 
+#[test]
+fn incomplete_functionn_instantiation_does_not_fail_scope_binding() {
+    let function3 = class_with_signature(
+        "Lkotlin/jvm/functions/Function3;",
+        ["Ljava/lang/Object;"],
+        [],
+        Some(
+            GenericSignatures::class(
+                "<P1:Ljava/lang/Object;P2:Ljava/lang/Object;P3:Ljava/lang/Object;R:Ljava/lang/Object;>Ljava/lang/Object;",
+            )
+            .expect("Function3 class signature"),
+        ),
+        "kotlin.jvm.functions",
+    );
+    let args = ["java/lang/String", "java/lang/Integer", "java/lang/Long"]
+        .into_iter()
+        .map(|name| {
+            TypeArgument::Exact(JvmTypeSignature::ClassType(parse_class_type_signature(
+                name,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let mut substitutions = TypeSubstitution::new();
+
+    collect_scope_type_parameters(&function3, &args, &mut substitutions)
+        .expect("Function3 instantiated with three arguments must not fail");
+}
+
+#[test]
+fn incomplete_functionn_parent_does_not_abort_override_analysis() {
+    let function3 = class_with_signature(
+        "Lkotlin/jvm/functions/Function3;",
+        ["Ljava/lang/Object;"],
+        [method(
+            "Lkotlin/jvm/functions/Function3;",
+            "invoke(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            vec![
+                ArgType::object("java/lang/Object"),
+                ArgType::object("java/lang/Object"),
+                ArgType::object("java/lang/Object"),
+            ],
+            ArgType::object("java/lang/Object"),
+            0x0401,
+        )],
+        Some(
+            GenericSignatures::class(
+                "<P1:Ljava/lang/Object;P2:Ljava/lang/Object;P3:Ljava/lang/Object;R:Ljava/lang/Object;>Ljava/lang/Object;",
+            )
+            .expect("Function3 class signature"),
+        ),
+        "kotlin.jvm.functions",
+    );
+    let child = class_with_signature(
+        "Lcom/example/Callback;",
+        ["Lkotlin/jvm/functions/Function3;"],
+        [method(
+            "Lcom/example/Callback;",
+            "invoke(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            vec![
+                ArgType::object("java/lang/Object"),
+                ArgType::object("java/lang/Object"),
+                ArgType::object("java/lang/Object"),
+            ],
+            ArgType::object("java/lang/Object"),
+            0x0001,
+        )],
+        Some(
+            GenericSignatures::class(
+                "Ljava/lang/Object;Lkotlin/jvm/functions/Function3<Ljava/lang/String;Ljava/lang/Integer;Ljava/lang/Long;>;",
+            )
+            .expect("three-argument Function3 instantiation"),
+        ),
+        "com.example",
+    );
+    let hierarchy = LocalHierarchy::new([function3, child.clone()]);
+    let analyzer = MethodOverrideAnalyzer::new(&hierarchy);
+    let ancestors = analyzer
+        .collect_super_types(&child)
+        .expect("ancestor walk must survive a Function3 arity mismatch");
+    assert!(ancestors
+        .iter()
+        .any(|class| class.descriptor == "Lkotlin/jvm/functions/Function3;"));
+
+    let mut sink = OverrideSink::default();
+    analyzer
+        .analyze(&mut sink, std::slice::from_ref(&child))
+        .expect("archive override analysis must not fail");
+    assert!(sink.0.iter().any(|(class, method)| {
+        class == "Lcom/example/Callback;"
+            && method
+                == "invoke(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+    }));
+}
+
+#[test]
+fn override_analysis_skips_a_broken_class_and_continues() {
+    let healthy = class(
+        "Lcom/example/Ok;",
+        ["Ljava/lang/Object;"],
+        [method(
+            "Lcom/example/Ok;",
+            "size()I",
+            Vec::new(),
+            ArgType::INT,
+            0x0001,
+        )],
+        "com.example",
+    );
+    let broken = ClassDetails {
+        descriptor: "Lcom/example/Broken;".to_string(),
+        package: "com.example".to_string(),
+        access_flags: AccessInfo::for_class(0x0001),
+        parents: vec![ArgType::object("java/lang/Object")],
+        generic_parents: Vec::new(),
+        generic_signature: None,
+        instantiated_self: None,
+        methods: vec![method(
+            "Lcom/example/Broken;",
+            "size()I",
+            Vec::new(),
+            ArgType::INT,
+            0x0001,
+        )],
+    };
+    let hierarchy = LocalHierarchy::new([healthy.clone(), broken.clone()]);
+    let mut sink = OverrideSink::default();
+    MethodOverrideAnalyzer::new(&hierarchy)
+        .analyze(&mut sink, &[broken, healthy])
+        .expect("one broken class must not abort the archive");
+    assert!(
+        sink.0.iter().any(|(class, _)| class == "Lcom/example/Ok;"),
+        "healthy class should still be analyzed"
+    );
+}
+
+#[derive(Default)]
+struct OverrideSink(Vec<(String, String)>);
+
+impl OverrideAnalysisTarget for OverrideSink {
+    fn set_method_override(
+        &mut self,
+        declaring_class: &str,
+        method_short_id: &str,
+        _semantics: Option<MethodOverrideSemantics>,
+    ) {
+        self.0
+            .push((declaring_class.to_string(), method_short_id.to_string()));
+    }
+}
+
 struct TestHierarchy {
     app: ClassDetails,
     platform: PlatformClassSet,
