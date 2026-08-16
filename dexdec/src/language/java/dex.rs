@@ -290,6 +290,12 @@ impl OuterInstanceBinding {
     }
 }
 
+fn is_register_style_name(name: &str) -> bool {
+    name.strip_prefix('v').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 impl DexJavaDialect {
     pub fn new(
         is_static: bool,
@@ -565,11 +571,38 @@ impl DexJavaDialect {
         if let Some(name) = self.names.get(&key) {
             return Ok(name.clone());
         }
-        let name = self
-            .name_scope
-            .claim(JavaIdentifier::from_dex(&format!("v{}", key.raw())));
+        let name = self.name_scope.claim(self.fallback_local_name(register));
         self.names.insert(key, name.clone());
         Ok(name)
+    }
+
+    fn fallback_local_name(&self, register: &RegisterArg) -> JavaIdentifier {
+        self.source_register_type(register)
+            .and_then(Self::fallback_name_for_type)
+            .unwrap_or_else(|| JavaIdentifier::from_hint("value"))
+    }
+
+    fn fallback_name_for_type(ty: &JavaType) -> Option<JavaIdentifier> {
+        match ty {
+            JavaType::Class(class) => {
+                let name = &class.segments.last()?.name;
+                let source = name.as_str();
+                (source != "Object" && !is_register_style_name(source)).then(|| {
+                    let mut characters = source.chars();
+                    let Some(first) = characters.next() else {
+                        return JavaIdentifier::from_hint("value");
+                    };
+                    let mut lowered = first.to_lowercase().collect::<String>();
+                    lowered.extend(characters);
+                    JavaIdentifier::from_hint(&lowered)
+                })
+            }
+            JavaType::Array(_) => Some(JavaIdentifier::from_hint("values")),
+            JavaType::Primitive(crate::language::java::JavaPrimitiveType::Boolean) => {
+                Some(JavaIdentifier::from_hint("flag"))
+            }
+            _ => None,
+        }
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<JavaExpr, JavaLoweringError> {

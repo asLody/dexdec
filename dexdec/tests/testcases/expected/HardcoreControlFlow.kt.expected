@@ -27,62 +27,62 @@ public open class HardcoreControlFlow {
     }
 
     public open fun exceptionSpaghetti(p0: Int, p1: Int): Int {
-        var v3: Int = 0
-        var v8: Int = 0
+        var value2: Int = 0
+        var value4: Int = 0
         if (p0 <= 0) {
             try {
-                v8 = -2
+                value4 = -2
                 throw IllegalArgumentException()
             } catch (exception5: IllegalArgumentException) {
-                v8 = v3 - 100
-                if (v8 <= 0) {
-                    return v8
+                value4 = value2 - 100
+                if (value4 <= 0) {
+                    return value4
                 }
-                return v8 * 2
+                return value4 * 2
             } catch (exception4: ArithmeticException) {
-                return v8
+                return value4
             } catch (exception3: Throwable) {
-                if (v3 <= 0) {
+                if (value2 <= 0) {
                     throw exception3
                 }
-                return v3 * 2
+                return value2 * 2
             }
         }
-        val v2: Int = 0
+        val value: Int = 0
         try {
-            v8 = -2
-            val v7: Int = p0 / p1
-            if (v7 <= 10) {
-                v8 = v7 + 100
-                if (v8 <= 0) {
-                    return v8
+            value4 = -2
+            val value3: Int = p0 / p1
+            if (value3 <= 10) {
+                value4 = value3 + 100
+                if (value4 <= 0) {
+                    return value4
                 }
-                return v8 * 2
+                return value4 * 2
             }
-            val v19: Int = v7 + 100
-            if (v19 <= 0) {
-                return v7
+            val value5: Int = value3 + 100
+            if (value5 <= 0) {
+                return value3
             }
-            return v19 * 2
+            return value5 * 2
         } catch (exception2: ArithmeticException) {
             throw exception2
         } catch (exception: Throwable) {
-            v3 = v2 + 100
+            value2 = value + 100
             try {
                 throw exception
             } catch (exception5: IllegalArgumentException) {
-                v8 = v3 - 100
-                if (v8 <= 0) {
-                    return v8
+                value4 = value2 - 100
+                if (value4 <= 0) {
+                    return value4
                 }
-                return v8 * 2
+                return value4 * 2
             } catch (exception4: ArithmeticException) {
-                return v8
+                return value4
             } catch (exception3: Throwable) {
-                if (v3 <= 0) {
+                if (value2 <= 0) {
                     throw exception3
                 }
-                return v3 * 2
+                return value2 * 2
             }
         }
     }

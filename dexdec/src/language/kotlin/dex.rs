@@ -677,6 +677,12 @@ impl OuterInstanceBinding {
     }
 }
 
+fn is_register_style_name(name: &str) -> bool {
+    name.strip_prefix('v').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 impl DexKotlinDialect {
     pub fn new(
         is_static: bool,
@@ -1025,11 +1031,40 @@ impl DexKotlinDialect {
         if let Some(name) = self.names.get(&key) {
             return Ok(name.clone());
         }
-        let name = self
-            .name_scope
-            .claim(KotlinIdentifier::from_dex(&format!("v{}", key.raw())));
+        let name = self.name_scope.claim(self.fallback_local_name(register));
         self.names.insert(key, name.clone());
         Ok(name)
+    }
+
+    fn fallback_local_name(&self, register: &RegisterArg) -> KotlinIdentifier {
+        self.source_register_type(register)
+            .and_then(Self::fallback_name_for_type)
+            .unwrap_or_else(|| KotlinIdentifier::from_hint("value"))
+    }
+
+    fn fallback_name_for_type(ty: &KotlinType) -> Option<KotlinIdentifier> {
+        match ty {
+            KotlinType::Class(class) => {
+                let name = &class.segments.last()?.name;
+                let source = name.as_str();
+                (source != "Any" && source != "Object" && !is_register_style_name(source)).then(
+                    || {
+                        let mut characters = source.chars();
+                        let Some(first) = characters.next() else {
+                            return KotlinIdentifier::from_hint("value");
+                        };
+                        let mut lowered = first.to_lowercase().collect::<String>();
+                        lowered.extend(characters);
+                        KotlinIdentifier::from_hint(&lowered)
+                    },
+                )
+            }
+            KotlinType::Array(_) => Some(KotlinIdentifier::from_hint("values")),
+            KotlinType::Primitive(crate::language::kotlin::KotlinPrimitiveType::Boolean) => {
+                Some(KotlinIdentifier::from_hint("flag"))
+            }
+            _ => None,
+        }
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<KotlinExpr, KotlinLoweringError> {

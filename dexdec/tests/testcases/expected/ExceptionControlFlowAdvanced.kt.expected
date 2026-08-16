@@ -24,18 +24,18 @@ public open class ExceptionControlFlowAdvanced {
 
         public fun multiCatchAndFinally(values: IntArray?): Int {
             var index: Int = 0
-            var v4: Int = 0
+            var value: Int = 0
             var result: Int
             try {
                 while (index < values!!.size) {
                     if (values[index] < 0) {
                         throw IllegalArgumentException()
                     }
-                    val v5: Int = v4 + 10 / values[index]
+                    val value2: Int = value + 10 / values[index]
                     index++
-                    v4 = v5
+                    value = value2
                 }
-                result = v4 + 3
+                result = value + 3
                 return result
             } catch (exception3: IllegalArgumentException) {
                 result = 1

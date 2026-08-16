@@ -191,7 +191,9 @@ impl<'a> StructuralNameModel<'a> {
         match ty {
             KotlinType::Class(class) => {
                 let name = &class.segments.last()?.name;
-                (name.as_str() != "Object").then(|| self.morphology.lower_camel(name))
+                let source = name.as_str();
+                (source != "Object" && !is_register_style_name(source))
+                    .then(|| self.morphology.lower_camel(name))
             }
             KotlinType::Array(element) => self
                 .java_type_name(element)
@@ -556,11 +558,64 @@ impl<'a> SemanticNameRecovery<'a> {
             .flatten()
             .chain(this_variable)
             .collect::<BTreeSet<_>>();
-        ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35).solve(
+        let model = StructuralNameModel::for_graph(self.types, &graph);
+        let mut names =
+            ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35)
+                .solve(&graph, &roles, parameter_names, &excluded);
+        fill_remaining_source_names(
             &graph,
             &roles,
+            &model,
             parameter_names,
             &excluded,
-        )
+            &mut names,
+        );
+        names
+    }
+}
+
+fn is_register_style_name(name: &str) -> bool {
+    name.strip_prefix('v').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn fill_remaining_source_names(
+    graph: &VariableSemanticGraph,
+    roles: &VariableRoleScores,
+    model: &StructuralNameModel<'_>,
+    reserved: &[KotlinIdentifier],
+    excluded: &BTreeSet<u32>,
+    names: &mut BTreeMap<u32, KotlinIdentifier>,
+) {
+    let mut used = names.values().cloned().collect::<BTreeSet<_>>();
+    for name in reserved {
+        used.insert(name.clone());
+    }
+    for variable in graph.variables() {
+        if !variable.is_source_binding() || excluded.contains(&variable.identity()) {
+            continue;
+        }
+        if names.contains_key(&variable.identity()) {
+            continue;
+        }
+        let preferred = model
+            .type_name(variable.ty())
+            .or_else(|| {
+                roles
+                    .roles(variable.identity())
+                    .max_by_key(|(_, score)| *score)
+                    .filter(|(_, score)| *score > 0)
+                    .map(|(role, _)| {
+                        KotlinIdentifier::from_hint(StructuralNameModel::role_name(role))
+                    })
+            })
+            .unwrap_or_else(|| KotlinIdentifier::from_hint("value"));
+        let name = if used.insert(preferred.clone()) {
+            preferred
+        } else {
+            ConstrainedNameSolver::<StructuralNameModel>::claim_variant(&preferred, &mut used)
+        };
+        names.insert(variable.identity(), name);
     }
 }

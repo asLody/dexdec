@@ -62,9 +62,9 @@ public open class Synchronized {
                 var index: Int = 0
                 var counter: Int = 0
                 while (index < values!!.size) {
-                    val v6: Int = counter + values[index]
+                    val value: Int = counter + values[index]
                     index++
-                    counter = v6
+                    counter = value
                 }
                 Synchronized.counter = counter
                 return counter

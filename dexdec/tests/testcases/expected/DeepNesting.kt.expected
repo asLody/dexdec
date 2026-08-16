@@ -34,15 +34,15 @@ public open class DeepNesting {
         }
 
         public fun matrixSum(p0: Int, p1: Int): Int {
-            var v2: Int = 0
+            var value: Int = 0
             var result: Int = 0
-            while (v2 < p0) {
-                var v9: Int = 0
-                while (v9 < p1) {
-                    result = result + v2 * p1 + v9
-                    v9++
+            while (value < p0) {
+                var value2: Int = 0
+                while (value2 < p1) {
+                    result = result + value * p1 + value2
+                    value2++
                 }
-                v2++
+                value++
             }
             return result
         }

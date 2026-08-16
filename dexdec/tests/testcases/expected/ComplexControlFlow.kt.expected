@@ -9,11 +9,11 @@ public open class ComplexControlFlow {
                 if (p0 > 10) {
                     return 10
                 }
-                val v2: Int = p0 + 1
-                if (v2 >= 5) {
-                    return v2
+                val value: Int = p0 + 1
+                if (value >= 5) {
+                    return value
                 }
-                p0 = v2
+                p0 = value
             }
         }
 
@@ -54,10 +54,10 @@ public open class ComplexControlFlow {
         }
 
         public fun whileSwitch(p0: Int): Int {
-            var v1: Int = 0
+            var value: Int = 0
             var total: Int = 0
-            while (v1 < 5) {
-                when (p0 + v1) {
+            while (value < 5) {
+                when (p0 + value) {
                     0 -> {
                         total++
                     }
@@ -75,9 +75,9 @@ public open class ComplexControlFlow {
                     if (total > 10) {
                         return total
                     }
-                    v1++
+                    value++
                 } else {
-                    v1++
+                    value++
                 }
             }
             return total

@@ -41,12 +41,12 @@ public open class SynchronizedAdvanced {
         }
 
         public fun sequentialSync(p0: Int, p1: Int): Int {
-            var v3: Int
+            var value: Int
             synchronized(SynchronizedAdvanced.lock1!!) {
-                v3 = p0 + 1
+                value = p0 + 1
             }
             synchronized(SynchronizedAdvanced.lock2!!) {
-                return v3 + p1
+                return value + p1
             }
         }
 
@@ -83,11 +83,11 @@ public open class SynchronizedAdvanced {
             synchronized(SynchronizedAdvanced.lock1!!) {
                 var result: Int = 0
                 while (p0 > 0) {
-                    val v5: Int = p0 / 2
-                    p0 = v5
-                    p0 = v5
+                    val value: Int = p0 / 2
+                    p0 = value
+                    p0 = value
                     result++
-                    p0 = v5
+                    p0 = value
                 }
                 return result
             }
@@ -101,9 +101,9 @@ public open class SynchronizedAdvanced {
                     if (values[index] < 0) {
                         return result
                     }
-                    val v6: Int = result + values[index]
+                    val value: Int = result + values[index]
                     index++
-                    result = v6
+                    result = value
                 }
                 return result
             }

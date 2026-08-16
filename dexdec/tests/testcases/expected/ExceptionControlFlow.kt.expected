@@ -58,10 +58,10 @@ public open class ExceptionControlFlow {
             var total: Int = 0
             while (index < values!!.size) {
                 var condition: Boolean = false
-                var v12: Int = 0
+                var value: Int = 0
                 try {
                     if (values[index] != 0) {
-                        v12 = 100 / values[index]
+                        value = 100 / values[index]
                     } else {
                         total += 2
                         index++
@@ -75,7 +75,7 @@ public open class ExceptionControlFlow {
                     throw exception
                 }
                 if (!condition) {
-                    val step: Int = total + v12
+                    val step: Int = total + value
                     if (step > 50) {
                         return step
                     }
