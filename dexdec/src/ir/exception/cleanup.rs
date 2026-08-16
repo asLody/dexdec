@@ -68,6 +68,7 @@ pub(super) struct CleanupRecovery<'a> {
     cfg: &'a CFG,
     values: &'a SsaValueGraph,
     normal_dominators: &'a DominatorTree,
+    shared_handler_entries: &'a BTreeSet<BlockId>,
 }
 
 impl<'a> CleanupRecovery<'a> {
@@ -75,11 +76,13 @@ impl<'a> CleanupRecovery<'a> {
         cfg: &'a CFG,
         values: &'a SsaValueGraph,
         normal_dominators: &'a DominatorTree,
+        shared_handler_entries: &'a BTreeSet<BlockId>,
     ) -> Self {
         Self {
             cfg,
             values,
             normal_dominators,
+            shared_handler_entries,
         }
     }
 
@@ -150,6 +153,9 @@ impl<'a> CleanupRecovery<'a> {
                 .collect::<BTreeSet<_>>();
             let owned =
                 CleanupDomain::analyze(self.cfg, handler.semantic_entry, &handler.rethrow_blocks);
+            // Shared tails still recover as finally. Copy elision for those
+            // tails is withheld in CatchCleanupRecovery so one region cannot
+            // delete cleanup still required by another occurrence.
             let mut copies = BTreeSet::new();
             let mut copy_blocks = BTreeSet::new();
             let mut contractions = Vec::new();
@@ -263,6 +269,7 @@ impl<'a> CleanupRecovery<'a> {
                 &owned,
                 &handler.rethrow_blocks,
                 self.normal_dominators,
+                self.shared_handler_entries,
             )
             .recover(&catch_domains)?
             else {
@@ -631,6 +638,7 @@ struct CatchCleanupRecovery<'a> {
     handler_blocks: &'a BTreeSet<BlockId>,
     rethrow_blocks: &'a BTreeSet<BlockId>,
     normal_dominators: &'a DominatorTree,
+    shared_handler_entries: &'a BTreeSet<BlockId>,
 }
 
 impl<'a> CatchCleanupRecovery<'a> {
@@ -642,6 +650,7 @@ impl<'a> CatchCleanupRecovery<'a> {
         handler_blocks: &'a BTreeSet<BlockId>,
         rethrow_blocks: &'a BTreeSet<BlockId>,
         normal_dominators: &'a DominatorTree,
+        shared_handler_entries: &'a BTreeSet<BlockId>,
     ) -> Self {
         Self {
             cfg,
@@ -651,6 +660,7 @@ impl<'a> CatchCleanupRecovery<'a> {
             handler_blocks,
             rethrow_blocks,
             normal_dominators,
+            shared_handler_entries,
         }
     }
 
@@ -660,6 +670,12 @@ impl<'a> CatchCleanupRecovery<'a> {
     ) -> Result<Option<RecoveredCleanupCopies>, super::ExceptionInvariantError> {
         let mut recovered = RecoveredCleanupCopies::default();
         for domain in domains {
+            // Shared catch tails still allow the outer handler to become
+            // `finally`. Only their copies are left in place so another
+            // protected region cannot lose required cleanup.
+            if self.shared_handler_entries.contains(&domain.entry) {
+                return Ok(None);
+            }
             let mut proofs = BTreeMap::new();
             for candidate in &domain.blocks {
                 let specialized = CleanupSpecialization::new(
@@ -1487,6 +1503,7 @@ impl<'a> CleanupProof<'a> {
                             .map(|(handler, normal)| (handler, 0, normal, 0)),
                     );
                 }
+                let prior_values = self.values.clone();
                 if !self.instruction(handler_insn, normal_insn) {
                     return self.reject(
                         handler,
@@ -1496,6 +1513,12 @@ impl<'a> CleanupProof<'a> {
                         CleanupMismatchReason::Instruction,
                     );
                 }
+                // The normal cleanup copy is elided after this proof, so
+                // values consumed by the two observable operations must be
+                // represented by the same source variable. Branch operands
+                // are recorded by `branch_relation`; straight-line cleanup
+                // operations need the same treatment here.
+                self.record_state_bindings(&prior_values);
                 if handler != normal {
                     self.matched_normal.insert(StatementOrigin {
                         block: normal,
@@ -2371,5 +2394,44 @@ mod tests {
             CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
         assert!(proof.bind_block(handler, observable));
         assert!(!proof.bind_block(handler, target));
+    }
+
+    #[test]
+    fn straight_line_cleanup_records_observable_argument_binding() {
+        let handler = BlockId::new(0);
+        let normal = BlockId::new(1);
+        let handler_value = RegisterArg::new_ssa(1, 7, ArgType::object("java/io/Closeable"));
+        let normal_value = RegisterArg::new_ssa(12, 3, ArgType::object("java/io/Closeable"));
+        let mut cfg = CFG::new("cleanup_straight_line_state");
+        let mut handler_block = Block::new(handler);
+        handler_block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![InsnArg::Reg(handler_value.clone())],
+        ));
+        cfg.add_block(handler_block);
+        let mut normal_block = Block::new(normal);
+        normal_block.push(InsnNode::invoke(
+            InvokeType::Static,
+            0,
+            vec![InsnArg::Reg(normal_value.clone())],
+        ));
+        cfg.add_block(normal_block);
+
+        let values = SsaValueGraph::default();
+        let origins = SsaOrigins::analyze(&values);
+        let handler_blocks = BTreeSet::from([handler]);
+        let rethrow_blocks = BTreeSet::from([handler]);
+        let mut proof =
+            CleanupProof::new(&cfg, &values, &origins, &handler_blocks, &rethrow_blocks);
+
+        assert!(proof.compare(handler, normal).expect("cleanup proof"));
+        assert_eq!(
+            proof.value_bindings(),
+            BTreeSet::from([(
+                SsaVar::from_reg(&handler_value).expect("handler SSA value"),
+                SsaVar::from_reg(&normal_value).expect("normal SSA value"),
+            )])
+        );
     }
 }
