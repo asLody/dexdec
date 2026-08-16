@@ -10,8 +10,9 @@ use std::str::FromStr;
 
 use super::metadata_members::{backing_field_references, MetadataCallable};
 use crate::frontend::kotlin_metadata::{KotlinMetadata, TypeReference, Visibility};
-use crate::frontend::ClassNode;
-use crate::ir::{FieldReference, MethodDescriptor, MethodReference};
+use crate::frontend::{ClassNode, MethodNode};
+use crate::ir::generic_types::{GenericSignatures, JvmTypeSignature, TypeArgument};
+use crate::ir::{ArgType, FieldReference, MethodDescriptor, MethodReference};
 use crate::language::kotlin::{KotlinDefaultCallContract, KotlinDefaultMask, KotlinIdentifier};
 use std::sync::Arc;
 
@@ -571,6 +572,7 @@ impl KotlinDeclaredMembers {
         singletons: &mut std::collections::BTreeSet<crate::ir::ArgType>,
     ) {
         let Some(Ok(metadata)) = KotlinMetadata::of(&class.annotations) else {
+            self.collect_suspend_abi(class);
             return;
         };
         let declarations = metadata.declarations();
@@ -725,6 +727,32 @@ impl KotlinDeclaredMembers {
                 }
                 self.fields.insert(reference, property.flags.visibility());
             }
+        }
+        self.collect_suspend_abi(class);
+    }
+
+    fn collect_suspend_abi(&mut self, class: &ClassNode) {
+        let continuation_impl = class
+            .methods()
+            .iter()
+            .any(|method| method.name() == "invokeSuspend");
+        for method in class.methods() {
+            if method.is_constructor() || method.name() == "<clinit>" {
+                continue;
+            }
+            if method.name() == "create" || method.name() == "invokeSuspend" {
+                continue;
+            }
+            if continuation_impl && method.name() == "invoke" {
+                continue;
+            }
+            let Some(declaration) = suspend_abi_declaration(method) else {
+                continue;
+            };
+            let reference = method_reference(class, method);
+            self.suspend_functions
+                .entry(reference)
+                .or_insert(declaration);
         }
     }
 
@@ -931,6 +959,73 @@ impl KotlinDeclaredMembers {
     }
 }
 
+fn method_reference(class: &ClassNode, method: &MethodNode) -> MethodReference {
+    MethodReference {
+        owner: class.class_type().clone(),
+        name: method.name().to_string(),
+        descriptor: MethodDescriptor {
+            parameters: method.param_types().to_vec(),
+            return_type: method.return_type().clone(),
+        },
+    }
+}
+
+fn suspend_abi_declaration(method: &MethodNode) -> Option<KotlinSuspendDeclaration> {
+    if method.return_type() != &ArgType::object("java/lang/Object") {
+        return None;
+    }
+    let continuation_parameter = method.param_types().len().checked_sub(1)?;
+    if !is_continuation_type(&method.param_types()[continuation_parameter]) {
+        return None;
+    }
+    Some(KotlinSuspendDeclaration {
+        continuation_parameter,
+        return_type: suspend_abi_return_type(method),
+    })
+}
+
+fn suspend_abi_return_type(method: &MethodNode) -> ArgType {
+    continuation_result_type(method).unwrap_or_else(|| ArgType::object("java/lang/Object"))
+}
+
+fn continuation_result_type(method: &MethodNode) -> Option<ArgType> {
+    let signature = method
+        .signature
+        .as_deref()
+        .and_then(|signature| GenericSignatures::method(signature).ok())
+        .or_else(|| {
+            method
+                .override_semantics
+                .as_ref()
+                .and_then(|semantics| semantics.inherited_signature.clone())
+        })?;
+    let last = signature.parameter_types.last()?;
+    continuation_type_argument(last).map(|ty| ty.erased())
+}
+
+fn continuation_type_argument(ty: &JvmTypeSignature) -> Option<&JvmTypeSignature> {
+    let JvmTypeSignature::ClassType(class) = ty else {
+        return None;
+    };
+    if !is_continuation_class_name(&class.erased_name()) {
+        return None;
+    }
+    match class.type_arguments.first()? {
+        TypeArgument::Super(inner) | TypeArgument::Exact(inner) | TypeArgument::Extends(inner) => {
+            Some(inner)
+        }
+        TypeArgument::Unbounded => None,
+    }
+}
+
+fn is_continuation_type(ty: &ArgType) -> bool {
+    ty.as_object().is_some_and(is_continuation_class_name)
+}
+
+fn is_continuation_class_name(name: &str) -> bool {
+    name == "kotlin/coroutines/Continuation" || name.ends_with("/Continuation")
+}
+
 fn property_accessor_reference(
     class: &ClassNode,
     signature: &crate::frontend::kotlin_metadata::JvmSignature,
@@ -940,4 +1035,113 @@ fn property_accessor_reference(
         name: signature.name.clone(),
         descriptor: MethodDescriptor::from_str(&signature.descriptor).ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::{AccessInfo, ClassInfo, MethodInfo};
+
+    fn class_with_methods(name: &str, methods: Vec<MethodNode>) -> ClassNode {
+        let mut class = ClassNode::new(
+            0,
+            ClassInfo::from_type_descriptor(&format!("L{name};")).expect("class descriptor"),
+            AccessInfo::for_class(0x1),
+        );
+        for method in methods {
+            class.add_method(method);
+        }
+        class
+    }
+
+    fn method(name: &str, parameters: Vec<ArgType>, return_type: ArgType) -> MethodNode {
+        MethodNode::new(
+            0,
+            MethodInfo::new(
+                "Lsample/Host;".to_string(),
+                name.to_string(),
+                parameters,
+                return_type,
+            ),
+            AccessInfo::for_method(0x9),
+        )
+    }
+
+    #[test]
+    fn continuation_type_accepts_obfuscated_package() {
+        assert!(is_continuation_type(&ArgType::object(
+            "kotlin/coroutines/Continuation"
+        )));
+        assert!(is_continuation_type(&ArgType::object("ef1/Continuation")));
+        assert!(!is_continuation_type(&ArgType::object("java/lang/Object")));
+        assert!(!is_continuation_type(&ArgType::INT));
+    }
+
+    #[test]
+    fn suspend_abi_reads_continuation_result_type() {
+        let method = method(
+            "await",
+            vec![
+                ArgType::object("java/lang/String"),
+                ArgType::object("kotlin/coroutines/Continuation"),
+            ],
+            ArgType::object("java/lang/Object"),
+        )
+        .with_signature(Some(
+            "(Ljava/lang/String;Lkotlin/coroutines/Continuation<-Ljava/lang/Integer;>;)Ljava/lang/Object;"
+                .into(),
+        ));
+        let declaration = suspend_abi_declaration(&method).expect("suspend ABI");
+        assert_eq!(declaration.continuation_parameter, 1);
+        assert_eq!(
+            declaration.return_type,
+            ArgType::object("java/lang/Integer")
+        );
+    }
+
+    #[test]
+    fn collect_suspend_abi_skips_continuation_impl_invoke() {
+        let class = class_with_methods(
+            "sample/StateMachine",
+            vec![
+                method(
+                    "invokeSuspend",
+                    vec![ArgType::object("java/lang/Object")],
+                    ArgType::object("java/lang/Object"),
+                ),
+                method(
+                    "invoke",
+                    vec![
+                        ArgType::object("java/lang/String"),
+                        ArgType::object("kotlin/coroutines/Continuation"),
+                    ],
+                    ArgType::object("java/lang/Object"),
+                ),
+                method(
+                    "await",
+                    vec![ArgType::object("kotlin/coroutines/Continuation")],
+                    ArgType::object("java/lang/Object"),
+                ),
+            ],
+        );
+        let declared = KotlinDeclaredMembers::analyze(&[&class], &|_, _| None);
+        let invoke = method_reference(
+            &class,
+            class
+                .methods()
+                .iter()
+                .find(|method| method.name() == "invoke")
+                .expect("invoke"),
+        );
+        let await_method = method_reference(
+            &class,
+            class
+                .methods()
+                .iter()
+                .find(|method| method.name() == "await")
+                .expect("await"),
+        );
+        assert!(declared.suspend_declaration(&invoke).is_none());
+        assert!(declared.suspend_declaration(&await_method).is_some());
+    }
 }

@@ -267,9 +267,10 @@ impl Decompiler {
     /// The language a class was written in, as far as the class itself says.
     ///
     /// The Kotlin compiler stamps everything it emits with `@kotlin.Metadata`,
-    /// down to the synthetic classes it makes for lambdas, and nothing else
-    /// writes that annotation. A class carrying none was not compiled from
-    /// Kotlin, so Java is what it should be read back as.
+    /// down to the synthetic classes it makes for lambdas. R8 often strips that
+    /// annotation but leaves the DEX `SourceFile` (`.kt`), which is the same
+    /// attribute JADX uses to recover Kotlin file names. A class with neither
+    /// signal is read back as Java.
     ///
     /// Only the class declaration is read; no method body is decoded.
     pub fn source_language(
@@ -280,12 +281,10 @@ impl Decompiler {
         let Some(node) = self.context.load_class_deferred(&class)? else {
             return Err(DecompileError::ClassNotFound(class));
         };
-        let kotlin = node.annotations.iter().any(KotlinMetadata::is_metadata);
-        Ok(if kotlin {
-            SourceLanguage::Kotlin
-        } else {
-            SourceLanguage::Java
-        })
+        Ok(inferred_source_language(
+            &node.annotations,
+            node.source_file.as_deref(),
+        ))
     }
 
     /// Inspect one class declaration without decoding any method body.
@@ -582,6 +581,23 @@ pub fn kotlin_source_path(descriptor: &str) -> PathBuf {
     source_path(descriptor, SourceLanguage::Kotlin)
 }
 
+fn inferred_source_language(
+    annotations: &[crate::frontend::AnnotationNode],
+    source_file: Option<&str>,
+) -> SourceLanguage {
+    if annotations.iter().any(KotlinMetadata::is_metadata) || is_kotlin_source_file(source_file) {
+        SourceLanguage::Kotlin
+    } else {
+        SourceLanguage::Java
+    }
+}
+
+fn is_kotlin_source_file(source_file: Option<&str>) -> bool {
+    source_file.is_some_and(|name| {
+        name.ends_with(".kt") || name.ends_with(".kts") || name.ends_with(".ktm")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +616,22 @@ mod tests {
             ClassSelector::listed(["LB;", "LA;", "LB;"]),
             ClassSelector::Listed(BTreeSet::from(["LA;".to_string(), "LB;".to_string()]))
         );
+    }
+
+    #[test]
+    fn source_file_kt_selects_kotlin_without_metadata() {
+        assert_eq!(
+            inferred_source_language(&[], Some("PipHintTracker.kt")),
+            SourceLanguage::Kotlin
+        );
+        assert_eq!(
+            inferred_source_language(&[], Some("Script.kts")),
+            SourceLanguage::Kotlin
+        );
+        assert_eq!(
+            inferred_source_language(&[], Some("Main.java")),
+            SourceLanguage::Java
+        );
+        assert_eq!(inferred_source_language(&[], None), SourceLanguage::Java);
     }
 }
