@@ -134,16 +134,13 @@ pub(crate) fn collect_instantiated_super_types<H: ClassHierarchy>(
         if !seen.insert(details.descriptor.clone()) {
             continue;
         }
-        let instantiated = bind_class(hierarchy, &details, &instantiated_parent)?;
+        let Ok(instantiated) = bind_class(hierarchy, &details, &instantiated_parent) else {
+            continue;
+        };
         for (idx, parent_ty) in instantiated.parents.iter().enumerate() {
-            let generic = instantiated
-                .generic_parents
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| OverrideAnalysisError::MissingErasedParent {
-                    class: instantiated.descriptor.clone(),
-                    index: idx,
-                })?;
+            let Some(generic) = instantiated.generic_parents.get(idx).cloned() else {
+                continue;
+            };
             queue.push_back((parent_ty.clone(), generic));
         }
         out.push(instantiated);
@@ -177,9 +174,13 @@ where
         T: OverrideAnalysisTarget,
     {
         for class in classes {
-            let ancestors = self.collect_super_types(class)?;
+            let Ok(ancestors) = self.collect_super_types(class) else {
+                continue;
+            };
             for method in &class.methods {
-                let semantics = self.analyze_method(class, method, &ancestors)?;
+                let Ok(semantics) = self.analyze_method(class, method, &ancestors) else {
+                    continue;
+                };
                 target.set_method_override(
                     &method.reference.declaring_class,
                     &method.reference.short_id,
@@ -528,23 +529,15 @@ fn collect_scope_type_parameters(
     substitutions: &mut TypeSubstitution,
 ) -> OverrideResult<()> {
     let Some(signature) = declared.generic_signature.as_ref() else {
-        if type_arguments.is_empty() {
-            return Ok(());
-        }
-        return Err(OverrideAnalysisError::GenericArity {
-            class: declared.descriptor.clone(),
-            expected: 0,
-            actual: type_arguments.len(),
-        });
+        return Ok(());
     };
     let expected = signature.type_parameters.len();
     let actual = type_arguments.len();
+    // Kotlin FunctionN and some SAM/lambda signatures omit a type
+    // argument (commonly the return type). Keep analysis going as a
+    // raw instantiation instead of failing the whole archive.
     if actual != 0 && actual != expected {
-        return Err(OverrideAnalysisError::GenericArity {
-            class: declared.descriptor.clone(),
-            expected,
-            actual,
-        });
+        return Ok(());
     }
     collect_instantiated_class_type_parameters(signature, type_arguments, substitutions)
 }
