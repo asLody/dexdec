@@ -4,87 +4,87 @@ public open class Synchronized {
 
         private var counter: Int = 0
 
-        public fun computeInSync(p0: Int, p1: Int): Int {
+        public fun computeInSync(i: Int, i2: Int): Int {
             synchronized(Synchronized.lock!!) {
-                val counter: Int = p0 + p1
+                val counter: Int = i + i2
                 Synchronized.counter = counter
                 return counter
             }
         }
 
-        public fun multiExit(p0: Int, p1: Int): Int {
+        public fun multiExit(i: Int, i2: Int): Int {
             synchronized(Synchronized.lock!!) {
-                if (p0 < 0) {
+                if (i < 0) {
                     return -1
                 }
-                if (p1 < 0) {
+                if (i2 < 0) {
                     return -2
                 }
-                Synchronized.counter = p0 + p1
+                Synchronized.counter = i + i2
             }
             return Synchronized.counter
         }
 
-        public fun nestedSync(any: Any?, p1: Int): Int {
+        public fun nestedSync(any: Any?, i: Int): Int {
             synchronized(Synchronized.lock!!) {
                 synchronized(any!!) {
-                    Synchronized.counter = p1 * 2
+                    Synchronized.counter = i * 2
                 }
             }
             return Synchronized.counter
         }
 
-        public fun simpleSync(p0: Int): Int {
+        public fun simpleSync(i: Int): Int {
             synchronized(Synchronized.lock!!) {
-                Synchronized.counter = p0
+                Synchronized.counter = i
                 return Synchronized.counter
             }
         }
 
-        public @kotlin.jvm.Synchronized fun syncMethod(p0: Int): Int {
-            Synchronized.counter = p0
+        public @kotlin.jvm.Synchronized fun syncMethod(i: Int): Int {
+            Synchronized.counter = i
             return Synchronized.counter
         }
 
-        public fun syncWithCondition(p0: Int): Int {
+        public fun syncWithCondition(i: Int): Int {
             synchronized(Synchronized.lock!!) {
-                if (p0 <= 0) {
-                    Synchronized.counter = -p0
+                if (i <= 0) {
+                    Synchronized.counter = -i
                 } else {
-                    Synchronized.counter = p0
+                    Synchronized.counter = i
                 }
             }
             return Synchronized.counter
         }
 
-        public fun syncWithLoop(values: IntArray?): Int {
+        public fun syncWithLoop(iArr: IntArray?): Int {
             synchronized(Synchronized.lock!!) {
                 var index: Int = 0
                 var counter: Int = 0
-                while (index < values!!.size) {
-                    val value: Int = counter + values[index]
+                while (index < iArr!!.size) {
+                    val i: Int = counter + iArr[index]
                     index++
-                    counter = value
+                    counter = i
                 }
                 Synchronized.counter = counter
                 return counter
             }
         }
 
-        public fun syncWithReturn(p0: Int): Int {
+        public fun syncWithReturn(i: Int): Int {
             synchronized(Synchronized.lock!!) {
-                if (p0 != 0) {
-                    Synchronized.counter = 100 / p0
+                if (i != 0) {
+                    Synchronized.counter = 100 / i
                     return Synchronized.counter
                 }
                 return -1
             }
         }
 
-        public fun syncWithTry(p0: Int): Int {
+        public fun syncWithTry(i: Int): Int {
             synchronized(Synchronized.lock!!) {
                 try {
-                    Synchronized.counter = 100 / p0
+                    Synchronized.counter = 100 / i
                 } catch (exception: ArithmeticException) {
                     Synchronized.counter = -1
                 }
@@ -92,13 +92,13 @@ public open class Synchronized {
             return Synchronized.counter
         }
 
-        public fun tryWithSync(p0: Int): Int {
+        public fun tryWithSync(i: Int): Int {
             try {
                 synchronized(Synchronized.lock!!) {
-                    if (p0 == 0) {
+                    if (i == 0) {
                         throw RuntimeException("zero")
                     }
-                    Synchronized.counter = p0
+                    Synchronized.counter = i
                 }
             } catch (exception: RuntimeException) {
                 return -1

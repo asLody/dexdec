@@ -677,10 +677,48 @@ impl OuterInstanceBinding {
     }
 }
 
-fn is_register_style_name(name: &str) -> bool {
-    name.strip_prefix('v').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    })
+fn jadx_name_for_kotlin_type(ty: &KotlinType) -> Option<String> {
+    match ty {
+        KotlinType::Primitive(primitive) => {
+            crate::analysis::jadx_local_names::primitive_local_name(match primitive {
+                crate::language::kotlin::KotlinPrimitiveType::Void => return None,
+                crate::language::kotlin::KotlinPrimitiveType::Boolean => {
+                    crate::ir::PrimitiveType::Boolean
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Byte => {
+                    crate::ir::PrimitiveType::Byte
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Short => {
+                    crate::ir::PrimitiveType::Short
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Char => {
+                    crate::ir::PrimitiveType::Char
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Int => crate::ir::PrimitiveType::Int,
+                crate::language::kotlin::KotlinPrimitiveType::Long => {
+                    crate::ir::PrimitiveType::Long
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Float => {
+                    crate::ir::PrimitiveType::Float
+                }
+                crate::language::kotlin::KotlinPrimitiveType::Double => {
+                    crate::ir::PrimitiveType::Double
+                }
+            })
+            .map(str::to_string)
+        }
+        KotlinType::Class(class) => Some(
+            crate::analysis::jadx_local_names::class_local_name_from_segments(
+                class.segments.iter().map(|segment| segment.name.as_str()),
+            ),
+        ),
+        KotlinType::Variable(name) => Some(crate::analysis::jadx_local_names::class_local_name(
+            name.as_str(),
+        )),
+        KotlinType::Array(element) => Some(crate::analysis::jadx_local_names::array_local_name(
+            &jadx_name_for_kotlin_type(element.as_type())?,
+        )),
+    }
 }
 
 impl DexKotlinDialect {
@@ -1043,28 +1081,7 @@ impl DexKotlinDialect {
     }
 
     fn fallback_name_for_type(ty: &KotlinType) -> Option<KotlinIdentifier> {
-        match ty {
-            KotlinType::Class(class) => {
-                let name = &class.segments.last()?.name;
-                let source = name.as_str();
-                (source != "Any" && source != "Object" && !is_register_style_name(source)).then(
-                    || {
-                        let mut characters = source.chars();
-                        let Some(first) = characters.next() else {
-                            return KotlinIdentifier::from_hint("value");
-                        };
-                        let mut lowered = first.to_lowercase().collect::<String>();
-                        lowered.extend(characters);
-                        KotlinIdentifier::from_hint(&lowered)
-                    },
-                )
-            }
-            KotlinType::Array(_) => Some(KotlinIdentifier::from_hint("values")),
-            KotlinType::Primitive(crate::language::kotlin::KotlinPrimitiveType::Boolean) => {
-                Some(KotlinIdentifier::from_hint("flag"))
-            }
-            _ => None,
-        }
+        Some(KotlinIdentifier::from_hint(&jadx_name_for_kotlin_type(ty)?))
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<KotlinExpr, KotlinLoweringError> {

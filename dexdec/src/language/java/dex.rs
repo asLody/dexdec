@@ -290,10 +290,38 @@ impl OuterInstanceBinding {
     }
 }
 
-fn is_register_style_name(name: &str) -> bool {
-    name.strip_prefix('v').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    })
+fn jadx_name_for_java_type(ty: &JavaType) -> Option<String> {
+    match ty {
+        JavaType::Primitive(primitive) => {
+            crate::analysis::jadx_local_names::primitive_local_name(match primitive {
+                crate::language::java::JavaPrimitiveType::Void => return None,
+                crate::language::java::JavaPrimitiveType::Boolean => {
+                    crate::ir::PrimitiveType::Boolean
+                }
+                crate::language::java::JavaPrimitiveType::Byte => crate::ir::PrimitiveType::Byte,
+                crate::language::java::JavaPrimitiveType::Short => crate::ir::PrimitiveType::Short,
+                crate::language::java::JavaPrimitiveType::Char => crate::ir::PrimitiveType::Char,
+                crate::language::java::JavaPrimitiveType::Int => crate::ir::PrimitiveType::Int,
+                crate::language::java::JavaPrimitiveType::Long => crate::ir::PrimitiveType::Long,
+                crate::language::java::JavaPrimitiveType::Float => crate::ir::PrimitiveType::Float,
+                crate::language::java::JavaPrimitiveType::Double => {
+                    crate::ir::PrimitiveType::Double
+                }
+            })
+            .map(str::to_string)
+        }
+        JavaType::Class(class) => Some(
+            crate::analysis::jadx_local_names::class_local_name_from_segments(
+                class.segments.iter().map(|segment| segment.name.as_str()),
+            ),
+        ),
+        JavaType::Variable(name) => Some(crate::analysis::jadx_local_names::class_local_name(
+            name.as_str(),
+        )),
+        JavaType::Array(element) => Some(crate::analysis::jadx_local_names::array_local_name(
+            &jadx_name_for_java_type(element)?,
+        )),
+    }
 }
 
 impl DexJavaDialect {
@@ -583,26 +611,7 @@ impl DexJavaDialect {
     }
 
     fn fallback_name_for_type(ty: &JavaType) -> Option<JavaIdentifier> {
-        match ty {
-            JavaType::Class(class) => {
-                let name = &class.segments.last()?.name;
-                let source = name.as_str();
-                (source != "Object" && !is_register_style_name(source)).then(|| {
-                    let mut characters = source.chars();
-                    let Some(first) = characters.next() else {
-                        return JavaIdentifier::from_hint("value");
-                    };
-                    let mut lowered = first.to_lowercase().collect::<String>();
-                    lowered.extend(characters);
-                    JavaIdentifier::from_hint(&lowered)
-                })
-            }
-            JavaType::Array(_) => Some(JavaIdentifier::from_hint("values")),
-            JavaType::Primitive(crate::language::java::JavaPrimitiveType::Boolean) => {
-                Some(JavaIdentifier::from_hint("flag"))
-            }
-            _ => None,
-        }
+        Some(JavaIdentifier::from_hint(&jadx_name_for_java_type(ty)?))
     }
 
     fn arg(&mut self, arg: &SemanticExpression) -> Result<JavaExpr, JavaLoweringError> {

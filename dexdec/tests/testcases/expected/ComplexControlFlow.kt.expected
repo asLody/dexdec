@@ -1,32 +1,32 @@
 public open class ComplexControlFlow {
     companion object {
-        public fun doWhileClamp(p0: Int): Int {
-            var p0: Int = p0
+        public fun doWhileClamp(i: Int): Int {
+            var i: Int = i
             while (true) {
-                if (p0 < 0) {
-                    p0 = -p0
+                if (i < 0) {
+                    i = -i
                 }
-                if (p0 > 10) {
+                if (i > 10) {
                     return 10
                 }
-                val value: Int = p0 + 1
-                if (value >= 5) {
-                    return value
+                val i2: Int = i + 1
+                if (i2 >= 5) {
+                    return i2
                 }
-                p0 = value
+                i = i2
             }
         }
 
-        public fun findInMatrix(valueses: Array<IntArray?>, p1: Int): Int {
+        public fun findInMatrix(iArrArr: Array<IntArray?>, i: Int): Int {
             var index2: Int = 0
-            while (index2 < valueses.size) {
-                val values: IntArray? = valueses[index2]
+            while (index2 < iArrArr.size) {
+                val iArr: IntArray? = iArrArr[index2]
                 var index: Int = 0
-                while (index < values!!.size) {
-                    if (values[index] == p1) {
+                while (index < iArr!!.size) {
+                    if (iArr[index] == i) {
                         return index2 * 1000 + index
                     }
-                    if (values[index] != -1) {
+                    if (iArr[index] != -1) {
                         index++
                         continue
                     }
@@ -37,14 +37,14 @@ public open class ComplexControlFlow {
             return -1
         }
 
-        public fun sumUntil(values: IntArray, p1: Int): Int {
+        public fun sumUntil(iArr: IntArray, i: Int): Int {
             var index: Int = 0
             var total: Int = 0
-            while (index < values.size) {
-                val step: Int = values[index]
+            while (index < iArr.size) {
+                val step: Int = iArr[index]
                 if (step >= 0) {
                     total += step
-                    if (total > p1) {
+                    if (total > i) {
                         return total
                     }
                 }
@@ -53,11 +53,11 @@ public open class ComplexControlFlow {
             return total
         }
 
-        public fun whileSwitch(p0: Int): Int {
-            var value: Int = 0
+        public fun whileSwitch(i: Int): Int {
+            var i2: Int = 0
             var total: Int = 0
-            while (value < 5) {
-                when (p0 + value) {
+            while (i2 < 5) {
+                when (i + i2) {
                     0 -> {
                         total++
                     }
@@ -75,9 +75,9 @@ public open class ComplexControlFlow {
                     if (total > 10) {
                         return total
                     }
-                    value++
+                    i2++
                 } else {
-                    value++
+                    i2++
                 }
             }
             return total

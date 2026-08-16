@@ -2,9 +2,9 @@ public open class Finally {
     companion object {
         private var counter: Int = 0
 
-        public fun test(p0: Int): Int {
+        public fun test(i: Int): Int {
             var counter: Int
-            if (p0 == 0) {
+            if (i == 0) {
                 try {
                     throw RuntimeException("zero")
                 } catch (exception: RuntimeException) {
@@ -15,7 +15,7 @@ public open class Finally {
                 }
             }
             try {
-                return 100 / p0
+                return 100 / i
             } catch (exception: RuntimeException) {
                 return -1
             } finally {

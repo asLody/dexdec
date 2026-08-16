@@ -1,28 +1,28 @@
 public open class DeepNesting {
     companion object {
-        public fun classify(p0: Int, p1: Int, p2: Int): Int {
-            if (p0 <= 0) {
-                if (p1 <= 0) {
+        public fun classify(i: Int, i2: Int, i3: Int): Int {
+            if (i <= 0) {
+                if (i2 <= 0) {
                     return 6
                 }
                 return 5
             }
-            if (p1 <= 0) {
-                if (p2 <= 0) {
+            if (i2 <= 0) {
+                if (i3 <= 0) {
                     return 4
                 }
                 return 3
             }
-            if (p2 <= 0) {
+            if (i3 <= 0) {
                 return 2
             }
             return 1
         }
 
-        public fun conditionalSum(p0: Int): Int {
+        public fun conditionalSum(i: Int): Int {
             var step: Int = 0
             var total: Int = 0
-            while (step < p0) {
+            while (step < i) {
                 if (step % 2 != 0) {
                     total -= step
                 } else {
@@ -33,16 +33,16 @@ public open class DeepNesting {
             return total
         }
 
-        public fun matrixSum(p0: Int, p1: Int): Int {
-            var value: Int = 0
+        public fun matrixSum(i: Int, i2: Int): Int {
+            var i3: Int = 0
             var result: Int = 0
-            while (value < p0) {
-                var value2: Int = 0
-                while (value2 < p1) {
-                    result = result + value * p1 + value2
-                    value2++
+            while (i3 < i) {
+                var i4: Int = 0
+                while (i4 < i2) {
+                    result = result + i3 * i2 + i4
+                    i4++
                 }
-                value++
+                i3++
             }
             return result
         }

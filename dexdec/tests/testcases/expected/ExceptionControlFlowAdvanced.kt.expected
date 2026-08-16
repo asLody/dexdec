@@ -1,16 +1,16 @@
 public open class ExceptionControlFlowAdvanced {
     companion object {
-        public fun finallyWithBreakContinue(values: IntArray?): Int {
+        public fun finallyWithBreakContinue(iArr: IntArray?): Int {
             var index: Int = 0
             var count: Int = 0
-            while (index < values!!.size) {
+            while (index < iArr!!.size) {
                 try {
-                    if (values[index] != 0) {
-                        if (values[index] < 0) {
+                    if (iArr[index] != 0) {
+                        if (iArr[index] < 0) {
                             count++
                             return count
                         }
-                        count = count + values[index] + 1
+                        count = count + iArr[index] + 1
                     } else {
                         count++
                     }
@@ -22,20 +22,20 @@ public open class ExceptionControlFlowAdvanced {
             return count
         }
 
-        public fun multiCatchAndFinally(values: IntArray?): Int {
+        public fun multiCatchAndFinally(iArr: IntArray?): Int {
             var index: Int = 0
-            var value: Int = 0
+            var i: Int = 0
             var result: Int
             try {
-                while (index < values!!.size) {
-                    if (values[index] < 0) {
+                while (index < iArr!!.size) {
+                    if (iArr[index] < 0) {
                         throw IllegalArgumentException()
                     }
-                    val value2: Int = value + 10 / values[index]
+                    val i2: Int = i + 10 / iArr[index]
                     index++
-                    value = value2
+                    i = i2
                 }
-                result = value + 3
+                result = i + 3
                 return result
             } catch (exception3: IllegalArgumentException) {
                 result = 1
@@ -48,9 +48,9 @@ public open class ExceptionControlFlowAdvanced {
             }
         }
 
-        public fun nestedTryInCatch(p0: Int): Int {
+        public fun nestedTryInCatch(i: Int): Int {
             var result: Int = 0
-            if (p0 != 0) {
+            if (i != 0) {
                 result = 1
                 return result
             }
@@ -58,7 +58,7 @@ public open class ExceptionControlFlowAdvanced {
                 throw RuntimeException()
             } catch (exception: RuntimeException) {
                 try {
-                    if (p0 < 0) {
+                    if (i < 0) {
                         result = 3
                         throw IllegalStateException()
                     }

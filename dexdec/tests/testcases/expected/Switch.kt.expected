@@ -1,7 +1,7 @@
 public open class Switch {
     companion object {
-        public fun dayName(p0: Int): String {
-            when (p0) {
+        public fun dayName(i: Int): String {
+            when (i) {
                 1 -> {
                     return "Monday"
                 }

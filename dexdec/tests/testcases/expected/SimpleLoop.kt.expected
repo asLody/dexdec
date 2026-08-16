@@ -1,12 +1,12 @@
 public open class SimpleLoop {
     companion object {
-        public fun sum(p0: Int): Int {
-            var value: Int = 0
+        public fun sum(i: Int): Int {
+            var i2: Int = 0
             var result: Int = 0
-            while (value < p0) {
-                val value2: Int = result + value
-                value++
-                result = value2
+            while (i2 < i) {
+                val i3: Int = result + i2
+                i2++
+                result = i3
             }
             return result
         }

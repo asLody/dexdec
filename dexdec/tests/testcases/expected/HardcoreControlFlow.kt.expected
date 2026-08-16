@@ -1,113 +1,113 @@
 public open class HardcoreControlFlow {
-    private fun check(p0: Int): Boolean {
-        if (p0 <= 0) {
+    private fun check(i: Int): Boolean {
+        if (i <= 0) {
             return false
         }
         return true
     }
 
-    private fun modify(p0: Int): Boolean {
-        if (p0 % 2 != 0) {
+    private fun modify(i: Int): Boolean {
+        if (i % 2 != 0) {
             return false
         }
         return true
     }
 
-    public open fun complexLogic(p0: Int, p1: Int): Boolean {
-        if (this.check(p0)) {
+    public open fun complexLogic(i: Int, i2: Int): Boolean {
+        if (this.check(i)) {
             return true
         }
-        if (this.modify(p0) && this.check(p1)) {
+        if (this.modify(i) && this.check(i2)) {
             return true
         }
-        if (this.modify(p1)) {
+        if (this.modify(i2)) {
             return true
         }
         return false
     }
 
-    public open fun exceptionSpaghetti(p0: Int, p1: Int): Int {
-        var value2: Int = 0
-        var value4: Int = 0
-        if (p0 <= 0) {
+    public open fun exceptionSpaghetti(i: Int, i2: Int): Int {
+        var i4: Int = 0
+        var i6: Int = 0
+        if (i <= 0) {
             try {
-                value4 = -2
+                i6 = -2
                 throw IllegalArgumentException()
             } catch (exception5: IllegalArgumentException) {
-                value4 = value2 - 100
-                if (value4 <= 0) {
-                    return value4
+                i6 = i4 - 100
+                if (i6 <= 0) {
+                    return i6
                 }
-                return value4 * 2
+                return i6 * 2
             } catch (exception4: ArithmeticException) {
-                return value4
+                return i6
             } catch (exception3: Throwable) {
-                if (value2 <= 0) {
+                if (i4 <= 0) {
                     throw exception3
                 }
-                return value2 * 2
+                return i4 * 2
             }
         }
-        val value: Int = 0
+        val i3: Int = 0
         try {
-            value4 = -2
-            val value3: Int = p0 / p1
-            if (value3 <= 10) {
-                value4 = value3 + 100
-                if (value4 <= 0) {
-                    return value4
+            i6 = -2
+            val i5: Int = i / i2
+            if (i5 <= 10) {
+                i6 = i5 + 100
+                if (i6 <= 0) {
+                    return i6
                 }
-                return value4 * 2
+                return i6 * 2
             }
-            val value5: Int = value3 + 100
-            if (value5 <= 0) {
-                return value3
+            val i7: Int = i5 + 100
+            if (i7 <= 0) {
+                return i5
             }
-            return value5 * 2
+            return i7 * 2
         } catch (exception2: ArithmeticException) {
             throw exception2
         } catch (exception: Throwable) {
-            value2 = value + 100
+            i4 = i3 + 100
             try {
                 throw exception
             } catch (exception5: IllegalArgumentException) {
-                value4 = value2 - 100
-                if (value4 <= 0) {
-                    return value4
+                i6 = i4 - 100
+                if (i6 <= 0) {
+                    return i6
                 }
-                return value4 * 2
+                return i6 * 2
             } catch (exception4: ArithmeticException) {
-                return value4
+                return i6
             } catch (exception3: Throwable) {
-                if (value2 <= 0) {
+                if (i4 <= 0) {
                     throw exception3
                 }
-                return value2 * 2
+                return i4 * 2
             }
         }
     }
 
-    public open fun labeledBreaks(valueses: Array<IntArray?>): Int {
+    public open fun labeledBreaks(iArrArr: Array<IntArray?>): Int {
         var index: Int = 0
         var total: Int = 0
-        while (index < valueses.size) {
-            if (valueses[index] !== null) {
+        while (index < iArrArr.size) {
+            if (iArrArr[index] !== null) {
                 var index2: Int = 0
                 var condition: Boolean = false
-                while (index2 < valueses[index]!!.size) {
-                    val element: Int = valueses[index]!![index2]
-                    if (element == -1) {
+                while (index2 < iArrArr[index]!!.size) {
+                    val i: Int = iArrArr[index]!![index2]
+                    if (i == -1) {
                         return total
                     }
-                    if (element == -2) {
+                    if (i == -2) {
                         break
                     }
-                    if (element == -3) {
+                    if (i == -3) {
                         break
                     }
-                    if (element > 100) {
+                    if (i > 100) {
                         var step: Int = 0
-                        while (step < element) {
+                        while (step < i) {
                             if (step * index2 > 1000) {
                                 total += step
                                 condition = true
@@ -119,7 +119,7 @@ public open class HardcoreControlFlow {
                             break
                         }
                     }
-                    total += element
+                    total += i
                     index2++
                 }
             }
@@ -128,12 +128,12 @@ public open class HardcoreControlFlow {
         return total
     }
 
-    public open fun stateMachine(values: IntArray): Int {
+    public open fun stateMachine(iArr: IntArray): Int {
         var index: Int = 0
         var total: Int = 0
         var selector: Int = 0
-        while (index < values.size) {
-            val step: Int = values[index]
+        while (index < iArr.size) {
+            val step: Int = iArr[index]
             when (selector) {
                 0 -> {
                     if (step > 0) {
