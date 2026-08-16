@@ -2,7 +2,7 @@
 
 use crate::ir::{ArgType, MethodDescriptor};
 use crate::language::java::{
-    JavaConstructorLayout, JavaFieldSymbol, JavaMemberNames, JavaMethodSymbol,
+    JavaConstructorLayout, JavaFieldSymbol, JavaIdentifier, JavaMemberNames, JavaMethodSymbol,
 };
 
 use super::java_model::method::{JavaMethodDeclarationKind, JavaMethodModel};
@@ -13,6 +13,7 @@ pub(super) struct ClassMemberNames;
 impl ClassMemberNames {
     pub(super) fn collect(root: &JavaClassModel) -> JavaMemberNames {
         let mut fields = Vec::new();
+        let mut hidden_fields = Vec::new();
         let mut methods = Vec::new();
         let mut constructors = Vec::new();
         let mut pending = vec![root];
@@ -23,6 +24,14 @@ impl ClassMemberNames {
             };
             fields.extend(class.fields.iter().map(|field| {
                 JavaFieldSymbol::new(owner.clone(), field.name.clone(), field.field_type.clone())
+            }));
+            hidden_fields.extend(class.outer_instance.iter().map(|outer| {
+                let field = outer.reference();
+                JavaFieldSymbol::new(
+                    field.owner.clone(),
+                    JavaIdentifier::from_dex(&field.name),
+                    field.field_type.clone(),
+                )
             }));
             methods.extend(
                 class
@@ -37,7 +46,9 @@ impl ClassMemberNames {
                     .filter_map(|method| Self::constructor(owner.clone(), method)),
             );
         }
-        JavaMemberNames::allocate(fields, methods).with_constructor_layouts(constructors)
+        JavaMemberNames::allocate(fields, methods)
+            .with_hidden_fields(hidden_fields)
+            .with_constructor_layouts(constructors)
     }
 
     pub(super) fn method_only(

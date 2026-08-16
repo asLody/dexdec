@@ -1314,6 +1314,19 @@ impl<'a> ValuePlanner<'a> {
         let [usage] = uses else {
             return Ok(false);
         };
+        // A materialized DEX `cmpg`/`cmpl` is lowered with explicit NaN bias
+        // and may inspect each operand more than once. Keep effectful operand
+        // producers as locals until the comparison itself can be rewritten as
+        // a source predicate; predicate operands are single-evaluated there.
+        if usage.consumer == Some(InsnType::Cmp) && usage.context != UseContext::Predicate {
+            let Some(effect) = self.relocatable_definition_effect_with_dependencies(definition)
+            else {
+                return Ok(false);
+            };
+            if !effect.is_pure() {
+                return Ok(false);
+            }
+        }
         if self.adjacent_inline(definition, usage)? {
             return Ok(true);
         }
@@ -1781,6 +1794,67 @@ impl<'a> ValuePlanner<'a> {
         }
     }
 
+    /// Includes effects hidden behind SSA registers in an expression. A pure
+    /// arithmetic wrapper can still contain an unstable producer (for example
+    /// `getCurrentScale() * factor`); expanding that wrapper into a materialized
+    /// `cmpg`/`cmpl` would evaluate the producer more than once.
+    fn relocatable_definition_effect_with_dependencies(
+        &self,
+        definition: &DefinitionFact,
+    ) -> Option<EffectSummary> {
+        let mut effect = EffectSummary::expression(definition.expression());
+        let mut pending = vec![definition.expression()];
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            match expression {
+                SemanticExpression::Register(register) => {
+                    let Some(key) = self.graph().key(register) else {
+                        continue;
+                    };
+                    if !visited.insert(key) {
+                        continue;
+                    }
+                    let Some(definitions) = self.graph().definitions.get(&key) else {
+                        continue;
+                    };
+                    for dependency in definitions {
+                        effect = effect.join(EffectSummary::expression(dependency.expression()));
+                        pending.push(dependency.expression());
+                    }
+                }
+                SemanticExpression::Operation(operation) => {
+                    pending.extend(operation.operands());
+                    pending.extend(operation.compound_target());
+                }
+                SemanticExpression::Select {
+                    condition,
+                    when_true,
+                    when_false,
+                } => {
+                    pending.push(when_true);
+                    pending.push(when_false);
+                    let mut predicates = vec![condition];
+                    while let Some(predicate) = predicates.pop() {
+                        match predicate {
+                            crate::ir::SemanticPredicate::Test(operation) => {
+                                effect = effect.join(EffectSummary::operation(operation));
+                                pending.extend(operation.operands());
+                                pending.extend(operation.compound_target());
+                            }
+                            crate::ir::SemanticPredicate::Not(inner) => predicates.push(inner),
+                            crate::ir::SemanticPredicate::And(terms)
+                            | crate::ir::SemanticPredicate::Or(terms) => predicates.extend(terms),
+                            crate::ir::SemanticPredicate::True
+                            | crate::ir::SemanticPredicate::False => {}
+                        }
+                    }
+                }
+                SemanticExpression::Literal(_) => {}
+            }
+        }
+        effect.can_relocate().then_some(effect)
+    }
+
     fn selection_effect(definition: &DefinitionFact) -> EffectSummary {
         match definition.operation() {
             Some(operation) if operation.payload.edge_copy => {
@@ -1885,9 +1959,10 @@ impl ValueAction {
 mod tests {
     use super::*;
     use crate::ir::{
-        analysis::SsaValueGraph, block::Block, ArgType, BlockId, EdgeKind, InsnNode, InvokeType,
-        RegionId, RegisterArg, SemanticBlock, SemanticLoopControl, SemanticLoopKind,
-        SemanticLoopTest, SemanticNode, SemanticPredicate, SemanticStatement, CFG,
+        analysis::SsaValueGraph, block::Block, ArgType, ArithOp, BlockId, CmpBias, EdgeKind,
+        InsnNode, InvokeType, RegionId, RegisterArg, SemanticBlock, SemanticLoopControl,
+        SemanticLoopKind, SemanticLoopTest, SemanticNode, SemanticPredicate, SemanticStatement,
+        CFG,
     };
 
     fn register(value: SsaVar, ty: &ArgType) -> RegisterArg {
@@ -1998,6 +2073,35 @@ mod tests {
         assert!(scheduled.contains(&allocation));
         assert!(scheduled.contains(&first_alias));
         assert!(scheduled.contains(&second_alias));
+    }
+
+    #[test]
+    fn keeps_pure_cmp_wrapper_when_its_dependency_reads_memory() {
+        let float_type = ArgType::FLOAT;
+        let field_value = SsaVar::new(1, 0);
+        let product = SsaVar::new(2, 0);
+        let comparison = SsaVar::new(3, 0);
+
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::sget(register(field_value, &float_type), 7));
+        block.push(InsnNode::arith(
+            ArithOp::Mul,
+            register(product, &float_type),
+            argument(field_value, &float_type),
+            InsnArg::lit(0x3f800000, float_type.clone()),
+            float_type.clone(),
+        ));
+        block.push(InsnNode::cmp(
+            register(comparison, &ArgType::INT),
+            argument(product, &float_type),
+            InsnArg::lit(0x3f800000, float_type),
+            CmpBias::Gt,
+        ));
+
+        let scheduled = scheduled_replacements("cmp_dependency_read", block);
+
+        assert!(scheduled.contains(&field_value));
+        assert!(!scheduled.contains(&product));
     }
 
     #[test]

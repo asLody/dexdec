@@ -29,6 +29,7 @@ pub use lower::{JavaDialect, JavaLowerer, JavaStructuralError};
 pub use members::{JavaConstructorLayout, JavaFieldSymbol, JavaMemberNames, JavaMethodSymbol};
 pub use normalize::{
     JavaAstNormalizer, JavaAstTransform, JavaInitializerExitLowering, JavaMethodCompletion,
+    JavaVoidTailLinearizer,
 };
 pub use rewrite::JavaAstRewriter;
 pub(crate) use source_types::GenericTypeProjection;

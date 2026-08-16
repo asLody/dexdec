@@ -73,6 +73,7 @@ struct UseFact {
     repetitive: bool,
     evaluation_prefix: EffectSummary,
     context: UseContext,
+    consumer: Option<InsnType>,
     site: Option<UseSite>,
 }
 

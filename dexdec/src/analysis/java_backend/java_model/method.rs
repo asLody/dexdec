@@ -3,7 +3,7 @@ use crate::ir::{ty::ArgType, CFG};
 use crate::language::java::{
     AggregateInitializer, DefiniteAssignment, JavaAstNormalizer, JavaAstTransform, JavaIdentifier,
     JavaInitializerExitLowering, JavaLowerer, JavaMethodCompletion, JavaModifier, JavaType,
-    LexicalDeclarationPlacement,
+    JavaVoidTailLinearizer, LexicalDeclarationPlacement,
 };
 
 use super::super::method_pipeline::MethodBodyAnalysis;
@@ -324,6 +324,15 @@ impl JavaMethodBody {
                 .apply(&mut ast)
                 .map_err(crate::language::java::JavaLoweringError::from)
         })?;
+        if !class_initializer && self.return_type.as_ref() == Some(&ArgType::VOID) {
+            let mut tail = JavaVoidTailLinearizer;
+            crate::profile_scope!("java_backend.method_lower.void_tail", {
+                match tail.apply(&mut ast) {
+                    Ok(_) => {}
+                    Err(never) => match never {},
+                }
+            });
+        }
         if semantically_terminal {
             if let Some(return_type) = completion_type {
                 let mut completion = JavaMethodCompletion::new(return_type);
@@ -498,7 +507,9 @@ impl JavaMethodDeclaration {
             && parsed_signature.as_ref().is_some_and(|signature| {
                 signature.has_unbound_type_variables(lexical_type_variables)
             });
-        let explicit_signature = parsed_signature.filter(|_| !has_unbound_variables);
+        let explicit_signature = parsed_signature.filter(|signature| {
+            !has_unbound_variables && method_signature_is_java_denotable(signature)
+        });
         let (signature, source_return_type) = match explicit_signature {
             Some(signature) => (Some(signature), None),
             None => {
@@ -660,6 +671,24 @@ impl JavaMethodDeclaration {
     }
 }
 
+fn method_signature_is_java_denotable(
+    signature: &crate::ir::generic_types::MethodSignature,
+) -> bool {
+    signature.type_parameters.iter().all(|parameter| {
+        parameter
+            .class_bound
+            .iter()
+            .chain(&parameter.interface_bounds)
+            .all(|bound| {
+                !matches!(
+                    bound,
+                    crate::ir::generic_types::JvmTypeSignature::Array(_)
+                        | crate::ir::generic_types::JvmTypeSignature::BaseType(_)
+                )
+            })
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::analysis::java_backend) enum JavaMethodDeclarationKind {
     Method,
@@ -800,4 +829,31 @@ fn is_meaningful_param_name(name: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::generic_types::GenericSignatures;
+
+    use super::method_signature_is_java_denotable;
+
+    #[test]
+    fn rejects_an_array_type_parameter_bound_in_a_method_signature() {
+        let signature = GenericSignatures::method(
+            "<C:[Ljava/lang/Object;:TR;R:Ljava/lang/Object;>\
+             (TC;Lkotlin/jvm/functions/Function0<+TR;>;)TR;",
+        )
+        .expect("Kotlin array intersection signature");
+
+        assert!(!method_signature_is_java_denotable(&signature));
+    }
+
+    #[test]
+    fn accepts_a_java_denotable_method_signature() {
+        let signature =
+            GenericSignatures::method("<T:Ljava/lang/Object;>(Ljava/util/List<+TT;>;)TT;")
+                .expect("ordinary generic method signature");
+
+        assert!(method_signature_is_java_denotable(&signature));
+    }
 }

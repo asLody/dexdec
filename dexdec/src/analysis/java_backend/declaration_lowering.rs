@@ -582,9 +582,10 @@ impl<'a> JavaTypeLowering<'a> {
             .ok_or(JavaDecompilerError::MalformedDeclarationStack)?;
         let mut declaration = lowered.declaration;
         let recovered_functions = lowered.liveness.apply(&mut declaration);
-        let outer_aliases = self
-            .outer_instances
-            .iter()
+        // Resolved simple owner names can collide across unrelated classes;
+        // only aliases owned by this lexical model may rewrite its fields.
+        let outer_aliases = class
+            .outer_instances()
             .map(|(field, outer)| {
                 Ok((
                     self.names.resolve_type(&field.owner)?,

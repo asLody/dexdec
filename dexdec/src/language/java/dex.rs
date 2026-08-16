@@ -2857,19 +2857,27 @@ impl DexJavaDialect {
             ..
         } = value
         {
+            let true_type = self.source_expression_type(when_true);
+            let false_type = self.source_expression_type(when_false);
+            let is_reference = |ty: &JavaType| !matches!(ty, JavaType::Primitive(_));
+            if when_false.literal_value() == Some(0) && true_type.as_ref().is_some_and(is_reference)
+            {
+                return true_type;
+            }
+            if when_true.literal_value() == Some(0) && false_type.as_ref().is_some_and(is_reference)
+            {
+                return false_type;
+            }
             let is_null = |branch: &SemanticExpression| {
                 branch.literal_value() == Some(0)
                     && branch.declared_type().is_some_and(ArgType::is_reference)
             };
             let joined = match (is_null(when_true), is_null(when_false)) {
-                (true, false) => self.source_expression_type(when_false),
-                (false, true) => self.source_expression_type(when_true),
-                _ => self
-                    .source_expression_type(when_true)
-                    .zip(self.source_expression_type(when_false))
-                    .and_then(|(left, right)| {
-                        self.type_relations().least_upper_bound(&left, &right)
-                    }),
+                (true, false) => false_type,
+                (false, true) => true_type,
+                _ => true_type.zip(false_type).and_then(|(left, right)| {
+                    self.type_relations().least_upper_bound(&left, &right)
+                }),
             };
             if joined.is_some() {
                 return joined;
@@ -4904,7 +4912,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::ir::analysis::SourceTypeEnvironment;
-    use crate::ir::{ArgType, RegisterArg};
+    use crate::ir::{ArgType, LiteralArg, RegisterArg, SemanticExpression, SemanticPredicate};
 
     use super::{DexJavaDialect, JavaDialect, JavaMemberNames, JavaType};
 
@@ -4962,6 +4970,34 @@ mod tests {
             JavaDialect::loop_variable(&mut dialect, &register).expect("reference source type");
 
         assert_eq!(ty, reference);
+    }
+
+    #[test]
+    fn select_types_an_integer_zero_as_null_against_a_reference_branch() {
+        let string = ArgType::string();
+        let source_string = JavaType::source_class("java.lang.String");
+        let dialect = DexJavaDialect::new(
+            true,
+            None,
+            &[],
+            &[],
+            &SourceTypeEnvironment::default(),
+            BTreeMap::from([(string.clone(), source_string.clone())]),
+            Arc::new(JavaMemberNames::default()),
+        )
+        .expect("static dialect");
+        let select = SemanticExpression::select(
+            SemanticPredicate::True,
+            SemanticExpression::Literal(LiteralArg::int(0)),
+            SemanticExpression::Register(RegisterArg {
+                reg_num: 1,
+                ty: string,
+                ssa_version: Some(1),
+                code_var: None,
+            }),
+        );
+
+        assert_eq!(dialect.source_expression_type(&select), Some(source_string));
     }
 }
 

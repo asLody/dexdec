@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::{EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG};
+use crate::ir::{
+    ArgType, EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct MethodTermination {
@@ -80,7 +82,9 @@ impl MethodTermination {
 
     fn is_no_return_call(&self, instruction: &InsnNode) -> bool {
         self.exact_internal_target(instruction)
-            .is_some_and(|target| self.no_return.contains(target))
+            .is_some_and(|target| {
+                self.no_return.contains(target) && !preserves_source_continuation(target)
+            })
     }
 
     fn exact_internal_target<'a>(
@@ -160,14 +164,32 @@ impl<'a> ReturnReachability<'a> {
         let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() else {
             return false;
         };
-        self.members.contains(target) && !self.may_return.contains(target)
+        self.members.contains(target)
+            && !self.may_return.contains(target)
+            && !preserves_source_continuation(target)
     }
+}
+
+/// Preserves bytecode continuations that still carry source-level meaning.
+///
+/// A non-void invocation can feed a `move-result` even when its implementation
+/// never returns at runtime. Removing that continuation loses the original
+/// expression or return value. Kotlin reification calls are void compiler
+/// markers with the same property: their throwing runtime implementations are
+/// placeholders for code expected to be inlined.
+fn preserves_source_continuation(target: &MethodReference) -> bool {
+    target.descriptor.return_type != ArgType::VOID
+        || (target.owner.as_object() == Some("kotlin/jvm/internal/Intrinsics")
+            && matches!(
+                target.name.as_str(),
+                "reifiedOperationMarker" | "needClassReification"
+            ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{ArgType, Block, BlockId, MethodContext, MethodDescriptor};
+    use crate::ir::{Block, BlockId, MethodContext, MethodDescriptor};
 
     fn reference(name: &str) -> MethodReference {
         MethodReference {
@@ -258,5 +280,101 @@ mod tests {
         let summary = MethodTermination::analyze([&left, &right]);
         assert!(summary.apply(&mut left));
         assert!(summary.apply(&mut right));
+    }
+
+    #[test]
+    fn kotlin_reification_markers_preserve_source_continuation() {
+        let marker = MethodReference {
+            owner: ArgType::object("kotlin/jvm/internal/Intrinsics"),
+            name: "reifiedOperationMarker".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: vec![ArgType::INT, ArgType::object("java/lang/String")],
+                return_type: ArgType::VOID,
+            },
+        };
+        assert!(preserves_source_continuation(&marker));
+        let mut class_reification = marker.clone();
+        class_reification.name = "needClassReification".to_string();
+        assert!(preserves_source_continuation(&class_reification));
+        let mut explicit_throw = marker.clone();
+        explicit_throw.name = "throwUndefinedForReified".to_string();
+        assert!(!preserves_source_continuation(&explicit_throw));
+
+        let mut marker_body = CFG::with_method(MethodContext::new(
+            marker.owner.clone(),
+            marker.name.clone(),
+            marker.descriptor.clone(),
+            true,
+        ));
+        let mut marker_entry = Block::new(0);
+        marker_entry.push(InsnNode::throw(crate::ir::InsnArg::lit(
+            0,
+            ArgType::object("java/lang/Throwable"),
+        )));
+        marker_body.add_block(marker_entry);
+
+        let mut caller = graph("caller");
+        let mut entry = Block::new(0);
+        let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        invoke.payload.reference = Some(MemberReference::Method(marker));
+        entry.push(invoke);
+        entry.push(InsnNode::goto(1));
+        caller.add_block(entry);
+        let mut normal = Block::new(1);
+        normal.push(InsnNode::return_void());
+        caller.add_block(normal);
+        caller.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+
+        let summary = MethodTermination::analyze([&marker_body, &caller]);
+        assert!(!summary.apply(&mut caller));
+        assert_eq!(caller.block(BlockId::new(0)).expect("entry").insns.len(), 2);
+        assert_eq!(
+            caller.successors_with_kind(BlockId::new(0)),
+            &[(BlockId::new(1), EdgeKind::Normal)]
+        );
+    }
+
+    #[test]
+    fn non_void_no_return_call_preserves_result_continuation() {
+        let target = MethodReference {
+            owner: ArgType::object("example/Test"),
+            name: "failWithValue".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::object("java/lang/Object"),
+            },
+        };
+        let mut target_body = CFG::with_method(MethodContext::new(
+            target.owner.clone(),
+            target.name.clone(),
+            target.descriptor.clone(),
+            true,
+        ));
+        let mut target_entry = Block::new(0);
+        target_entry.push(InsnNode::throw(crate::ir::InsnArg::lit(
+            0,
+            ArgType::object("java/lang/Throwable"),
+        )));
+        target_body.add_block(target_entry);
+
+        let mut caller = graph("caller");
+        let mut entry = Block::new(0);
+        let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
+        invoke.payload.reference = Some(MemberReference::Method(target));
+        entry.push(invoke);
+        entry.push(InsnNode::goto(1));
+        caller.add_block(entry);
+        let mut normal = Block::new(1);
+        normal.push(InsnNode::return_void());
+        caller.add_block(normal);
+        caller.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+
+        let summary = MethodTermination::analyze([&target_body, &caller]);
+        assert!(!summary.apply(&mut caller));
+        assert_eq!(caller.block(BlockId::new(0)).expect("entry").insns.len(), 2);
+        assert_eq!(
+            caller.successors_with_kind(BlockId::new(0)),
+            &[(BlockId::new(1), EdgeKind::Normal)]
+        );
     }
 }

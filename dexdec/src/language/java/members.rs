@@ -228,6 +228,28 @@ impl JavaMemberNames {
         self
     }
 
+    pub fn with_hidden_fields(mut self, fields: impl IntoIterator<Item = JavaFieldSymbol>) -> Self {
+        let mut scopes = BTreeMap::<ArgType, JavaNameScope>::new();
+        for (field, name) in &self.fields {
+            scopes
+                .entry(field.owner.clone())
+                .or_default()
+                .reserve(name.clone());
+        }
+        for field in fields.into_iter().collect::<BTreeSet<_>>() {
+            let key = field.key();
+            if self.fields.contains_key(&key) {
+                continue;
+            }
+            let name = scopes
+                .entry(field.owner.clone())
+                .or_default()
+                .claim(field.name.clone());
+            self.fields.insert(key, name);
+        }
+        self
+    }
+
     pub fn with_overloads(mut self, methods: impl IntoIterator<Item = MethodReference>) -> Self {
         for method in methods {
             self.overloads
@@ -365,6 +387,36 @@ impl FieldNameAllocation {
 
 struct MethodNameAllocation {
     scopes: BTreeMap<ArgType, JavaNameScope>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::ArgType;
+
+    use super::{JavaFieldSymbol, JavaIdentifier, JavaMemberNames};
+
+    #[test]
+    fn hidden_field_does_not_reuse_a_declared_field_name() {
+        let owner = ArgType::object("example/Owner");
+        let declared = JavaFieldSymbol::new(
+            owner.clone(),
+            JavaIdentifier::from_dex("value"),
+            ArgType::BOOLEAN,
+        );
+        let hidden = JavaFieldSymbol::new(
+            owner,
+            JavaIdentifier::from_dex("value"),
+            ArgType::object("example/Outer"),
+        );
+        let names =
+            JavaMemberNames::allocate([declared.clone()], []).with_hidden_fields([hidden.clone()]);
+
+        assert_eq!(
+            names.field_symbol(&declared),
+            JavaIdentifier::from_dex("value")
+        );
+        assert_ne!(names.field_symbol(&hidden), names.field_symbol(&declared));
+    }
 }
 
 impl MethodNameAllocation {

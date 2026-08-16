@@ -2,8 +2,9 @@ use std::{borrow::Cow, cell::RefCell, sync::Arc};
 
 use crate::ir::semantic::{CompletionDomain, CompletionInterpreter};
 use crate::ir::{
-    SemanticExpression, SemanticLabel, SemanticLeave, SemanticLoopControl, SemanticLoopKind,
-    SemanticNode, SemanticOperation, SemanticPredicate, SemanticStatement, SemanticStatementKind,
+    InsnType, SemanticExpression, SemanticLabel, SemanticLeave, SemanticLoopControl,
+    SemanticLoopKind, SemanticNode, SemanticOperation, SemanticPredicate, SemanticStatement,
+    SemanticStatementKind,
 };
 
 use super::{
@@ -228,6 +229,7 @@ impl<'ir> FlowCollector<'ir> {
                     event,
                     prefix,
                     UseContext::Value,
+                    None,
                     argument_site,
                     origin,
                 )
@@ -297,6 +299,7 @@ impl<'ir> FlowCollector<'ir> {
             event,
             &mut prefix,
             UseContext::Value,
+            None,
             site,
             origin,
         )?;
@@ -404,6 +407,7 @@ impl<'ir> FlowCollector<'ir> {
             event,
             &mut prefix,
             UseContext::Value,
+            None,
             site,
             origin,
         )?;
@@ -427,11 +431,11 @@ impl<'ir> FlowCollector<'ir> {
                 .evaluation_operands()?
                 .into_iter()
                 .rev()
-                .map(EvaluationTask::Expression),
+                .map(|expression| EvaluationTask::Expression(expression, operation.insn_type)),
         );
         while let Some(task) = pending.pop() {
             match task {
-                EvaluationTask::Expression(SemanticExpression::Register(register)) => {
+                EvaluationTask::Expression(SemanticExpression::Register(register), consumer) => {
                     if let Some(key) = self.graph.key(register) {
                         self.graph.uses.entry(key).or_default().push(UseFact {
                             point: origin.cloned(),
@@ -443,25 +447,31 @@ impl<'ir> FlowCollector<'ir> {
                             repetitive: self.repetitive_depth != 0,
                             evaluation_prefix: prefix.clone(),
                             context,
+                            consumer: Some(consumer),
                             site,
                         });
                     }
                 }
-                EvaluationTask::Expression(SemanticExpression::Operation(child)) => {
+                EvaluationTask::Expression(SemanticExpression::Operation(child), _) => {
                     pending.push(EvaluationTask::Effect(child));
                     pending.extend(
                         child
                             .evaluation_operands()?
                             .into_iter()
                             .rev()
-                            .map(EvaluationTask::Expression),
+                            .map(|expression| {
+                                EvaluationTask::Expression(expression, child.insn_type)
+                            }),
                     );
                 }
-                EvaluationTask::Expression(SemanticExpression::Select {
-                    condition,
-                    when_true,
-                    when_false,
-                }) => {
+                EvaluationTask::Expression(
+                    SemanticExpression::Select {
+                        condition,
+                        when_true,
+                        when_false,
+                    },
+                    consumer,
+                ) => {
                     *prefix = prefix
                         .clone()
                         .join(self.visit_predicate_uses(condition, domain, event, site, origin)?);
@@ -476,6 +486,7 @@ impl<'ir> FlowCollector<'ir> {
                         event,
                         &mut true_prefix,
                         context,
+                        Some(consumer),
                         site,
                         origin,
                     )?;
@@ -486,12 +497,13 @@ impl<'ir> FlowCollector<'ir> {
                         event,
                         &mut false_prefix,
                         context,
+                        Some(consumer),
                         site,
                         origin,
                     )?;
                     *prefix = true_prefix.join(false_prefix);
                 }
-                EvaluationTask::Expression(SemanticExpression::Literal(_)) => {}
+                EvaluationTask::Expression(SemanticExpression::Literal(_), _) => {}
                 EvaluationTask::Effect(operation) => {
                     *prefix = prefix.clone().join(EffectSummary::direct(operation));
                 }
@@ -507,6 +519,7 @@ impl<'ir> FlowCollector<'ir> {
         event: usize,
         prefix: &mut EffectSummary,
         context: UseContext,
+        consumer: Option<InsnType>,
         site: Option<UseSite>,
         origin: Option<&crate::ir::analysis::SemanticFlowPoint>,
     ) -> Result<(), ValueRecoveryError> {
@@ -524,6 +537,7 @@ impl<'ir> FlowCollector<'ir> {
                         repetitive: self.repetitive_depth != 0,
                         evaluation_prefix: prefix.clone(),
                         context,
+                        consumer,
                         site,
                     });
                 }
@@ -551,6 +565,7 @@ impl<'ir> FlowCollector<'ir> {
                     event,
                     &mut true_prefix,
                     context,
+                    consumer,
                     site,
                     origin,
                 )?;
@@ -561,6 +576,7 @@ impl<'ir> FlowCollector<'ir> {
                     event,
                     &mut false_prefix,
                     context,
+                    consumer,
                     site,
                     origin,
                 )?;
@@ -791,6 +807,6 @@ enum FlowTask<'a> {
 }
 
 enum EvaluationTask<'a> {
-    Expression(&'a SemanticExpression),
+    Expression(&'a SemanticExpression, InsnType),
     Effect(&'a SemanticOperation),
 }
