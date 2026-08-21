@@ -3,7 +3,7 @@ members = ["dexdec", "dexdec-workbench", "dexdec-mcp", "dexdec-gui/src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"

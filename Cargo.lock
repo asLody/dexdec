@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "dexdec"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "abxml",
  "bitflags 2.13.1",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "dexdec-app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "dexdec-mcp",
  "dexdec-workbench",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "dexdec-mcp"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "dexdec-workbench",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "dexdec-workbench"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "abxml",
  "apk-info-axml",

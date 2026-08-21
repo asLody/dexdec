@@ -1,7 +1,7 @@
 {
   "name": "dexdec",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Fast, accurate Android decompilation for humans and AI agents",
   "license": "Apache-2.0",
   "engines": {
