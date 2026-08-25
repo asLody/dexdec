@@ -12,7 +12,7 @@ pub fn start_from_env() -> Option<Guard> {
 
     Some(
         hotpath::HotpathGuardBuilder::new("dexdec")
-            .functions_limit(80)
+            .functions_limit(200)
             .threads_limit(0)
             .sections(vec![hotpath::Section::FunctionsTiming])
             .build(),

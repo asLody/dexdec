@@ -128,7 +128,7 @@ impl DefaultMaskFlow {
             else {
                 continue;
             };
-            instruction.payload.reference = Some(MemberReference::Method(reference));
+            instruction.payload.reference = Some(Box::new(MemberReference::Method(reference)));
         }
         Some(cfg)
     }
@@ -140,7 +140,7 @@ impl DefaultMaskFlow {
             .filter(|instruction| {
                 instruction.insn_type == InsnType::Invoke
                     && matches!(
-                        instruction.payload.reference.as_ref(),
+                        instruction.payload.reference.as_deref(),
                         Some(MemberReference::Method(method)) if method == target
                     )
             })

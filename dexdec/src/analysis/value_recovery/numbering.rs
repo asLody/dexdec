@@ -392,10 +392,10 @@ impl ExpressionFrame {
             arithmetic: instruction.payload.arith_op,
             unary: instruction.payload.unary_op,
             comparison_bias: instruction.payload.cmp_bias,
-            cast_type: instruction.payload.cast_type.clone(),
-            class_type: instruction.payload.class_type.clone(),
+            cast_type: instruction.payload.cast_type.as_deref().cloned(),
+            class_type: instruction.payload.class_type.as_deref().cloned(),
             type_index: instruction.payload.type_index,
-            string_value: instruction.payload.string_value.clone(),
+            string_value: instruction.payload.string_value.as_deref().cloned(),
             argument_count: instruction.operands().len(),
         })
     }

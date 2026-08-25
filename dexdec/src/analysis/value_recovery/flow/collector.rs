@@ -714,7 +714,10 @@ impl CompletionDomain for ControlFallthrough<'_> {
         Ok(self.logic.borrow().falsity())
     }
 
-    fn sequence(&self, children: Vec<Self::State>) -> Result<Self::State, Self::Error> {
+    fn sequence(
+        &self,
+        children: impl IntoIterator<Item = Self::State>,
+    ) -> Result<Self::State, Self::Error> {
         let mut logic = self.logic.borrow_mut();
         let mut state = logic.truth();
         for child in children {
@@ -773,7 +776,7 @@ impl CompletionDomain for ControlFallthrough<'_> {
         &self,
         _region: Option<crate::ir::RegionId>,
         _has_default: bool,
-        _cases: Vec<Self::State>,
+        _cases: impl IntoIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         Ok(self.logic.borrow().truth())
     }
@@ -782,7 +785,7 @@ impl CompletionDomain for ControlFallthrough<'_> {
         &self,
         _catches: usize,
         _has_finally: bool,
-        _children: Vec<Self::State>,
+        _children: impl DoubleEndedIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         Ok(self.logic.borrow().truth())
     }

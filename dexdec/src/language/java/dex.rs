@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ir::analysis::{SourceTypeEnvironment, TypeConstraintError};
@@ -28,8 +29,8 @@ mod input;
 use super::members::JavaMemberNames;
 use super::source_types::{
     invocation_expression_signature, GenericInvocationCompatibility, GenericTypeEvidence,
-    GenericTypeProjection, GenericTypeRelation, GenericTypeSolver, JavaTypeRelations,
-    SourceTypeFlow,
+    GenericTypeProjection, GenericTypeRelation, GenericTypeSolver, JavaTypeErasureIndex,
+    JavaTypeRelations, SourceObjectTypes, SourceTypeFlow,
 };
 use input::JavaInputVerifier;
 
@@ -197,9 +198,9 @@ pub struct DexJavaDialect {
     primitive_expression_types: RefCell<BTreeMap<InstructionId, Option<PrimitiveType>>>,
     source_field_types: Arc<BTreeMap<FieldReference, JavaType>>,
     generic_fields: Arc<BTreeMap<FieldReference, GenericFieldContract>>,
-    source_object_types: Arc<BTreeMap<ArgType, JavaType>>,
+    source_object_types: Arc<SourceObjectTypes>,
     generic_methods: Arc<BTreeMap<MethodReference, GenericMethodContract>>,
-    generic_type_projection: Option<Arc<dyn GenericTypeProjection>>,
+    generic_type_projection: Option<Rc<dyn GenericTypeProjection>>,
     declared: BTreeSet<JavaIdentifier>,
     locals: BTreeMap<JavaIdentifier, JavaType>,
     current_type: Option<ArgType>,
@@ -213,6 +214,7 @@ pub struct DexJavaDialect {
     this_code_var: Option<u32>,
     types: SourceTypeEnvironment,
     source_types: BTreeMap<ArgType, JavaType>,
+    source_erasures: Arc<JavaTypeErasureIndex>,
     inline_declarations: BTreeSet<SourceVariable>,
     catch_storage: BTreeSet<SourceVariable>,
     name_scope: JavaNameScope,
@@ -340,6 +342,7 @@ impl DexJavaDialect {
                 names: parameter_names.len(),
             });
         }
+        let source_erasures = Arc::new(JavaTypeErasureIndex::from_source_types(&source_types));
         let mut values = Self {
             names: BTreeMap::new(),
             source_names: BTreeMap::new(),
@@ -353,7 +356,7 @@ impl DexJavaDialect {
             primitive_expression_types: RefCell::new(BTreeMap::new()),
             source_field_types: Arc::new(BTreeMap::new()),
             generic_fields: Arc::new(BTreeMap::new()),
-            source_object_types: Arc::new(BTreeMap::new()),
+            source_object_types: Arc::new(SourceObjectTypes::default()),
             generic_methods: Arc::new(BTreeMap::new()),
             generic_type_projection: None,
             declared: BTreeSet::new(),
@@ -369,6 +372,7 @@ impl DexJavaDialect {
             this_code_var,
             types: types.clone(),
             source_types,
+            source_erasures,
             inline_declarations: BTreeSet::new(),
             catch_storage: BTreeSet::new(),
             name_scope: JavaNameScope::default(),
@@ -433,14 +437,14 @@ impl DexJavaDialect {
         self
     }
 
-    pub fn with_source_object_types(mut self, types: Arc<BTreeMap<ArgType, JavaType>>) -> Self {
+    pub(crate) fn with_source_object_types(mut self, types: Arc<SourceObjectTypes>) -> Self {
         self.source_object_types = types;
         self
     }
 
     pub(crate) fn with_generic_type_projection(
         mut self,
-        projection: Arc<dyn GenericTypeProjection>,
+        projection: Rc<dyn GenericTypeProjection>,
     ) -> Self {
         self.generic_type_projection = Some(projection);
         self
@@ -568,7 +572,7 @@ impl DexJavaDialect {
         else {
             return false;
         };
-        let Some(MemberReference::Field(field)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Field(field)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(binding) = self.outer_instance.as_ref() else {
@@ -674,7 +678,7 @@ impl DexJavaDialect {
                 if operation.insn_type != InsnType::Invoke {
                     return false;
                 }
-                let Some(actual) = Self::method(operation.payload.reference.as_ref())
+                let Some(actual) = Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type)
                     .filter(|actual| actual.is_reference())
@@ -1083,7 +1087,7 @@ impl DexJavaDialect {
                 expression = &operation.operands()[0];
                 continue;
             }
-            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() {
+            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() {
                 if let ArgType::Primitive(primitive) = &method.descriptor.return_type {
                     return Some(*primitive);
                 }
@@ -1161,7 +1165,7 @@ impl DexJavaDialect {
                         .first()
                         .and_then(Self::intrinsic_primitive_type);
                 }
-                match operation.payload.reference.as_ref() {
+                match operation.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => {
                         return method.descriptor.return_type.as_primitive();
                     }
@@ -1175,7 +1179,7 @@ impl DexJavaDialect {
                 operation
                     .payload
                     .cast_type
-                    .as_ref()
+                    .as_deref()
                     .and_then(ArgType::as_primitive)
                     .or_else(|| {
                         operation
@@ -1194,6 +1198,43 @@ impl DexJavaDialect {
             }
             SemanticExpression::Register(_) => None,
         }
+    }
+
+    fn array_element_primitive(&self, expression: &SemanticExpression) -> Option<PrimitiveType> {
+        let operation = expression.as_operation()?;
+        if operation.insn_type != InsnType::Aget {
+            return None;
+        }
+        let array = operation.operands().first()?;
+        match self.expression_type(array).ok()? {
+            ArgType::Array(element) => element.as_primitive(),
+            _ => None,
+        }
+    }
+
+    fn numeric_comparison_domain(
+        &self,
+        left: &SemanticExpression,
+        right: &SemanticExpression,
+    ) -> ArgType {
+        let primitives = [
+            self.source_primitive_type(left),
+            Self::intrinsic_primitive_type(left),
+            self.array_element_primitive(left),
+            self.source_primitive_type(right),
+            Self::intrinsic_primitive_type(right),
+            self.array_element_primitive(right),
+        ];
+        if primitives.contains(&Some(PrimitiveType::Double)) {
+            return ArgType::Primitive(PrimitiveType::Double);
+        }
+        if primitives.contains(&Some(PrimitiveType::Float)) {
+            return ArgType::Primitive(PrimitiveType::Float);
+        }
+        if primitives.contains(&Some(PrimitiveType::Long)) {
+            return ArgType::Primitive(PrimitiveType::Long);
+        }
+        ArgType::Primitive(PrimitiveType::Int)
     }
 
     fn has_intrinsic_numeric_comparison_domain(
@@ -1434,7 +1475,7 @@ impl DexJavaDialect {
             InsnType::ConstStr => Ok(JavaExpr::Literal(JavaLiteral::String(
                 insn.payload
                     .string_value
-                    .as_ref()
+                    .as_deref()
                     .ok_or(JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "string_value",
@@ -1442,7 +1483,7 @@ impl DexJavaDialect {
                     .clone(),
             ))),
             InsnType::ConstClass => Ok(JavaExpr::ClassLiteral(
-                self.source_type(insn.payload.class_type.as_ref().ok_or(
+                self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -1608,7 +1649,7 @@ impl DexJavaDialect {
                             .ok_or(JavaLoweringError::MissingArgument(insn.insn_type))?,
                     )?,
                 ),
-                ty: self.source_type(insn.payload.class_type.as_ref().ok_or(
+                ty: self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -1642,7 +1683,7 @@ impl DexJavaDialect {
                 ),
             }),
             InsnType::Iget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let owner = insn
                     .operands()
                     .first()
@@ -1663,7 +1704,7 @@ impl DexJavaDialect {
                 })
             }
             InsnType::Sget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 Ok(JavaExpr::StaticField {
                     owner: self.source_type(&field.owner)?,
                     name: self.member_names.field(field),
@@ -1671,7 +1712,7 @@ impl DexJavaDialect {
             }
             InsnType::Invoke => self.invoke(insn, None),
             InsnType::Constructor => {
-                let method = Self::method(insn.payload.reference.as_ref())?;
+                let method = Self::method(insn.payload.reference.as_deref())?;
                 let allocation_owner = insn.allocation_type().unwrap_or(&method.owner);
                 let analyzed_allocation_type = insn
                     .result
@@ -1689,6 +1730,7 @@ impl DexJavaDialect {
                     })
                     .unwrap_or_else(|| {
                         GenericTypeSolver::new(&self.source_types)
+                            .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
                             .with_projection(self.generic_type_projection.as_deref())
                     });
                 let contextual_allocation_type = expected_source_type.and_then(|expected| {
@@ -1902,7 +1944,7 @@ impl DexJavaDialect {
         Vec<&'operation SemanticExpression>,
         GenericMethodContract,
     )> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let contract = self.generic_methods.get(method)?.clone();
         let invoke_type = operation.payload.invoke_type?;
         let is_static = invoke_type == InvokeType::Static;
@@ -2041,7 +2083,7 @@ impl DexJavaDialect {
         insn: &SemanticOperation,
         expected_source_type: Option<&JavaType>,
     ) -> Result<JavaExpr, JavaLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let invoke_type = insn
             .payload
             .invoke_type
@@ -2056,6 +2098,7 @@ impl DexJavaDialect {
             .map(|contract| self.solver(&contract.owner, &contract.signature.type_parameters))
             .unwrap_or_else(|| {
                 GenericTypeSolver::new(&self.source_types)
+                    .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
                     .with_projection(self.generic_type_projection.as_deref())
             });
         if let Some(contract) = &contract {
@@ -2984,7 +3027,7 @@ impl DexJavaDialect {
                 operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => {
                             self.outer_instance_fields.get(field).cloned().or_else(|| {
@@ -3038,7 +3081,7 @@ impl DexJavaDialect {
     }
 
     fn intrinsic_invocation_source_type(&self, operation: &SemanticOperation) -> Option<JavaType> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let (mut solver, arguments, contract) = self.invocation_solver(operation)?;
         if solver.owner_is_raw(&contract.owner)
             || contract
@@ -3082,7 +3125,7 @@ impl DexJavaDialect {
         let declared = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| Self::method(operation.payload.reference.as_ref()).ok())
+            .and_then(|operation| Self::method(operation.payload.reference.as_deref()).ok())
             .and_then(|method| {
                 self.source_object_types
                     .get(&method.owner)
@@ -3184,7 +3227,7 @@ impl DexJavaDialect {
                     operation
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .and_then(|reference| match reference {
                             MemberReference::Field(field) => self
                                 .source_field_type(field, operation.operands().first())
@@ -3220,7 +3263,8 @@ impl DexJavaDialect {
                 InsnType::Invoke => {
                     self.intrinsic_invocation_source_type(operation)
                         .or_else(|| {
-                            let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+                            let method =
+                                Self::method(operation.payload.reference.as_deref()).ok()?;
                             self.source_type(&method.descriptor.return_type).ok()
                         })
                 }
@@ -3318,7 +3362,7 @@ impl DexJavaDialect {
     fn declared_expression_erasure(value: &SemanticExpression) -> Option<&ArgType> {
         match value {
             SemanticExpression::Operation(operation) => match operation.insn_type {
-                InsnType::Invoke => Self::method(operation.payload.reference.as_ref())
+                InsnType::Invoke => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type),
                 InsnType::Move => operation
@@ -3326,7 +3370,7 @@ impl DexJavaDialect {
                     .first()
                     .and_then(Self::declared_expression_erasure),
                 InsnType::CheckCast => operation.conversion_type(),
-                InsnType::Constructor => Self::method(operation.payload.reference.as_ref())
+                InsnType::Constructor => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.owner),
                 _ => value.declared_type(),
@@ -3353,7 +3397,7 @@ impl DexJavaDialect {
                 InsnType::Invoke | InsnType::Constructor => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Method(method) => self.generic_methods.get(method),
                         MemberReference::Field(_) => None,
@@ -3365,7 +3409,7 @@ impl DexJavaDialect {
                 InsnType::Iget | InsnType::Sget => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => self.generic_fields.get(field),
                         MemberReference::Method(_) => None,
@@ -3391,7 +3435,7 @@ impl DexJavaDialect {
                 .first()
                 .is_some_and(|operand| self.expression_declares_concrete_generic_type(operand));
         }
-        let Some(reference) = operation.payload.reference.as_ref() else {
+        let Some(reference) = operation.payload.reference.as_deref() else {
             return false;
         };
         match reference {
@@ -3449,7 +3493,7 @@ impl DexJavaDialect {
         let constructed_type = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| operation.payload.reference.as_ref())
+            .and_then(|operation| operation.payload.reference.as_deref())
             .and_then(|reference| match reference {
                 MemberReference::Method(method) => Some(&method.owner),
                 MemberReference::Field(_) => None,
@@ -3481,6 +3525,7 @@ impl DexJavaDialect {
             &self.source_type_erasures,
             self.generic_type_projection.as_deref(),
         )
+        .with_erasure_index(Some(self.source_erasures.as_ref()))
         .with_direct_supertypes(Some(self.source_object_types.as_ref()))
         .with_variable_bounds(Some(&self.source_type_bounds))
     }
@@ -3491,6 +3536,7 @@ impl DexJavaDialect {
         parameters: &[TypeParameter],
     ) -> GenericTypeSolver<'a> {
         let solver = GenericTypeSolver::new(&self.source_types)
+            .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
             .with_local_owner_variables(owner)
             .with_inference_variables(parameters)
             .with_lexical_scope(
@@ -3537,7 +3583,7 @@ impl DexJavaDialect {
         if operation.insn_type != InsnType::Invoke {
             return false;
         }
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(contract) = self.generic_methods.get(method) else {
@@ -3784,7 +3830,7 @@ impl DexJavaDialect {
         &mut self,
         insn: &SemanticOperation,
     ) -> Result<JavaStmt, JavaLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let receiver = insn
             .operands()
             .first()
@@ -4258,10 +4304,11 @@ impl DexJavaDialect {
             return Ok(comparison);
         }
         if self.has_intrinsic_numeric_comparison_domain(left_arg, right_arg)? {
+            let domain = self.numeric_comparison_domain(left_arg, right_arg);
             return Ok(JavaExpr::Binary {
-                left: Box::new(self.arg(left_arg)?),
+                left: Box::new(self.arg_as(left_arg, &domain)?),
                 op: Self::comparison_operator(op),
-                right: Box::new(self.arg(right_arg)?),
+                right: Box::new(self.arg_as(right_arg, &domain)?),
             });
         }
         let mut left = self.comparison_arg(left_arg, right_arg)?;
@@ -4682,7 +4729,7 @@ impl JavaDialect for DexJavaDialect {
                     && insn
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .is_some_and(|reference| {
                             matches!(reference, MemberReference::Method(method) if method.is_constructor())
                         })
@@ -4695,7 +4742,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::FilledNewArray => {
-                let ty = self.source_type(insn.payload.class_type.as_ref().ok_or(
+                let ty = self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -4708,7 +4755,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::Iput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let value = insn
                     .operands()
                     .first()
@@ -4736,7 +4783,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::Sput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 JavaStmt::Assign {
                     target: JavaExpr::StaticField {
                         owner: self.source_type(&field.owner)?,

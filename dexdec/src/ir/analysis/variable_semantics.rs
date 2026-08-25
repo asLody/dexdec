@@ -472,7 +472,7 @@ impl<'a> VariableSemanticGraphBuilder<'a> {
                 expression = &operation.operands()[0];
                 continue;
             }
-            return operation.payload.reference.clone();
+            return operation.payload.reference.as_deref().cloned();
         }
     }
 
@@ -715,7 +715,7 @@ impl SemanticVisitor for VariableSemanticGraphBuilder<'_> {
             .or_insert_with(|| OperationNode {
                 identity: operation.id,
                 kind: operation.insn_type,
-                reference: operation.payload.reference.clone(),
+                reference: operation.payload.reference.as_deref().cloned(),
                 operands,
                 loop_depth: self.loop_depth,
             });

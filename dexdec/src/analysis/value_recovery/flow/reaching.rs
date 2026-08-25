@@ -394,7 +394,7 @@ mod tests {
             ),
         ]);
         SemanticSiteNumbering::assign(&mut root).unwrap();
-        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new()).unwrap();
+        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new(), &mut None).unwrap();
         let key = SsaVar::new(variable, 0);
         let definitions = &graph.definitions[&key];
         let uses = &graph.uses[&key];

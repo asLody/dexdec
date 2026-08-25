@@ -223,7 +223,7 @@ impl ObjectInitializations {
             let allocation_type = cfg
                 .block(allocation.block)
                 .and_then(|block| block.insns.get(allocation.index))
-                .and_then(|instruction| instruction.payload.class_type.as_ref())
+                .and_then(|instruction| instruction.payload.class_type.as_deref())
                 .ok_or(ObjectInitializationError::MissingAllocationType(
                     *allocation,
                 ))?;
@@ -375,7 +375,7 @@ impl ObjectInitializations {
     fn is_orphan_string_builder(cfg: &CFG, allocation: InsnPosition) -> bool {
         cfg.block(allocation.block)
             .and_then(|block| block.insns.get(allocation.index))
-            .and_then(|instruction| instruction.payload.class_type.as_ref())
+            .and_then(|instruction| instruction.payload.class_type.as_deref())
             .and_then(crate::ir::ArgType::as_object)
             == Some("java/lang/StringBuilder")
     }
@@ -424,7 +424,7 @@ impl ObjectInitializations {
         let reference = instruction
             .payload
             .reference
-            .as_ref()
+            .as_deref()
             .ok_or(ObjectInitializationError::MissingReference(position))?;
         let MemberReference::Method(method) = reference else {
             return Err(ObjectInitializationError::InvalidReferenceKind(position));
@@ -619,7 +619,7 @@ mod tests {
         let object_type = crate::ir::ArgType::object(ty);
         let mut instruction =
             InsnNode::new_instance(RegisterArg::with_ssa(0, object_type.clone(), 0), 0);
-        instruction.payload.class_type = Some(object_type);
+        instruction.payload.class_type = Some(Box::new(object_type));
 
         let mut entry = Block::new(allocation);
         entry.push(instruction);

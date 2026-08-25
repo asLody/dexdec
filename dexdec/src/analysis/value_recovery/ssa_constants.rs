@@ -191,7 +191,7 @@ fn constant_key(value: &InsnArg) -> Option<ConstantKey<'_>> {
             ))
         }
         InsnArg::Wrapped(instruction) if instruction.insn_type == InsnType::ConstStr => Some(
-            ConstantKey::String(instruction.payload.string_value.as_ref()?),
+            ConstantKey::String(instruction.payload.string_value.as_deref()?),
         ),
         InsnArg::Reg(_) | InsnArg::Wrapped(_) => None,
     }

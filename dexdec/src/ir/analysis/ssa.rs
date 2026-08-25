@@ -296,6 +296,14 @@ impl SsaValueGraph {
         &self.phis
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_phis_for_test(phis: Vec<PhiMerge>) -> Self {
+        Self {
+            phis,
+            ..Self::default()
+        }
+    }
+
     pub fn copies(&self) -> &[ValueCopy] {
         &self.copies
     }

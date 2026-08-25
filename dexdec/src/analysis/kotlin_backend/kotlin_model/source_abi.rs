@@ -205,7 +205,7 @@ impl<'a> ConstructorOriginFlow<'a> {
                         == Some(&ConstructorOrigin::This)
                 {
                     if let Some(MemberReference::Field(field)) =
-                        instruction.payload.reference.as_ref()
+                        instruction.payload.reference.as_deref()
                     {
                         if candidates.contains(field) {
                             stores.insert(field.clone());
@@ -447,23 +447,26 @@ impl InheritedMethodAbi {
         reference: &MethodReference,
         owner: &ClassTypeSignature,
         owner_parameters: &[TypeParameter],
-        methods: &std::collections::BTreeMap<MethodReference, GenericMethodContract>,
+        declarations: &std::collections::BTreeMap<
+            (String, crate::ir::MethodDescriptor),
+            Vec<(ArgType, GenericMethodContract)>,
+        >,
+        owner_ancestors: &std::collections::BTreeSet<ArgType>,
         hierarchy: &crate::analysis::method_override::GenericTypeHierarchy,
     ) -> Option<GenericMethodContract> {
-        let mut nearest: Option<(&MethodReference, &GenericMethodContract)> = None;
-        for (candidate, contract) in methods.iter().filter(|(candidate, _)| {
-            candidate.owner != reference.owner
-                && candidate.name == reference.name
-                && candidate.descriptor == reference.descriptor
-                && hierarchy.is_subtype(&reference.owner, &candidate.owner)
+        let candidates =
+            declarations.get(&(reference.name.clone(), reference.descriptor.clone()))?;
+        let mut nearest: Option<(&ArgType, &GenericMethodContract)> = None;
+        for (candidate_owner, contract) in candidates.iter().filter(|(candidate_owner, _)| {
+            candidate_owner != &reference.owner && owner_ancestors.contains(candidate_owner)
         }) {
             nearest = match nearest {
-                None => Some((candidate, contract)),
-                Some((current, _)) if hierarchy.is_subtype(&candidate.owner, &current.owner) => {
-                    Some((candidate, contract))
+                None => Some((candidate_owner, contract)),
+                Some((current, _)) if hierarchy.is_subtype(candidate_owner, current) => {
+                    Some((candidate_owner, contract))
                 }
                 Some((current, current_contract))
-                    if hierarchy.is_subtype(&current.owner, &candidate.owner) =>
+                    if hierarchy.is_subtype(current, candidate_owner) =>
                 {
                     Some((current, current_contract))
                 }
@@ -600,6 +603,7 @@ pub(crate) struct KotlinSourceAbi {
     lexical_type_parameters: std::collections::BTreeMap<ArgType, Vec<TypeParameter>>,
     inherited_member_types: BTreeMap<ArgType, BTreeSet<(KotlinIdentifier, ArgType)>>,
     outer_instances: std::collections::BTreeMap<FieldReference, ArgType>,
+    outer_instance_by_owner: BTreeMap<ArgType, FieldReference>,
     field_types: std::collections::BTreeMap<FieldReference, GenericFieldContract>,
     method_exceptions: std::collections::BTreeMap<MethodReference, Vec<ArgType>>,
     platform_exceptions: std::sync::Arc<std::collections::BTreeMap<MethodReference, Vec<ArgType>>>,
@@ -615,214 +619,136 @@ pub(crate) struct KotlinSourceAbi {
     platform_symbols: Option<std::sync::Arc<crate::platform_symbols::PlatformSymbolSet>>,
 }
 
+/// Components of [`KotlinSourceAbi`] other than its nullability contracts.
+///
+/// Split out so nullability and this assembly can run as concurrent join
+/// branches: neither consumes the other's output before final assembly.
+#[derive(Debug)]
+struct KotlinAbiParts {
+    constructors: Vec<KotlinConstructorLayout>,
+    methods: Vec<MethodReference>,
+    declared_members: super::declared_members::KotlinDeclaredMembers,
+    owner_types: std::collections::BTreeMap<ArgType, ClassTypeSignature>,
+    lexical_type_parameters: std::collections::BTreeMap<ArgType, Vec<TypeParameter>>,
+    inherited_member_types: BTreeMap<ArgType, BTreeSet<(KotlinIdentifier, ArgType)>>,
+    outer_instances: std::collections::BTreeMap<FieldReference, ArgType>,
+    outer_instance_by_owner: BTreeMap<ArgType, FieldReference>,
+    field_types: std::collections::BTreeMap<FieldReference, GenericFieldContract>,
+    method_exceptions: std::collections::BTreeMap<MethodReference, Vec<ArgType>>,
+    platform_exceptions: std::sync::Arc<std::collections::BTreeMap<MethodReference, Vec<ArgType>>>,
+    generic_methods: std::collections::BTreeMap<MethodReference, GenericMethodContract>,
+    generic_method_declarations: std::collections::BTreeMap<
+        (String, crate::ir::MethodDescriptor),
+        Vec<(ArgType, GenericMethodContract)>,
+    >,
+    inaccessible_top_level_imports: BTreeSet<String>,
+    generic_hierarchy: Option<crate::analysis::method_override::GenericTypeHierarchy>,
+    platform_generic_hierarchy: Option<crate::analysis::method_override::GenericTypeHierarchy>,
+    platform_symbols: Option<std::sync::Arc<crate::platform_symbols::PlatformSymbolSet>>,
+}
+
 impl KotlinSourceAbi {
     pub(crate) fn analyze<'a>(
         classes: impl IntoIterator<Item = &'a ClassNode>,
         contract_roots: &BTreeSet<MethodReference>,
-        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference>,
-        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference>,
+        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
+        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
+    ) -> Self {
+        Self::analyze_inner(classes, contract_roots, None, resolve_method, resolve_field)
+    }
+
+    pub(crate) fn analyze_with_preterminated_cfgs<'a, 'cfg>(
+        classes: impl IntoIterator<Item = &'a ClassNode>,
+        contract_roots: &BTreeSet<MethodReference>,
+        cfgs: impl IntoIterator<Item = &'cfg CFG>,
+        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
+        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
+    ) -> Self {
+        let cfgs = cfgs
+            .into_iter()
+            .map(|cfg| {
+                (
+                    MethodReference {
+                        owner: cfg.method().owner().clone(),
+                        name: cfg.method().name().to_string(),
+                        descriptor: cfg.method().descriptor().clone(),
+                    },
+                    cfg,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self::analyze_inner(
+            classes,
+            contract_roots,
+            Some(cfgs),
+            resolve_method,
+            resolve_field,
+        )
+    }
+
+    fn analyze_inner<'a, 'cfg>(
+        classes: impl IntoIterator<Item = &'a ClassNode>,
+        contract_roots: &BTreeSet<MethodReference>,
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &'cfg CFG>>,
+        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
+        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
     ) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let nullability = super::nullability::DexNullabilityContracts::analyze(
-            &classes,
-            contract_roots,
-            &resolve_method,
-            &resolve_field,
-        );
-        let mut declared_members =
-            super::declared_members::KotlinDeclaredMembers::analyze(&classes, &resolve_method);
-        let open_owners = Self::open_owner_types(&classes);
-        let lexical_type_parameters = LexicalTypeEnvironment::analyze(&classes);
-        let inherited_member_types = Self::build_inherited_member_types(&classes);
-        let outer_instances = classes
-            .iter()
-            .filter_map(|class| OuterInstanceField::analyze(class))
-            .map(|outer| (outer.reference, outer.outer_type))
-            .collect();
-        let constructor_owner_types = &open_owners;
-        let constructors = classes
-            .iter()
-            .copied()
-            .flat_map(|class| {
-                class.constructors().filter_map(move |constructor| {
-                    ConstructorSourceAbi::analyze(class, constructor, constructor_owner_types)
-                        .and_then(|abi| abi.layout(class, constructor))
-                })
-            })
-            .collect();
-        let methods = Self::method_overloads(&classes);
-        let field_types = classes
-            .iter()
-            .copied()
-            .flat_map(|class| {
-                let owner = open_owners
-                    .get(class.class_type())
-                    .cloned()
-                    .unwrap_or_else(|| Self::direct_owner_type(class));
-                class.fields().iter().filter_map(move |field| {
-                    let signature = field
-                        .signature
-                        .as_deref()
-                        .and_then(|value| GenericSignatures::field(value).ok())?;
-                    Some((
-                        FieldReference {
-                            owner: class.class_type().clone(),
-                            name: field.name().to_string(),
-                            field_type: field.field_type().clone(),
-                        },
-                        GenericFieldContract {
-                            signature,
-                            owner: owner.clone(),
-                        },
-                    ))
-                })
-            })
-            .collect();
-        let method_exceptions = classes
-            .iter()
-            .copied()
-            .flat_map(|class| {
-                class.methods().iter().filter_map(move |method| {
-                    let exceptions = method.throws().to_vec();
-                    (!exceptions.is_empty()).then(|| {
-                        (
-                            MethodReference {
-                                owner: class.class_type().clone(),
-                                name: method.name().to_string(),
-                                descriptor: crate::ir::MethodDescriptor {
-                                    parameters: method.param_types().to_vec(),
-                                    return_type: method.return_type().clone(),
-                                },
-                            },
-                            exceptions,
-                        )
-                    })
-                })
-            })
-            .collect();
-        let platform_exceptions =
-            crate::analysis::method_override::platform_exception_contracts().unwrap_or_default();
-        let generic_hierarchy =
-            crate::analysis::method_override::GenericTypeHierarchy::from_classes(
-                classes.iter().copied(),
-            )
-            .ok();
-        let generic_owner_types = &open_owners;
-        let mut generic_methods = classes
-            .iter()
-            .copied()
-            .flat_map(|class| {
-                let owner = open_owners
-                    .get(class.class_type())
-                    .cloned()
-                    .unwrap_or_else(|| Self::direct_owner_type(class));
-                class.methods().iter().filter_map(move |method| {
-                    let declared_parameters = Self::declared_type_parameters(class);
-                    let parsed_signature = method
-                        .signature
-                        .as_deref()
-                        .and_then(|signature| GenericSignatures::method(signature).ok());
-                    let contract = parsed_signature
-                        .map(|signature| {
-                            let signature =
-                                ConstructorSourceAbi::analyze(class, method, generic_owner_types)
-                                    .map(|abi| {
-                                        abi.align(signature.clone(), method.param_types().len())
-                                    })
-                                    .unwrap_or(signature);
-                            GenericMethodContract {
-                                signature,
-                                owner: owner.clone(),
-                                owner_parameters: declared_parameters.clone(),
-                            }
-                        })
-                        .or_else(|| {
-                            method.is_constructor().then(|| {
-                                GenericMethodContract::erased_constructor(
-                                    owner.clone(),
-                                    declared_parameters,
-                                    method.param_types(),
-                                    method.throws(),
-                                )
-                            })?
-                        })?;
-                    Some((
-                        MethodReference {
-                            owner: class.class_type().clone(),
-                            name: method.name().to_string(),
-                            descriptor: crate::ir::MethodDescriptor {
-                                parameters: method.param_types().to_vec(),
-                                return_type: method.return_type().clone(),
-                            },
-                        },
-                        contract,
-                    ))
-                })
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if let Some(hierarchy) = generic_hierarchy.as_ref() {
-            for class in &classes {
-                let owner = open_owners
-                    .get(class.class_type())
-                    .cloned()
-                    .unwrap_or_else(|| Self::direct_owner_type(class));
-                let owner_parameters = Self::declared_type_parameters(class);
-                for method in class
-                    .methods()
-                    .iter()
-                    .filter(|method| method.access_flags.is_bridge())
-                {
-                    let reference = MethodReference {
-                        owner: class.class_type().clone(),
-                        name: method.name().to_string(),
-                        descriptor: crate::ir::MethodDescriptor {
-                            parameters: method.param_types().to_vec(),
-                            return_type: method.return_type().clone(),
-                        },
-                    };
-                    if generic_methods.contains_key(&reference) {
-                        continue;
-                    }
-                    if let Some(contract) = InheritedMethodAbi::contract(
-                        &reference,
-                        &owner,
-                        &owner_parameters,
-                        &generic_methods,
-                        hierarchy,
-                    ) {
-                        generic_methods.insert(reference, contract);
-                    }
-                }
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let mark = |name: &str, started: std::time::Instant| {
+            if stats {
+                eprintln!(
+                    "dexdec batch: kotlin_abi_{name}={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
             }
-        }
-        let platform_generic_hierarchy =
-            crate::analysis::method_override::GenericTypeHierarchy::from_classes(
-                std::iter::empty::<&ClassNode>(),
-            )
-            .ok();
-        let platform_symbols = crate::platform_symbols::default_platform_symbols().ok();
-        if let Some(symbols) = platform_symbols.as_deref() {
-            declared_members.merge_external_abi(symbols);
-        }
-        let inaccessible_top_level_imports = classes
-            .iter()
-            .filter(|class| !class.is_public())
-            .filter_map(|class| class.class_type().as_object())
-            .filter(|name| {
-                !name
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|name| name.contains('$'))
-            })
-            .map(|name| name.replace('/', "."))
-            .collect();
-        let mut generic_method_declarations = std::collections::BTreeMap::new();
-        for (method, contract) in &generic_methods {
-            generic_method_declarations
-                .entry((method.name.clone(), method.descriptor.clone()))
-                .or_insert_with(Vec::new)
-                .push((method.owner.clone(), contract.clone()));
-        }
+        };
+        let t = std::time::Instant::now();
+        // Nullability reads only the class list and the caller-supplied
+        // resolvers, and nothing assembled alongside it consumes its output
+        // before final assembly, so both halves run concurrently and rejoin
+        // here.
+        let (nullability, parts) = rayon::join(
+            || {
+                let started = std::time::Instant::now();
+                let nullability = super::nullability::DexNullabilityContracts::analyze(
+                    &classes,
+                    contract_roots,
+                    preterminated_cfgs,
+                    &resolve_method,
+                    &resolve_field,
+                );
+                if stats {
+                    eprintln!(
+                        "dexdec batch: kotlin_abi_nullability={:.0}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                nullability
+            },
+            || Self::analyze_parts(&classes, &resolve_method),
+        );
+        mark("join", t);
+        let KotlinAbiParts {
+            constructors,
+            methods,
+            declared_members,
+            owner_types: open_owners,
+            lexical_type_parameters,
+            inherited_member_types,
+            outer_instances,
+            outer_instance_by_owner,
+            field_types,
+            method_exceptions,
+            platform_exceptions,
+            generic_methods,
+            generic_method_declarations,
+            inaccessible_top_level_imports,
+            generic_hierarchy,
+            platform_generic_hierarchy,
+            platform_symbols,
+        } = parts;
+        let t = std::time::Instant::now();
         let mut abi = Self {
             constructors,
             methods,
@@ -832,6 +758,7 @@ impl KotlinSourceAbi {
             lexical_type_parameters,
             inherited_member_types,
             outer_instances,
+            outer_instance_by_owner,
             field_types,
             method_exceptions,
             platform_exceptions,
@@ -888,7 +815,287 @@ impl KotlinSourceAbi {
                 }
             }
         }
+        mark("tail", t);
         abi
+    }
+    /// Assembles every ABI component except the nullability contracts,
+    /// which share no state with this work and run concurrently with it.
+    fn analyze_parts(
+        classes: &[&ClassNode],
+        resolve_method: &(impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync),
+    ) -> KotlinAbiParts {
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let mark = |name: &str, started: std::time::Instant| {
+            if stats {
+                eprintln!(
+                    "dexdec batch: kotlin_abi_{name}={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        let t = std::time::Instant::now();
+        let mut declared_members =
+            super::declared_members::KotlinDeclaredMembers::analyze(&classes, resolve_method);
+        mark("declared_members", t);
+        let t = std::time::Instant::now();
+        let open_owners = Self::open_owner_types(&classes);
+        let lexical_type_parameters = LexicalTypeEnvironment::analyze(&classes);
+        let inherited_member_types = Self::build_inherited_member_types(&classes);
+        mark("owner_lexical_inherited", t);
+        let outer_instances = classes
+            .iter()
+            .filter_map(|class| OuterInstanceField::analyze(class))
+            .map(|outer| (outer.reference, outer.outer_type))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let outer_instance_by_owner = outer_instances
+            .iter()
+            .map(|(field, _)| (field.owner.clone(), field.clone()))
+            .collect();
+        let t = std::time::Instant::now();
+        let constructor_owner_types = &open_owners;
+        let constructors = classes
+            .iter()
+            .copied()
+            .flat_map(|class| {
+                class.constructors().filter_map(move |constructor| {
+                    ConstructorSourceAbi::analyze(class, constructor, constructor_owner_types)
+                        .and_then(|abi| abi.layout(class, constructor))
+                })
+            })
+            .collect();
+        mark("constructors", t);
+        let t = std::time::Instant::now();
+        let methods = Self::method_overloads(&classes);
+        mark("method_overloads", t);
+        let field_types = classes
+            .iter()
+            .copied()
+            .flat_map(|class| {
+                let owner = open_owners
+                    .get(class.class_type())
+                    .cloned()
+                    .unwrap_or_else(|| Self::direct_owner_type(class));
+                class.fields().iter().filter_map(move |field| {
+                    let signature = field
+                        .signature
+                        .as_deref()
+                        .and_then(|value| GenericSignatures::field(value).ok())?;
+                    Some((
+                        FieldReference {
+                            owner: class.class_type().clone(),
+                            name: field.name().to_string(),
+                            field_type: field.field_type().clone(),
+                        },
+                        GenericFieldContract {
+                            signature,
+                            owner: owner.clone(),
+                        },
+                    ))
+                })
+            })
+            .collect();
+        let method_exceptions = classes
+            .iter()
+            .copied()
+            .flat_map(|class| {
+                class.methods().iter().filter_map(move |method| {
+                    let exceptions = method.throws().to_vec();
+                    (!exceptions.is_empty()).then(|| {
+                        (
+                            MethodReference {
+                                owner: class.class_type().clone(),
+                                name: method.name().to_string(),
+                                descriptor: crate::ir::MethodDescriptor {
+                                    parameters: method.param_types().to_vec(),
+                                    return_type: method.return_type().clone(),
+                                },
+                            },
+                            exceptions,
+                        )
+                    })
+                })
+            })
+            .collect();
+        let platform_exceptions =
+            crate::analysis::method_override::platform_exception_contracts().unwrap_or_default();
+        let t = std::time::Instant::now();
+        let generic_hierarchy =
+            crate::analysis::method_override::GenericTypeHierarchy::from_classes(
+                classes.iter().copied(),
+            )
+            .ok();
+        mark("generic_hierarchy", t);
+        let t = std::time::Instant::now();
+        let generic_owner_types = &open_owners;
+        let mut generic_methods = classes
+            .iter()
+            .copied()
+            .flat_map(|class| {
+                let owner = open_owners
+                    .get(class.class_type())
+                    .cloned()
+                    .unwrap_or_else(|| Self::direct_owner_type(class));
+                class.methods().iter().filter_map(move |method| {
+                    let declared_parameters = Self::declared_type_parameters(class);
+                    let parsed_signature = method
+                        .signature
+                        .as_deref()
+                        .and_then(|signature| GenericSignatures::method(signature).ok());
+                    let contract = parsed_signature
+                        .map(|signature| {
+                            let signature =
+                                ConstructorSourceAbi::analyze(class, method, generic_owner_types)
+                                    .map(|abi| {
+                                        abi.align(signature.clone(), method.param_types().len())
+                                    })
+                                    .unwrap_or(signature);
+                            GenericMethodContract {
+                                signature,
+                                owner: owner.clone(),
+                                owner_parameters: declared_parameters.clone(),
+                            }
+                        })
+                        .or_else(|| {
+                            method.is_constructor().then(|| {
+                                GenericMethodContract::erased_constructor(
+                                    owner.clone(),
+                                    declared_parameters,
+                                    method.param_types(),
+                                    method.throws(),
+                                )
+                            })?
+                        })?;
+                    Some((
+                        MethodReference {
+                            owner: class.class_type().clone(),
+                            name: method.name().to_string(),
+                            descriptor: crate::ir::MethodDescriptor {
+                                parameters: method.param_types().to_vec(),
+                                return_type: method.return_type().clone(),
+                            },
+                        },
+                        contract,
+                    ))
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        mark("generic_method_contracts", t);
+        let t = std::time::Instant::now();
+        if let Some(hierarchy) = generic_hierarchy.as_ref() {
+            // Bridge lookup scans candidates sharing the bridge's name and
+            // descriptor instead of sweeping every declared method. Entries are
+            // kept sorted by owner so each search visits exactly the candidates
+            // a full sweep would, in the same order.
+            let mut declarations = std::collections::BTreeMap::<
+                (String, crate::ir::MethodDescriptor),
+                Vec<(ArgType, GenericMethodContract)>,
+            >::new();
+            crate::profile_scope!("abi.bridge_index_build", {
+                for (method, contract) in &generic_methods {
+                    declarations
+                        .entry((method.name.clone(), method.descriptor.clone()))
+                        .or_default()
+                        .push((method.owner.clone(), contract.clone()));
+                }
+            });
+            let mut owner_ancestors =
+                std::collections::BTreeMap::<ArgType, std::collections::BTreeSet<ArgType>>::new();
+            for class in classes {
+                let owner = open_owners
+                    .get(class.class_type())
+                    .cloned()
+                    .unwrap_or_else(|| Self::direct_owner_type(class));
+                let owner_parameters = Self::declared_type_parameters(class);
+                for method in class
+                    .methods()
+                    .iter()
+                    .filter(|method| method.access_flags.is_bridge())
+                {
+                    let reference = MethodReference {
+                        owner: class.class_type().clone(),
+                        name: method.name().to_string(),
+                        descriptor: crate::ir::MethodDescriptor {
+                            parameters: method.param_types().to_vec(),
+                            return_type: method.return_type().clone(),
+                        },
+                    };
+                    if generic_methods.contains_key(&reference) {
+                        continue;
+                    }
+                    if !owner_ancestors.contains_key(class.class_type()) {
+                        owner_ancestors.insert(
+                            class.class_type().clone(),
+                            hierarchy.ancestor_closure(class.class_type()),
+                        );
+                    }
+                    let owner_ancestor_set = &owner_ancestors[class.class_type()];
+                    if let Some(contract) = InheritedMethodAbi::contract(
+                        &reference,
+                        &owner,
+                        &owner_parameters,
+                        &declarations,
+                        owner_ancestor_set,
+                        hierarchy,
+                    ) {
+                        let entry = declarations
+                            .entry((reference.name.clone(), reference.descriptor.clone()))
+                            .or_default();
+                        let position =
+                            entry.partition_point(|(candidate, _)| candidate < &reference.owner);
+                        entry.insert(position, (reference.owner.clone(), contract.clone()));
+                        generic_methods.insert(reference, contract);
+                    }
+                }
+            }
+        }
+        mark("bridge_contracts", t);
+        let platform_generic_hierarchy =
+            crate::analysis::method_override::GenericTypeHierarchy::from_classes(
+                std::iter::empty::<&ClassNode>(),
+            )
+            .ok();
+        let platform_symbols = crate::platform_symbols::default_platform_symbols().ok();
+        if let Some(symbols) = platform_symbols.as_deref() {
+            declared_members.merge_external_abi(symbols);
+        }
+        let inaccessible_top_level_imports = classes
+            .iter()
+            .filter(|class| !class.is_public())
+            .filter_map(|class| class.class_type().as_object())
+            .filter(|name| {
+                !name
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.contains('$'))
+            })
+            .map(|name| name.replace('/', "."))
+            .collect();
+        let mut generic_method_declarations = std::collections::BTreeMap::new();
+        for (method, contract) in &generic_methods {
+            generic_method_declarations
+                .entry((method.name.clone(), method.descriptor.clone()))
+                .or_insert_with(Vec::new)
+                .push((method.owner.clone(), contract.clone()));
+        }
+        KotlinAbiParts {
+            constructors,
+            methods,
+            declared_members,
+            owner_types: open_owners,
+            lexical_type_parameters,
+            inherited_member_types,
+            outer_instances,
+            outer_instance_by_owner,
+            field_types,
+            method_exceptions,
+            platform_exceptions,
+            generic_methods,
+            generic_method_declarations,
+            inaccessible_top_level_imports,
+            generic_hierarchy,
+            platform_generic_hierarchy,
+            platform_symbols,
+        }
     }
 
     pub(crate) fn constructors(&self) -> impl Iterator<Item = KotlinConstructorLayout> + '_ {
@@ -1259,6 +1466,23 @@ impl KotlinSourceAbi {
 
     pub(crate) fn outer_instances(&self) -> impl Iterator<Item = (&FieldReference, &ArgType)> {
         self.outer_instances.iter()
+    }
+
+    /// Outer-instance fields owned by any of these types. Compilation units
+    /// ask about their own referenced types, so this stays proportional to the
+    /// unit instead of walking the whole archive catalog.
+    pub(crate) fn referenced_outer_instances<'a>(
+        &self,
+        types: impl IntoIterator<Item = &'a ArgType>,
+    ) -> std::collections::BTreeMap<FieldReference, ArgType> {
+        types
+            .into_iter()
+            .filter_map(|ty| {
+                let field = self.outer_instance_by_owner.get(ty)?;
+                let outer = self.outer_instances.get(field)?;
+                Some((field.clone(), outer.clone()))
+            })
+            .collect()
     }
 
     pub(crate) fn field_types(

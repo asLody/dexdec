@@ -1038,7 +1038,7 @@ impl DexKotlinDialect {
         else {
             return false;
         };
-        let Some(MemberReference::Field(field)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Field(field)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(binding) = self.outer_instance.as_ref() else {
@@ -1146,7 +1146,7 @@ impl DexKotlinDialect {
                 if operation.insn_type != InsnType::Invoke {
                     return false;
                 }
-                let Some(actual) = Self::method(operation.payload.reference.as_ref())
+                let Some(actual) = Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type)
                     .filter(|actual| actual.is_reference())
@@ -1604,7 +1604,7 @@ impl DexKotlinDialect {
                 expression = &operation.operands()[0];
                 continue;
             }
-            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() {
+            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() {
                 if let ArgType::Primitive(primitive) = &method.descriptor.return_type {
                     return Some(*primitive);
                 }
@@ -1682,7 +1682,7 @@ impl DexKotlinDialect {
                         .first()
                         .and_then(Self::intrinsic_primitive_type);
                 }
-                match operation.payload.reference.as_ref() {
+                match operation.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => {
                         return method.descriptor.return_type.as_primitive();
                     }
@@ -1696,7 +1696,7 @@ impl DexKotlinDialect {
                 operation
                     .payload
                     .cast_type
-                    .as_ref()
+                    .as_deref()
                     .and_then(ArgType::as_primitive)
                     .or_else(|| {
                         operation
@@ -1974,7 +1974,7 @@ impl DexKotlinDialect {
             InsnType::ConstStr => Ok(KotlinExpr::Literal(KotlinLiteral::String(
                 insn.payload
                     .string_value
-                    .as_ref()
+                    .as_deref()
                     .ok_or(KotlinLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "string_value",
@@ -1982,7 +1982,7 @@ impl DexKotlinDialect {
                     .clone(),
             ))),
             InsnType::ConstClass => Ok(KotlinExpr::ClassLiteral(
-                self.source_type(insn.payload.class_type.as_ref().ok_or(
+                self.source_type(insn.payload.class_type.as_deref().ok_or(
                     KotlinLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -2162,7 +2162,7 @@ impl DexKotlinDialect {
                             .ok_or(KotlinLoweringError::MissingArgument(insn.insn_type))?,
                     )?,
                 ),
-                ty: self.source_type(insn.payload.class_type.as_ref().ok_or(
+                ty: self.source_type(insn.payload.class_type.as_deref().ok_or(
                     KotlinLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -2196,7 +2196,7 @@ impl DexKotlinDialect {
                 ),
             }),
             InsnType::Iget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let owner = insn
                     .operands()
                     .first()
@@ -2217,7 +2217,7 @@ impl DexKotlinDialect {
                 })
             }
             InsnType::Sget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 if self.singleton_instances.contains(field) {
                     return Ok(KotlinExpr::ObjectReference(
                         self.source_type(&field.field_type)?,
@@ -2231,7 +2231,7 @@ impl DexKotlinDialect {
             }
             InsnType::Invoke => self.invoke(insn, None),
             InsnType::Constructor => {
-                let method = Self::method(insn.payload.reference.as_ref())?;
+                let method = Self::method(insn.payload.reference.as_deref())?;
                 let allocation_owner = insn.allocation_type().unwrap_or(&method.owner);
                 let contract = self.generic_methods.get(method).cloned();
                 let mut constraints = contract
@@ -2471,7 +2471,7 @@ impl DexKotlinDialect {
         Vec<&'operation SemanticExpression>,
         GenericMethodContract,
     )> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let contract = self.generic_methods.get(method)?.clone();
         let invoke_type = operation.payload.invoke_type?;
         let is_static = invoke_type == InvokeType::Static;
@@ -2618,7 +2618,7 @@ impl DexKotlinDialect {
         if operation.insn_type != InsnType::Sget {
             return None;
         }
-        let Some(MemberReference::Field(field)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Field(field)) = operation.payload.reference.as_deref() else {
             return None;
         };
         self.singleton_instances
@@ -2631,7 +2631,7 @@ impl DexKotlinDialect {
         insn: &SemanticOperation,
         expected_source_type: Option<&KotlinType>,
     ) -> Result<KotlinExpr, KotlinLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let invoke_type = insn
             .payload
             .invoke_type
@@ -3887,7 +3887,7 @@ impl DexKotlinDialect {
                 operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => {
                             self.outer_instance_fields.get(field).cloned().or_else(|| {
@@ -3944,7 +3944,7 @@ impl DexKotlinDialect {
         &self,
         operation: &SemanticOperation,
     ) -> Option<KotlinType> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let (mut solver, arguments, contract) = self.invocation_solver(operation)?;
         if solver.owner_is_raw(&contract.owner)
             || contract
@@ -3988,7 +3988,7 @@ impl DexKotlinDialect {
         let declared = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| Self::method(operation.payload.reference.as_ref()).ok())
+            .and_then(|operation| Self::method(operation.payload.reference.as_deref()).ok())
             .and_then(|method| {
                 self.source_object_types
                     .get(&method.owner)
@@ -4088,58 +4088,59 @@ impl DexKotlinDialect {
                 let right = self.intrinsic_source_type(when_false)?;
                 (left == right).then_some(left)
             }
-            SemanticExpression::Operation(operation) => match operation.insn_type {
-                InsnType::Iget | InsnType::Sget => {
-                    operation
+            SemanticExpression::Operation(operation) => {
+                match operation.insn_type {
+                    InsnType::Iget | InsnType::Sget => operation
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .and_then(|reference| match reference {
                             MemberReference::Field(field) => self
                                 .source_field_type(field, operation.operands().first())
                                 .or_else(|| self.source_type(&field.field_type).ok()),
                             MemberReference::Method(_) => None,
-                        })
+                        }),
+                    InsnType::Constructor => {
+                        let owner = operation.allocation_type()?;
+                        self.source_object_types
+                            .get(owner)
+                            .cloned()
+                            .or_else(|| self.source_type(owner).ok())
+                    }
+                    InsnType::ConstClass => operation
+                        .payload
+                        .class_type
+                        .as_ref()
+                        .and_then(|represented| self.class_literal_source_type(represented)),
+                    InsnType::CheckCast => self.reference_cast_source_type(operation),
+                    InsnType::Move => operation
+                        .operands()
+                        .first()
+                        .and_then(|operand| self.intrinsic_source_type(operand)),
+                    InsnType::Aget => operation
+                        .operands()
+                        .first()
+                        .and_then(|array| self.intrinsic_source_type(array))
+                        .and_then(|array| match array {
+                            KotlinType::Array(element) => Some(element.into_type()),
+                            KotlinType::Class(_)
+                            | KotlinType::Variable(_)
+                            | KotlinType::Primitive(_) => None,
+                        }),
+                    InsnType::Invoke => {
+                        self.intrinsic_invocation_source_type(operation)
+                            .or_else(|| {
+                                let method =
+                                    Self::method(operation.payload.reference.as_deref()).ok()?;
+                                self.source_type(&method.descriptor.return_type).ok()
+                            })
+                    }
+                    _ => operation
+                        .result
+                        .as_ref()
+                        .and_then(|result| self.source_type(&result.ty).ok()),
                 }
-                InsnType::Constructor => {
-                    let owner = operation.allocation_type()?;
-                    self.source_object_types
-                        .get(owner)
-                        .cloned()
-                        .or_else(|| self.source_type(owner).ok())
-                }
-                InsnType::ConstClass => operation
-                    .payload
-                    .class_type
-                    .as_ref()
-                    .and_then(|represented| self.class_literal_source_type(represented)),
-                InsnType::CheckCast => self.reference_cast_source_type(operation),
-                InsnType::Move => operation
-                    .operands()
-                    .first()
-                    .and_then(|operand| self.intrinsic_source_type(operand)),
-                InsnType::Aget => operation
-                    .operands()
-                    .first()
-                    .and_then(|array| self.intrinsic_source_type(array))
-                    .and_then(|array| match array {
-                        KotlinType::Array(element) => Some(element.into_type()),
-                        KotlinType::Class(_)
-                        | KotlinType::Variable(_)
-                        | KotlinType::Primitive(_) => None,
-                    }),
-                InsnType::Invoke => {
-                    self.intrinsic_invocation_source_type(operation)
-                        .or_else(|| {
-                            let method = Self::method(operation.payload.reference.as_ref()).ok()?;
-                            self.source_type(&method.descriptor.return_type).ok()
-                        })
-                }
-                _ => operation
-                    .result
-                    .as_ref()
-                    .and_then(|result| self.source_type(&result.ty).ok()),
-            },
+            }
         }
     }
 
@@ -4229,7 +4230,7 @@ impl DexKotlinDialect {
     fn declared_expression_erasure(value: &SemanticExpression) -> Option<&ArgType> {
         match value {
             SemanticExpression::Operation(operation) => match operation.insn_type {
-                InsnType::Invoke => Self::method(operation.payload.reference.as_ref())
+                InsnType::Invoke => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type),
                 InsnType::Move => operation
@@ -4237,7 +4238,7 @@ impl DexKotlinDialect {
                     .first()
                     .and_then(Self::declared_expression_erasure),
                 InsnType::CheckCast => operation.conversion_type(),
-                InsnType::Constructor => Self::method(operation.payload.reference.as_ref())
+                InsnType::Constructor => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.owner),
                 _ => value.declared_type(),
@@ -4264,7 +4265,7 @@ impl DexKotlinDialect {
                 InsnType::Invoke | InsnType::Constructor => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Method(method) => self.generic_methods.get(method),
                         MemberReference::Field(_) => None,
@@ -4276,7 +4277,7 @@ impl DexKotlinDialect {
                 InsnType::Iget | InsnType::Sget => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => self.generic_fields.get(field),
                         MemberReference::Method(_) => None,
@@ -4302,7 +4303,7 @@ impl DexKotlinDialect {
                 .first()
                 .is_some_and(|operand| self.expression_declares_concrete_generic_type(operand));
         }
-        let Some(reference) = operation.payload.reference.as_ref() else {
+        let Some(reference) = operation.payload.reference.as_deref() else {
             return false;
         };
         match reference {
@@ -4360,7 +4361,7 @@ impl DexKotlinDialect {
         let constructed_type = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| operation.payload.reference.as_ref())
+            .and_then(|operation| operation.payload.reference.as_deref())
             .and_then(|reference| match reference {
                 MemberReference::Method(method) => Some(&method.owner),
                 MemberReference::Field(_) => None,
@@ -4435,7 +4436,7 @@ impl DexKotlinDialect {
         if operation.insn_type != InsnType::Invoke {
             return false;
         }
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(contract) = self.generic_methods.get(method) else {
@@ -4661,7 +4662,7 @@ impl DexKotlinDialect {
         &mut self,
         insn: &SemanticOperation,
     ) -> Result<KotlinStmt, KotlinLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let receiver = insn
             .operands()
             .first()
@@ -5586,7 +5587,7 @@ impl KotlinDialect for DexKotlinDialect {
                     && insn
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .is_some_and(|reference| {
                             matches!(reference, MemberReference::Method(method) if method.is_constructor())
                         })
@@ -5602,7 +5603,7 @@ impl KotlinDialect for DexKotlinDialect {
                 KotlinStmt::Expression(self.insn_expr(insn, None, None)?)
             }
             InsnType::Iput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let value = insn
                     .operands()
                     .first()
@@ -5630,7 +5631,7 @@ impl KotlinDialect for DexKotlinDialect {
                 }
             }
             InsnType::Sput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 KotlinStmt::Assign {
                     target: KotlinExpr::StaticField {
                         owner: self.static_owner_type(&field.owner)?,

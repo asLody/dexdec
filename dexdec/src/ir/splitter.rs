@@ -56,19 +56,15 @@ impl Splitter {
         let mut cfg = CFG::with_method(self.method.clone());
         cfg.registers = self.registers;
         cfg.ins = self.ins;
-        cfg.handlers = self.handlers.clone();
         if self.insns.is_empty() {
+            cfg.handlers = std::mem::take(&mut self.handlers);
             return cfg;
         }
         self.annotate_dispatch_metadata();
 
-        // Find leaders
         let leaders = self.find_leaders();
-
-        // Create blocks
+        cfg.handlers = std::mem::take(&mut self.handlers);
         let offset_to_block = self.create_blocks(&mut cfg, &leaders);
-
-        // Build edges
         self.build_edges(&mut cfg, &offset_to_block);
 
         cfg
@@ -170,31 +166,47 @@ impl Splitter {
         leaders
     }
 
-    fn create_blocks(&self, cfg: &mut CFG, leaders: &BTreeSet<u32>) -> HashMap<u32, BlockId> {
-        let mut offset_to_block = HashMap::new();
+    fn create_blocks(&mut self, cfg: &mut CFG, leaders: &BTreeSet<u32>) -> HashMap<u32, BlockId> {
+        let insns = std::mem::take(&mut self.insns);
         let leader_vec: Vec<u32> = leaders.iter().copied().collect();
+        let mut offset_to_block = HashMap::with_capacity(leader_vec.len());
+        let mut ranges = Vec::with_capacity(leader_vec.len());
+        let mut index = 0usize;
+        for (idx, &leader) in leader_vec.iter().enumerate() {
+            let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u32::MAX);
+            let start = index;
+            while index < insns.len() && insns[index].offset < next_leader {
+                debug_assert!(insns[index].offset >= leader);
+                index += 1;
+            }
+            ranges.push((start, index));
+        }
 
+        let mut remaining = insns.into_iter();
+        let mut consumed = 0usize;
+        let mut entry = None;
         for (idx, &leader) in leader_vec.iter().enumerate() {
             let block_id = BlockId::new(idx as u32);
             offset_to_block.insert(leader, block_id);
-
-            let mut block = Block::with_offset(block_id, leader);
-            let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u32::MAX);
-
-            for insn in &self.insns {
-                if insn.offset >= leader && insn.offset < next_leader {
-                    block.push(insn.clone());
-                }
+            let (start, end) = ranges[idx];
+            for _ in consumed..start {
+                remaining.next();
             }
-
-            cfg.add_block(block);
+            let mut block_insns = Vec::with_capacity(end.saturating_sub(start));
+            for _ in start..end {
+                let Some(insn) = remaining.next() else {
+                    break;
+                };
+                if entry.is_none() {
+                    entry = Some(block_id);
+                }
+                block_insns.push(insn);
+            }
+            consumed = end;
+            cfg.add_block(Block::with_instructions(block_id, leader, block_insns));
         }
 
-        if let Some(&entry) = self
-            .insns
-            .first()
-            .and_then(|i| offset_to_block.get(&i.offset))
-        {
+        if let Some(entry) = entry {
             cfg.entry = entry;
         }
 
@@ -202,14 +214,16 @@ impl Splitter {
     }
 
     fn build_edges(&self, cfg: &mut CFG, offset_to_block: &HashMap<u32, BlockId>) {
-        // Build instruction offset map
-        let offsets: Vec<u32> = self.insns.iter().map(|i| i.offset).collect();
-        let next_offset = |off: u32| -> Option<u32> {
-            offsets
-                .iter()
-                .position(|&o| o == off)
-                .and_then(|i| offsets.get(i + 1).copied())
-        };
+        let offsets: Vec<u32> = cfg
+            .blocks
+            .values()
+            .flat_map(|block| block.insns.iter().map(|insn| insn.offset))
+            .collect();
+        let mut next_offsets = HashMap::with_capacity(offsets.len());
+        for pair in offsets.windows(2) {
+            next_offsets.insert(pair[0], pair[1]);
+        }
+        let next_offset = |off: u32| next_offsets.get(&off).copied();
 
         // Collect edges first to avoid borrow issues
         let mut edges: Vec<(BlockId, BlockId, EdgeKind)> = Vec::new();

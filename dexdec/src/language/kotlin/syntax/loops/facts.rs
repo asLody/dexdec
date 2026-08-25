@@ -434,7 +434,7 @@ impl IteratorProtocol {
 
     fn method(instruction: &SemanticOperation) -> Option<&MethodReference> {
         (instruction.insn_type == InsnType::Invoke).then_some(())?;
-        let MemberReference::Method(method) = instruction.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = instruction.payload.reference.as_deref()? else {
             return None;
         };
         Some(method)

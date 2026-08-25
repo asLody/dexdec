@@ -145,7 +145,7 @@ fn intrinsic_binding(operation: &SemanticOperation) -> Option<(u32, String)> {
     if operation.insn_type != InsnType::Invoke {
         return None;
     }
-    let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+    let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
         return None;
     };
     if !is_kotlin_varname_source(method) {
@@ -199,7 +199,7 @@ fn register_variable(expression: &SemanticExpression) -> Option<u32> {
 fn const_string(expression: &SemanticExpression) -> Option<String> {
     match expression {
         SemanticExpression::Operation(operation) if operation.insn_type == InsnType::ConstStr => {
-            Some(operation.payload.string_value.as_ref()?.to_string_lossy())
+            Some(operation.payload.string_value.as_deref()?.to_string_lossy())
         }
         SemanticExpression::Literal(LiteralArg { .. }) => None,
         _ => None,

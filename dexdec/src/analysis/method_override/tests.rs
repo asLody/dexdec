@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 
+use crate::frontend::{ClassInfo, MethodInfo};
+
 #[test]
 fn loads_platform_symbol_methods() {
     let platform = PlatformClassSet::load_default().expect("platform symbols should load");
@@ -11,6 +13,53 @@ fn loads_platform_symbol_methods() {
         method.reference.short_id == "size()I"
             && method.reference.declaring_class == "Ljava/util/AbstractMap;"
     }));
+}
+
+#[test]
+fn fills_platform_class_details_in_place() {
+    let platform = PlatformClassSet::load_default().expect("platform symbols should load");
+    assert_eq!(platform.cached_class_count(), 0);
+    assert!(!platform.is_frozen());
+
+    let first = platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("AbstractMap should parse while Filling");
+    assert_eq!(platform.cached_class_count(), 1);
+    let second = platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("AbstractMap should hit the in-place cache");
+    assert_eq!(first, second);
+    assert_eq!(platform.cached_class_count(), 1);
+}
+
+#[test]
+fn frozen_platform_details_cache_misses_in_extras() {
+    let platform = PlatformClassSet::load_default().expect("platform symbols should load");
+    platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("warm AbstractMap before freeze");
+    platform.freeze_details();
+    assert!(platform.is_frozen());
+    assert_eq!(platform.cached_class_count(), 1);
+
+    let list = platform
+        .class_details(&ArgType::object("java/util/List"))
+        .expect("Frozen miss must still parse a symbol-set class");
+    assert!(list
+        .methods
+        .iter()
+        .any(|method| { method.reference.short_id == "addAll(Ljava/util/Collection;)Z" }));
+    assert_eq!(platform.cached_class_count(), 2);
+    assert!(platform.is_frozen());
+    let again = platform
+        .class_details(&ArgType::object("java/util/List"))
+        .expect("Frozen extras should hit without another parse");
+    assert_eq!(list, again);
+    assert_eq!(platform.cached_class_count(), 2);
+
+    platform.freeze_details();
+    assert!(platform.is_frozen());
+    assert_eq!(platform.cached_class_count(), 2);
 }
 
 #[test]
@@ -62,6 +111,110 @@ fn resolves_declared_platform_generic_method_contract() {
     );
 }
 
+fn assert_overloads_match_walk(
+    hierarchy: &GenericTypeHierarchy,
+    method: &str,
+) -> (crate::ir::MethodReference, Vec<crate::ir::MethodReference>) {
+    let method = method
+        .parse::<crate::ir::MethodReference>()
+        .expect("method reference");
+    let indexed = hierarchy.method_overloads(&method);
+    let walked = hierarchy.method_overloads_walk(&method);
+    assert_eq!(
+        indexed, walked,
+        "index must match class_details BTreeSet walk for {}",
+        method.owner
+    );
+    assert!(indexed.iter().all(|candidate| {
+        candidate.owner == method.owner
+            && candidate.name == method.name
+            && candidate.descriptor.parameters.len() == method.descriptor.parameters.len()
+    }));
+    (method, indexed)
+}
+
+fn class_with_methods(
+    descriptor: &str,
+    super_class: Option<&str>,
+    methods: &[(&str, Vec<ArgType>, ArgType)],
+) -> ClassNode {
+    let info = ClassInfo::from_type_descriptor(descriptor).expect("class descriptor");
+    let mut class = ClassNode::new(0, info, AccessInfo::for_class(0x0001));
+    if let Some(super_class) = super_class {
+        class.set_super_class(super_class.parse().expect("super class"));
+    }
+    for (index, (name, parameters, return_type)) in methods.iter().enumerate() {
+        class.add_method(MethodNode::new(
+            index as u32,
+            MethodInfo::new(
+                descriptor.to_string(),
+                name.to_string(),
+                parameters.clone(),
+                return_type.clone(),
+            ),
+            AccessInfo::for_method(0x0001),
+        ));
+    }
+    class
+}
+
+#[test]
+fn method_overloads_index_matches_inherited_platform_walk() {
+    let hierarchy =
+        GenericTypeHierarchy::from_classes(std::iter::empty::<&ClassNode>()).expect("hierarchy");
+    let (method, overloads) = assert_overloads_match_walk(
+        &hierarchy,
+        "Ljava/util/ArrayList;->remove(Ljava/lang/Object;)Z",
+    );
+    assert!(
+        overloads.len() > 1,
+        "ArrayList.remove should include inherited same-arity descriptors, got {overloads:?}"
+    );
+    assert!(
+        overloads.iter().any(|candidate| {
+            candidate.descriptor.parameters.as_slice() == [ArgType::object("java/lang/Object")]
+        }),
+        "expected remapped remove(Object), got {overloads:?}"
+    );
+    assert_eq!(overloads, hierarchy.method_overloads(&method));
+}
+
+#[test]
+fn method_overloads_index_matches_loaded_parent_descriptor_walk() {
+    let parent = class_with_methods(
+        "Lcom/example/Parent;",
+        None,
+        &[
+            (
+                "foo",
+                vec![ArgType::object("java/lang/Object")],
+                ArgType::VOID,
+            ),
+            ("foo", vec![ArgType::string()], ArgType::VOID),
+        ],
+    );
+    let child = class_with_methods(
+        "Lcom/example/Child;",
+        Some("Lcom/example/Parent;"),
+        &[(
+            "foo",
+            vec![ArgType::object("java/lang/Object")],
+            ArgType::VOID,
+        )],
+    );
+    let hierarchy = GenericTypeHierarchy::from_classes([&parent, &child]).expect("hierarchy");
+    let (method, overloads) =
+        assert_overloads_match_walk(&hierarchy, "Lcom/example/Child;->foo(Ljava/lang/Object;)V");
+    assert!(
+        overloads.iter().any(|candidate| {
+            candidate.owner == method.owner
+                && candidate.descriptor.parameters.as_slice() == [ArgType::string()]
+        }),
+        "parent foo(String) must remap onto Child, got {overloads:?}"
+    );
+    assert_eq!(overloads, hierarchy.method_overloads(&method));
+}
+
 #[test]
 fn infers_parameterized_platform_subtype_from_target_type() {
     let hierarchy =
@@ -105,6 +258,7 @@ fn detects_override_against_platform_hierarchy() {
                 throws: Vec::new(),
                 access_flags: AccessInfo::for_method(0x0001),
             }],
+            method_candidates: OnceLock::new(),
         },
     };
     let method = hierarchy.app.methods[0].clone();
@@ -586,6 +740,7 @@ fn override_analysis_skips_a_broken_class_and_continues() {
             ArgType::INT,
             0x0001,
         )],
+        method_candidates: OnceLock::new(),
     };
     let hierarchy = LocalHierarchy::new([healthy.clone(), broken.clone()]);
     let mut sink = OverrideSink::default();
@@ -619,9 +774,9 @@ struct TestHierarchy {
 }
 
 impl ClassHierarchy for TestHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
+    fn class_details(&self, ty: &ArgType) -> Option<std::sync::Arc<ClassDetails>> {
         if ty.to_descriptor() == self.app.descriptor {
-            return Some(self.app.clone());
+            return Some(std::sync::Arc::new(self.app.clone()));
         }
         self.platform.class_details(ty)
     }
@@ -644,8 +799,11 @@ impl LocalHierarchy {
 }
 
 impl ClassHierarchy for LocalHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
-        self.classes.get(&ty.to_descriptor()).cloned()
+    fn class_details(&self, ty: &ArgType) -> Option<std::sync::Arc<ClassDetails>> {
+        self.classes
+            .get(&ty.to_descriptor())
+            .cloned()
+            .map(std::sync::Arc::new)
     }
 }
 
@@ -700,6 +858,7 @@ fn class_with_signature<const P: usize, const M: usize>(
         generic_signature,
         instantiated_self: None,
         methods: methods.into_iter().collect(),
+        method_candidates: OnceLock::new(),
     }
 }
 

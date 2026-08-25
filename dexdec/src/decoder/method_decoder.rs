@@ -274,8 +274,8 @@ impl<'a> MethodDecoder<'a> {
 
     /// Decode all instructions
     fn decode_instructions(&self) -> Vec<InsnNode> {
-        let mut result = Vec::new();
         let code_size = self.insns.len();
+        let mut result = Vec::with_capacity(code_size);
         let mut pc = 0usize;
 
         while pc < code_size {
@@ -295,7 +295,12 @@ impl<'a> MethodDecoder<'a> {
 
     /// Extract exception handlers
     fn extract_handlers(&self) -> Vec<ExceptionHandler> {
-        let mut handlers = Vec::new();
+        let mut handlers = Vec::with_capacity(
+            self.tries
+                .iter()
+                .map(|try_block| try_block.handlers.len())
+                .sum(),
+        );
         for try_block in self.tries {
             for handler in &try_block.handlers {
                 handlers.push(ExceptionHandler::new(

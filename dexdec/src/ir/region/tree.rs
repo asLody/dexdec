@@ -91,10 +91,11 @@ impl RegionTree {
         blocks: &BTreeSet<BlockId>,
         method: bool,
     ) -> Result<SynchronizationRewrite, RegionInvariantError> {
-        self.close_lexical_scope(enter, entry, blocks)?;
+        let blocks = self.close_monitor_cleanup_overlap(blocks);
+        self.close_lexical_scope(enter, entry, &blocks)?;
         // A handler can cross the runtime monitor-exit boundary only through
         // one proven continuation, such as a return lowered after monitor-exit.
-        SynchronizationPlacement::partition_handler_regions_for(self, cfg, None, blocks)?;
+        SynchronizationPlacement::partition_handler_regions_for(self, cfg, None, &blocks)?;
         let kind = RegionKind::Synchronized(SynchronizedRegion {
             lock,
             method,
@@ -106,8 +107,8 @@ impl RegionTree {
                 let regions = self
                     .regions()
                     .filter(|region| {
-                        !region.blocks.is_disjoint(blocks)
-                            && !region.blocks.is_subset(blocks)
+                        !region.blocks.is_disjoint(&blocks)
+                            && !region.blocks.is_subset(&blocks)
                             && !blocks.is_subset(&region.blocks)
                     })
                     .map(|region| {
@@ -132,6 +133,30 @@ impl RegionTree {
             splits: Vec::new(),
             handler_splits: Vec::new(),
         })
+    }
+
+    /// Expand a monitor scope so it laminates with overlapping finally/cleanup
+    /// regions (Kotlin `synchronized` inlines as try/finally around monitor-exit).
+    /// Catch regions are left alone so ambiguous user handlers still reject.
+    fn close_monitor_cleanup_overlap(&self, seed: &BTreeSet<BlockId>) -> BTreeSet<BlockId> {
+        let mut blocks = seed.clone();
+        loop {
+            let additions = self
+                .regions()
+                .filter(|region| region.kind.is_release_handler())
+                .filter(|region| {
+                    !region.blocks.is_disjoint(&blocks)
+                        && !region.blocks.is_subset(&blocks)
+                        && !blocks.is_subset(&region.blocks)
+                })
+                .flat_map(|region| region.blocks.iter().copied())
+                .filter(|block| !blocks.contains(block))
+                .collect::<BTreeSet<_>>();
+            if additions.is_empty() {
+                return blocks;
+            }
+            blocks.extend(additions);
+        }
     }
 
     fn close_lexical_scope(
@@ -2464,6 +2489,47 @@ mod tests {
             result,
             Err(RegionInvariantError::SynchronizationRegionOverlap { .. })
         ));
+    }
+
+    #[test]
+    fn standalone_synchronization_absorbs_overlapping_finally() {
+        let mut cfg = CFG::new("synchronized_finally_overlap");
+        for id in 0..=5 {
+            cfg.add_block(Block::new(id));
+        }
+        for (source, target) in [(0, 1), (1, 2), (2, 3), (3, 5)] {
+            cfg.add_edge(BlockId::new(source), BlockId::new(target), EdgeKind::Normal);
+        }
+        cfg.add_edge(BlockId::new(1), BlockId::new(4), EdgeKind::Exception);
+        cfg.add_edge(BlockId::new(4), BlockId::new(5), EdgeKind::Normal);
+
+        let mut tree = RegionTree::new(Some(BlockId::new(0)));
+        tree.cover_method(&cfg).unwrap();
+        let root = tree.root();
+        let finally = add_region(&mut tree, root, RegionKind::Finally, 4, [2, 4]);
+        let lock = InsnArg::Reg(RegisterArg::new(0, ArgType::object("java/lang/Object")));
+
+        tree.synchronize(
+            &cfg,
+            &BTreeMap::new(),
+            root,
+            &[],
+            lock,
+            BlockId::new(0),
+            BlockId::new(1),
+            &blocks([1, 2, 3]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .expect("overlapping finally should be absorbed into the monitor");
+
+        let sync = tree
+            .regions()
+            .find(|region| matches!(region.kind, RegionKind::Synchronized(_)))
+            .expect("synchronized region");
+        assert!(sync.blocks.is_superset(&blocks([1, 2, 3, 4])));
+        assert_eq!(tree.region(finally).unwrap().parent, Some(sync.id));
     }
 
     #[test]

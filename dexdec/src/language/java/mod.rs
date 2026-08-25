@@ -32,7 +32,7 @@ pub use normalize::{
     JavaVoidTailLinearizer,
 };
 pub use rewrite::JavaAstRewriter;
-pub(crate) use source_types::GenericTypeProjection;
+pub(crate) use source_types::{GenericTypeProjection, SourceObjectTypes};
 pub use syntax::{JavaValueSyntax, SourceSyntaxRecovery};
 pub use unit::{
     JavaAnnotation, JavaAnnotationElement, JavaAnnotationValue, JavaAnonymousClassBody,

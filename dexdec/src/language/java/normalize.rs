@@ -308,10 +308,13 @@ impl JavaAstNormalizer {
                 }
             }
         }
-        let [root] = results.as_slice() else {
+        if results.len() != 1 {
             return Err(super::JavaStructuralError::MalformedWorkStack);
-        };
-        Ok((root.clone(), changed))
+        }
+        let root = results
+            .pop()
+            .ok_or(super::JavaStructuralError::MalformedWorkStack)?;
+        Ok((root, changed))
     }
 
     fn flatten(children: Vec<JavaStmt>) -> (Vec<JavaStmt>, bool) {

@@ -66,6 +66,15 @@ impl Block {
         }
     }
 
+    pub fn with_instructions(id: impl Into<BlockId>, offset: u32, insns: Vec<InsnNode>) -> Self {
+        Self {
+            id: id.into(),
+            offset,
+            insns,
+            synthetic: false,
+        }
+    }
+
     pub fn synthetic(id: impl Into<BlockId>) -> Self {
         let id = id.into();
         Self {

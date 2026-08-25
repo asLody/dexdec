@@ -2530,10 +2530,12 @@ impl<'a> SourceTypeFlow<'a> {
         } else {
             Vec::new()
         };
-        let definition_variables =
-            Self::retained_states(flow.definition_states.clone(), &flow.contextual_variables);
+        let definition_variables = Self::retained_states(
+            std::mem::take(&mut flow.definition_states),
+            &flow.contextual_variables,
+        );
         let definition_values = Self::retained_states(
-            flow.value_definition_states.clone(),
+            std::mem::take(&mut flow.value_definition_states),
             &flow.contextual_values,
         );
         let requirements = Self::preferred_requirement_states(
@@ -2601,7 +2603,8 @@ impl<'a> SourceTypeFlow<'a> {
         self.invocations
             .iter()
             .filter_map(|operation| {
-                let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+                let MemberReference::Method(method) = operation.payload.reference.as_deref()?
+                else {
                     return None;
                 };
                 let Some((mut solver, _, contract)) = self.invocation_solver(operation) else {
@@ -2751,8 +2754,16 @@ impl<'a> SourceTypeFlow<'a> {
         self.definition_states = self.states.clone();
         self.constrain_runtime_type_tests();
 
+        // Element equations are structural: their variable/iterable pair is
+        // fixed once collected, so extract it once here instead of
+        // deep-cloning every expression on every convergence round.
+        let elements = self
+            .elements
+            .iter()
+            .map(|equation| (equation.variable.clone(), equation.iterable.clone()))
+            .collect::<Vec<_>>();
         loop {
-            self.converge_facts();
+            self.converge_facts(&elements);
             let replacements = self.apply_requirements();
             let value_replacements = self.apply_value_requirements();
             if replacements.is_empty() && value_replacements.is_empty() {
@@ -2874,22 +2885,21 @@ impl<'a> SourceTypeFlow<'a> {
             || self.erased_reference_result_fits(equation, requirement)
     }
 
-    fn converge_facts(&mut self) {
+    fn converge_facts(&mut self, elements: &[(RegisterArg, SemanticExpression)]) {
         loop {
             let mut changed = self.converge_equations();
-            for index in 0..self.elements.len() {
-                let equation = self.elements[index].clone();
-                if let Some(element) = self.iterable_element_type(&equation.iterable) {
-                    changed |= self.constrain_register(&equation.variable, element);
+            for (variable, iterable) in elements {
+                if let Some(element) = self.iterable_element_type(iterable) {
+                    changed |= self.constrain_register(variable, element);
                 }
                 let element = self
-                    .register_type(&equation.variable)
+                    .register_type(variable)
                     .cloned()
-                    .or_else(|| self.resolved_type(&equation.variable.ty));
-                if let Some(expected) = element
-                    .and_then(|element| self.iterable_context_type(&equation.iterable, element))
+                    .or_else(|| self.resolved_type(&variable.ty));
+                if let Some(expected) =
+                    element.and_then(|element| self.iterable_context_type(iterable, element))
                 {
-                    changed |= self.constrain_expression_context(&equation.iterable, expected);
+                    changed |= self.constrain_expression_context(iterable, expected);
                 }
             }
             for index in self.equation_graph.take_dirty_invocations() {
@@ -3464,15 +3474,14 @@ impl<'a> SourceTypeFlow<'a> {
             SemanticExpression::Operation(operation)
                 if operation.insn_type == InsnType::Constructor =>
             {
-                let Some(owner) =
-                    operation
-                        .payload
-                        .reference
-                        .as_ref()
-                        .and_then(|reference| match reference {
-                            MemberReference::Method(method) => Some(&method.owner),
-                            MemberReference::Field(_) => None,
-                        })
+                let Some(owner) = operation
+                    .payload
+                    .reference
+                    .as_deref()
+                    .and_then(|reference| match reference {
+                        MemberReference::Method(method) => Some(&method.owner),
+                        MemberReference::Field(_) => None,
+                    })
                 else {
                     return false;
                 };
@@ -3618,7 +3627,7 @@ impl<'a> SourceTypeFlow<'a> {
         let Some(target) = self.indexed_erased_type(target) else {
             return false;
         };
-        operation.payload.class_type.as_ref() == Some(&target)
+        operation.payload.class_type.as_deref() == Some(&target)
             || operation
                 .result
                 .as_ref()
@@ -3711,7 +3720,7 @@ impl<'a> SourceTypeFlow<'a> {
                 continue;
             };
             let target = match operation.insn_type {
-                InsnType::InstanceOf => operation.payload.class_type.as_ref(),
+                InsnType::InstanceOf => operation.payload.class_type.as_deref(),
                 InsnType::CheckCast => operation.conversion_type(),
                 _ => None,
             };
@@ -3827,15 +3836,12 @@ impl<'a> SourceTypeFlow<'a> {
                     .result
                     .as_ref()
                     .is_some_and(|result| result.ty == ArgType::BOOLEAN)
-                    || operation
-                        .payload
-                        .reference
-                        .as_ref()
-                        .and_then(|reference| match reference {
+                    || operation.payload.reference.as_deref().and_then(
+                        |reference| match reference {
                             MemberReference::Method(method) => Some(&method.descriptor.return_type),
                             MemberReference::Field(field) => Some(&field.field_type),
-                        })
-                        == Some(&ArgType::BOOLEAN)
+                        },
+                    ) == Some(&ArgType::BOOLEAN)
             }
             SemanticExpression::Register(register) => {
                 register.ty == ArgType::BOOLEAN
@@ -4283,7 +4289,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn constrain_invocation(&mut self, operation: &SemanticOperation) -> bool {
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let operand_receiver = Self::operand_receiver(operation);
@@ -4390,7 +4396,7 @@ impl<'a> SourceTypeFlow<'a> {
         if operation.payload.invoke_type == Some(crate::ir::InvokeType::Static) {
             return None;
         }
-        let method = match operation.payload.reference.as_ref()? {
+        let method = match operation.payload.reference.as_deref()? {
             MemberReference::Method(method) => method,
             MemberReference::Field(_) => return None,
         };
@@ -4418,7 +4424,7 @@ impl<'a> SourceTypeFlow<'a> {
         Vec<&'operation SemanticExpression>,
         &'a GenericMethodContract,
     )> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         let contract = self.generic_methods.get(method)?;
@@ -4580,7 +4586,7 @@ impl<'a> SourceTypeFlow<'a> {
                 })
             }
             SemanticExpression::Operation(operation) => {
-                let Some(reference) = operation.payload.reference.as_ref() else {
+                let Some(reference) = operation.payload.reference.as_deref() else {
                     return false;
                 };
                 match reference {
@@ -5210,7 +5216,7 @@ impl<'a> SourceTypeFlow<'a> {
                 operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => {
                             self.field_type(field, operation.operands().first())
@@ -5267,7 +5273,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn invocation_type(&self, operation: &SemanticOperation) -> Option<KotlinType> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         let Some((mut solver, arguments, contract)) = self.invocation_solver(operation) else {
@@ -5363,7 +5369,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn constructor_type(&self, operation: &SemanticOperation) -> Option<KotlinType> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         if let Some(allocation) = operation
@@ -5478,7 +5484,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn record_erased_generic_boundaries(&mut self, operation: &SemanticOperation) {
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return;
         };
         let Some(projection) = self.generic_projection else {
@@ -5589,7 +5595,7 @@ impl SemanticVisitor for SourceTypeFlow<'_> {
                     let field_type = operation
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .and_then(|reference| match reference {
                             MemberReference::Field(field) => Some((
                                 field,

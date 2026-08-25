@@ -832,7 +832,10 @@ impl CompletionDomain for PathConditionDomain {
         ))
     }
 
-    fn sequence(&self, children: Vec<Self::State>) -> Result<Self::State, Self::Error> {
+    fn sequence(
+        &self,
+        children: impl IntoIterator<Item = Self::State>,
+    ) -> Result<Self::State, Self::Error> {
         let mut result = PathCompletion::normal(self);
         for child in children {
             let entry = result.normal;
@@ -955,7 +958,7 @@ impl CompletionDomain for PathConditionDomain {
         &self,
         region: Option<crate::ir::RegionId>,
         has_default: bool,
-        cases: Vec<Self::State>,
+        cases: impl IntoIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         let mut result = PathCompletion::alternatives(self, cases)?;
         let break_path = region
@@ -971,10 +974,10 @@ impl CompletionDomain for PathConditionDomain {
         &self,
         catches: usize,
         has_finally: bool,
-        mut children: Vec<Self::State>,
+        mut children: impl DoubleEndedIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
-        let finally = has_finally.then(|| children.pop().expect("finally child"));
-        let protected = PathCompletion::alternatives(self, children.drain(..=catches))?;
+        let finally = has_finally.then(|| children.next_back().expect("finally child"));
+        let protected = PathCompletion::alternatives(self, children.take(catches + 1))?;
         let Some(finally) = finally else {
             return Ok(protected);
         };

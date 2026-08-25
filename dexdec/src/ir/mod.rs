@@ -64,6 +64,9 @@ pub use passes::{Pass, PassResult, PruneUnreachable, ValidateCFG};
 pub use splitter::Splitter;
 
 // Exception handling
+pub(crate) use exception::{
+    disable_trivial_early_returns, is_straight_line, trivial_early_returns,
+};
 pub use exception::{
     CatchHandler, ExceptionAnalysis, ExceptionAnalyzer, ExceptionInvariantError, HandlerKind,
     TryRegion,
@@ -79,7 +82,6 @@ pub use region::{
     RegionTransferKind, RegionTree, ResolvedRegionExit, StructuredRegion, SwitchRegion,
     SynchronizedRegion,
 };
-pub(crate) use semantic::SemanticSiteNumbering;
 pub use semantic::{
     SemanticBindingKind, SemanticBlock, SemanticBuildError, SemanticCatch, SemanticContext,
     SemanticExpression, SemanticExpressionFacts, SemanticExpressionTransform, SemanticFinally,
@@ -91,6 +93,7 @@ pub use semantic::{
     SourceSyntaxSemantics, SourceVariableContext, SsaSemantics, StatementOrigin,
     StringBuilderProtocol, StringBuildingRecovery, ValueSemantics,
 };
+pub(crate) use semantic::{SemanticControlTopology, SemanticSiteNumbering};
 
 // Structuring algorithm
 pub use structure::StructureError;

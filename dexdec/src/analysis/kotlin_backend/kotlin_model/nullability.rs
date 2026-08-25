@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use rayon::prelude::*;
+
 use super::metadata_members::{backing_field_references, MetadataCallable};
 use crate::decoder::method_decoder::MethodDecoder;
 use crate::frontend::kotlin_metadata::KotlinMetadata;
@@ -20,24 +22,41 @@ impl DexNullabilityContracts {
     pub(super) fn analyze(
         classes: &[&ClassNode],
         contract_roots: &BTreeSet<MethodReference>,
-        resolve_method: &impl Fn(&ClassNode, u32) -> Option<MethodReference>,
-        resolve_field: &impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference>,
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &CFG>>,
+        resolve_method: &(impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync),
+        resolve_field: &(impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference> + Sync),
     ) -> Self {
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let mark = |name: &str, started: std::time::Instant| {
+            if stats {
+                eprintln!(
+                    "dexdec batch: nullability_{name}={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         let metadata = NullabilityMetadata::analyze(classes);
-        let cfgs = MethodCfgCatalog::analyze(classes, resolve_method, resolve_field);
+        mark("metadata", t);
+        let t = std::time::Instant::now();
+        let cfgs =
+            MethodCfgCatalog::analyze(classes, preterminated_cfgs, resolve_method, resolve_field);
+        mark("cfg_catalog", t);
+        let t = std::time::Instant::now();
         let mut non_null_fields = metadata.non_null_fields.clone();
         non_null_fields.extend(StaticFieldNullability::analyze(classes, &cfgs));
         let fixed_non_null_fields = non_null_fields.clone();
         let instance_fields = InstanceFieldEvidence::analyze(classes, &cfgs);
+        mark("field_evidence", t);
+        let t = std::time::Instant::now();
         let summaries = classes
-            .iter()
-            .flat_map(|class| {
-                let cfgs = &cfgs;
+            .par_iter()
+            .flat_map_iter(|class| {
                 class
                     .methods()
                     .iter()
                     .filter(|method| !method.is_class_init())
-                    .map(move |method| {
+                    .map(|method| {
                         let reference = Self::reference(class, method);
                         let evidence = cfgs.get(&reference).map_or_else(
                             || MethodNullabilityEvidence {
@@ -53,6 +72,8 @@ impl DexNullabilityContracts {
                     })
             })
             .collect::<BTreeMap<_, _>>();
+        mark("summaries", t);
+        let t = std::time::Instant::now();
         let relevant = Self::relevant_methods(contract_roots, &summaries);
         let mut dependencies = contract_roots
             .iter()
@@ -76,42 +97,114 @@ impl DexNullabilityContracts {
                 (!summaries.contains_key(method)).then(|| method.owner.clone())
             }));
         }
-        let mut non_null = metadata.non_null_parameters;
-        loop {
-            let before = non_null.len();
-            for (method, parameters) in &summaries {
-                for (parameter, evidence) in parameters.parameters.iter().enumerate() {
-                    let id = ParameterId {
-                        method: method.clone(),
-                        parameter,
-                    };
-                    if metadata.nullable_parameters.contains(&id) {
-                        continue;
-                    }
-                    if evidence.required_on_all_returns {
-                        non_null.insert(id);
-                        continue;
-                    }
-                    if evidence.uses == 0
-                        || evidence.uses != evidence.required + evidence.dependencies.len()
-                    {
-                        continue;
-                    }
-                    let dependencies_hold = evidence.dependencies.iter().all(|dependency| {
-                        non_null.contains(&ParameterId {
-                            method: dependency.method.clone(),
-                            parameter: dependency.parameter,
-                        })
-                    });
-                    if (evidence.required != 0 || !evidence.dependencies.is_empty())
-                        && dependencies_hold
-                    {
-                        non_null.insert(id);
+        // Parameter non-nullness is a monotone constraint system: every rule
+        // only adds facts and reads other parameters' facts in its premise,
+        // so the least fixed point is unique no matter what order facts are
+        // derived in. A worklist seeded with every candidate and re-seeded
+        // through reverse dependencies therefore reaches exactly the set the
+        // full-sweep iteration produced, without re-scanning every summary on
+        // each round.
+        let keys = summaries.keys().collect::<Vec<_>>();
+        let method_index = keys
+            .iter()
+            .enumerate()
+            .map(|(index, method)| (*method, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut proven = vec![Vec::new(); keys.len()];
+        for (index, method) in keys.iter().enumerate() {
+            proven[index] = vec![false; summaries[*method].parameters.len()];
+        }
+        // Facts seeded by metadata hold from the start; dependencies pointing
+        // outside `summaries` can only ever be satisfied by them, because
+        // only summarized parameters ever join the set.
+        let seed_satisfies = |dependency: &ParameterDependency| {
+            metadata.non_null_parameters.contains(&ParameterId {
+                method: dependency.method.clone(),
+                parameter: dependency.parameter,
+            })
+        };
+        // Reverse edges are registered per owner-parameter slot so an
+        // insertion re-queues exactly the candidates that read it. Candidates
+        // failing the rule's static gate are registered too: the visit below
+        // re-checks the full rule, so a spurious visit costs a queue entry,
+        // never a wrong derivation.
+        let mut dependents = keys
+            .iter()
+            .map(|method| vec![Vec::new(); summaries[*method].parameters.len()])
+            .collect::<Vec<_>>();
+        for (candidate_index, method) in keys.iter().enumerate() {
+            let parameters = &summaries[*method];
+            for (parameter, evidence) in parameters.parameters.iter().enumerate() {
+                if metadata.nullable_parameters.contains(&ParameterId {
+                    method: (*method).clone(),
+                    parameter,
+                }) || evidence.required_on_all_returns
+                {
+                    continue;
+                }
+                for dependency in &evidence.dependencies {
+                    if let Some(&owner) = method_index.get(&dependency.method) {
+                        dependents[owner][dependency.parameter].push((candidate_index, parameter));
                     }
                 }
             }
-            if non_null.len() == before {
-                break;
+        }
+        // Only candidates whose rule can hold without waiting on another
+        // summarized parameter need an initial visit; every other candidate
+        // arrives through `dependents` when a premise it reads flips.
+        let mut queue = VecDeque::new();
+        for (index, method) in keys.iter().enumerate() {
+            let parameters = &summaries[*method];
+            for (parameter, evidence) in parameters.parameters.iter().enumerate() {
+                if metadata.nullable_parameters.contains(&ParameterId {
+                    method: (*method).clone(),
+                    parameter,
+                }) {
+                    continue;
+                }
+                if evidence.required_on_all_returns
+                    || (evidence.uses != 0
+                        && evidence.uses == evidence.required + evidence.dependencies.len())
+                {
+                    queue.push_back((index, parameter));
+                }
+            }
+        }
+        while let Some((index, parameter)) = queue.pop_front() {
+            if proven[index][parameter] {
+                continue;
+            }
+            // The rule is the original sweep's verbatim — static gate plus
+            // dependencies holding against metadata seeds and facts proven so
+            // far — so re-checking it in full keeps any over-queued visit
+            // inert rather than derivational.
+            let evidence = &summaries[keys[index]].parameters[parameter];
+            let holds = evidence.required_on_all_returns
+                || (evidence.uses != 0
+                    && evidence.uses == evidence.required + evidence.dependencies.len()
+                    && (evidence.required != 0 || !evidence.dependencies.is_empty())
+                    && evidence.dependencies.iter().all(|dependency| {
+                        seed_satisfies(dependency)
+                            || method_index
+                                .get(&dependency.method)
+                                .is_some_and(|&owner| proven[owner][dependency.parameter])
+                    }));
+            if holds {
+                proven[index][parameter] = true;
+                for &(owner, dependent) in &dependents[index][parameter] {
+                    queue.push_back((owner, dependent));
+                }
+            }
+        }
+        let mut non_null = metadata.non_null_parameters.clone();
+        for (method_index_outer, method) in keys.iter().enumerate() {
+            for (parameter, _) in summaries[*method].parameters.iter().enumerate() {
+                if proven[method_index_outer][parameter] {
+                    non_null.insert(ParameterId {
+                        method: (*method).clone(),
+                        parameter,
+                    });
+                }
             }
         }
         let fixed_non_null_returns = metadata.non_null_returns.clone();
@@ -181,6 +274,7 @@ impl DexNullabilityContracts {
                 ))
             })
             .collect();
+        mark("fixpoints", t);
         Self {
             methods,
             non_null_fields: std::sync::Arc::new(non_null_fields),
@@ -524,66 +618,124 @@ struct ParameterId {
 /// One resolved raw CFG per loaded method. Nullability analyses share this
 /// catalog so termination, return flow, and field flow observe identical
 /// control-flow and member identities.
-#[derive(Debug, Default)]
-struct MethodCfgCatalog {
-    methods: BTreeMap<MethodReference, CFG>,
+#[derive(Debug)]
+enum MethodCfgCatalog<'cfg> {
+    Owned(BTreeMap<MethodReference, CFG>),
+    Borrowed(BTreeMap<MethodReference, &'cfg CFG>),
 }
 
-impl MethodCfgCatalog {
+impl<'cfg> MethodCfgCatalog<'cfg> {
     fn analyze(
         classes: &[&ClassNode],
-        resolve_method: &impl Fn(&ClassNode, u32) -> Option<MethodReference>,
-        resolve_field: &impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference>,
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &'cfg CFG>>,
+        resolve_method: &(impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync),
+        resolve_field: &(impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference> + Sync),
     ) -> Self {
-        let mut methods = BTreeMap::new();
-        for class in classes {
-            for method in class.methods() {
-                let Some(code) = method.code() else {
-                    continue;
-                };
-                let decoded = MethodDecoder::from_code(code).decode();
-                let mut cfg = Splitter::new(method.name())
-                    .instructions(decoded.insns)
-                    .handlers(decoded.handlers)
-                    .registers(decoded.registers)
-                    .ins(decoded.ins)
-                    .build();
-                cfg.set_method(MethodContext::new(
-                    class.class_type().clone(),
-                    method.name(),
-                    MethodDescriptor {
-                        parameters: method.param_types().to_vec(),
-                        return_type: method.return_type().clone(),
-                    },
-                    method.is_static(),
-                ));
-                for instruction in cfg.blocks.values_mut().flat_map(|block| &mut block.insns) {
-                    if let Some(reference) = instruction
-                        .payload
-                        .method_index
-                        .and_then(|index| resolve_method(class, index))
-                    {
-                        instruction.payload.reference = Some(MemberReference::Method(reference));
-                    } else if let Some(reference) = instruction
-                        .payload
-                        .field_index
-                        .and_then(|index| resolve_field(class, index))
-                    {
-                        instruction.payload.reference = Some(MemberReference::Field(reference));
-                    }
-                }
-                methods.insert(DexNullabilityContracts::reference(class, method), cfg);
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let mark = |name: &str, started: std::time::Instant| {
+            if stats {
+                eprintln!(
+                    "dexdec batch: nullability_{name}={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
             }
+        };
+        let t = std::time::Instant::now();
+        if let Some(methods) = preterminated_cfgs.filter(|methods| {
+            let expected = classes
+                .iter()
+                .flat_map(|class| class.methods())
+                .filter(|method| method.code().is_some())
+                .count();
+            methods.len() == expected
+                && classes.iter().all(|class| {
+                    class
+                        .methods()
+                        .iter()
+                        .filter(|method| method.code().is_some())
+                        .all(|method| {
+                            methods.contains_key(&DexNullabilityContracts::reference(class, method))
+                        })
+                })
+        }) {
+            mark("cfg_reuse", t);
+            return Self::Borrowed(methods);
         }
+        let mut methods = classes
+            .par_iter()
+            .flat_map_iter(|class| {
+                class.methods().iter().filter_map(|method| {
+                    let code = method.code()?;
+                    let decoded = MethodDecoder::from_code(code).decode();
+                    let mut cfg = Splitter::new(method.name())
+                        .instructions(decoded.insns)
+                        .handlers(decoded.handlers)
+                        .registers(decoded.registers)
+                        .ins(decoded.ins)
+                        .build();
+                    cfg.set_method(MethodContext::new(
+                        class.class_type().clone(),
+                        method.name(),
+                        MethodDescriptor {
+                            parameters: method.param_types().to_vec(),
+                            return_type: method.return_type().clone(),
+                        },
+                        method.is_static(),
+                    ));
+                    for instruction in cfg.blocks.values_mut().flat_map(|block| &mut block.insns) {
+                        if let Some(reference) = instruction
+                            .payload
+                            .method_index
+                            .and_then(|index| resolve_method(class, index))
+                        {
+                            instruction.payload.reference =
+                                Some(Box::new(MemberReference::Method(reference)));
+                        } else if let Some(reference) = instruction
+                            .payload
+                            .field_index
+                            .and_then(|index| resolve_field(class, index))
+                        {
+                            instruction.payload.reference =
+                                Some(Box::new(MemberReference::Field(reference)));
+                        }
+                    }
+                    Some((DexNullabilityContracts::reference(class, method), cfg))
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        mark("cfg_build", t);
+        let t = std::time::Instant::now();
         let termination = crate::ir::analysis::MethodTermination::analyze(methods.values());
-        for cfg in methods.values_mut() {
+        mark("cfg_term_analyze", t);
+        let t = std::time::Instant::now();
+        // Each CFG mutates independently, so the application order cannot
+        // matter.
+        methods.par_iter_mut().for_each(|(_, cfg)| {
             termination.apply(cfg);
-        }
-        Self { methods }
+        });
+        mark("cfg_term_apply", t);
+        Self::Owned(methods)
     }
 
     fn get(&self, method: &MethodReference) -> Option<&CFG> {
-        self.methods.get(method)
+        match self {
+            Self::Owned(methods) => methods.get(method),
+            Self::Borrowed(methods) => methods.get(method).copied(),
+        }
+    }
+
+    fn contains_key(&self, method: &MethodReference) -> bool {
+        match self {
+            Self::Owned(methods) => methods.contains_key(method),
+            Self::Borrowed(methods) => methods.contains_key(method),
+        }
+    }
+
+    fn entries(&self) -> Vec<(&MethodReference, &CFG)> {
+        match self {
+            Self::Owned(methods) => methods.iter().collect(),
+            Self::Borrowed(methods) => methods.iter().map(|(method, cfg)| (method, *cfg)).collect(),
+        }
     }
 
     fn unresolved_termination_owners(
@@ -592,7 +744,7 @@ impl MethodCfgCatalog {
     ) -> BTreeSet<crate::ir::ArgType> {
         relevant
             .iter()
-            .filter_map(|method| self.methods.get(method))
+            .filter_map(|method| self.get(method))
             .flat_map(|cfg| cfg.blocks.values())
             .flat_map(|block| &block.insns)
             .filter(|instruction| {
@@ -602,12 +754,14 @@ impl MethodCfgCatalog {
                         Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                     )
             })
-            .filter_map(|instruction| match instruction.payload.reference.as_ref() {
-                Some(MemberReference::Method(method)) if !self.methods.contains_key(method) => {
-                    Some(method.owner.clone())
-                }
-                _ => None,
-            })
+            .filter_map(
+                |instruction| match instruction.payload.reference.as_deref() {
+                    Some(MemberReference::Method(method)) if !self.contains_key(method) => {
+                        Some(method.owner.clone())
+                    }
+                    _ => None,
+                },
+            )
             .collect()
     }
 }
@@ -732,7 +886,7 @@ impl MethodParameterNullability {
                 continue;
             };
             for instruction in &block.insns {
-                let invoked = match instruction.payload.reference.as_ref() {
+                let invoked = match instruction.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => Some(method),
                     _ => None,
                 };
@@ -1161,7 +1315,7 @@ impl MethodReturnNullability {
             InsnType::Iget | InsnType::Sget => instruction
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .and_then(|reference| match reference {
                     MemberReference::Field(field) if field.field_type.is_reference() => Some(
                         ReturnOrigin::Proven(vec![ReturnRequirement::Field(field.clone())]),
@@ -1181,7 +1335,7 @@ impl MethodReturnNullability {
                 state.pending_result = instruction
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Method(method) => Some(method.clone()),
                         MemberReference::Field(_) => None,
@@ -1224,8 +1378,21 @@ struct InstanceFieldEvidence {
 impl InstanceFieldEvidence {
     fn analyze(classes: &[&ClassNode], cfgs: &MethodCfgCatalog) -> Self {
         let mut evidence = Self::default();
-        for class in classes {
-            evidence.analyze_class(class, cfgs);
+        // Per-class constructor flow produces disjoint `writes` keys (each key
+        // carries its owner), so class jobs can run concurrently and merge in
+        // any order without changing the collected evidence.
+        let partials = classes
+            .par_iter()
+            .filter_map(|class| {
+                let mut per_class = Self::default();
+                per_class.analyze_class(class, cfgs);
+                (!per_class.writes.is_empty()).then_some(per_class.writes)
+            })
+            .collect::<Vec<_>>();
+        for partial in partials {
+            for (field, writes) in partial {
+                evidence.writes.entry(field).or_default().extend(writes);
+            }
         }
         evidence.scan_writes(cfgs);
         evidence
@@ -1297,42 +1464,52 @@ impl InstanceFieldEvidence {
     }
 
     fn scan_writes(&mut self, cfgs: &MethodCfgCatalog) {
-        for (reference, cfg) in &cfgs.methods {
-            if reference.is_constructor() {
-                continue;
-            }
-            let Some(entry) = cfg.entry_block().map(|block| block.id) else {
-                continue;
-            };
-            let state = MethodReturnNullability::entry_state_from_cfg(cfg);
-            let incoming = MethodReturnNullability::solve(cfg, entry, state);
-            for block in cfg.blocks_iter() {
-                let Some(mut state) = incoming.get(&block.id).cloned() else {
-                    continue;
-                };
-                for instruction in &block.insns {
-                    if instruction.insn_type == InsnType::Iput {
-                        if let Some(field) = Self::field_reference(instruction)
-                            .filter(|field| self.writes.contains_key(field))
-                        {
-                            let value = instruction
-                                .args
-                                .first()
-                                .map(|value| {
-                                    MethodReturnNullability::argument(value, &state.registers)
-                                })
-                                .unwrap_or(ReturnOrigin::Unknown);
-                            self.writes
-                                .entry(field)
-                                .or_default()
-                                .push(FieldWriteEvidence {
-                                    method: reference.clone(),
-                                    value,
-                                });
+        // `writes` keys are fixed before this pass (only the constructor flow
+        // creates entries), so each method's scan can run concurrently against
+        // the same key set and merge afterwards.
+        let produced = cfgs
+            .entries()
+            .into_par_iter()
+            .filter(|(reference, _)| !reference.is_constructor())
+            .filter_map(|(reference, cfg)| {
+                let entry = cfg.entry_block().map(|block| block.id)?;
+                let state = MethodReturnNullability::entry_state_from_cfg(cfg);
+                let incoming = MethodReturnNullability::solve(cfg, entry, state);
+                let mut found = Vec::new();
+                for block in cfg.blocks_iter() {
+                    let Some(mut state) = incoming.get(&block.id).cloned() else {
+                        continue;
+                    };
+                    for instruction in &block.insns {
+                        if instruction.insn_type == InsnType::Iput {
+                            if let Some(field) = Self::field_reference(instruction)
+                                .filter(|field| self.writes.contains_key(field))
+                            {
+                                let value = instruction
+                                    .args
+                                    .first()
+                                    .map(|value| {
+                                        MethodReturnNullability::argument(value, &state.registers)
+                                    })
+                                    .unwrap_or(ReturnOrigin::Unknown);
+                                found.push((
+                                    field,
+                                    FieldWriteEvidence {
+                                        method: reference.clone(),
+                                        value,
+                                    },
+                                ));
+                            }
                         }
+                        MethodReturnNullability::transfer(instruction, &mut state);
                     }
-                    MethodReturnNullability::transfer(instruction, &mut state);
                 }
+                (!found.is_empty()).then_some(found)
+            })
+            .collect::<Vec<_>>();
+        for chunk in produced {
+            for (field, write) in chunk {
+                self.writes.entry(field).or_default().push(write);
             }
         }
     }
@@ -1383,7 +1560,7 @@ impl InstanceFieldEvidence {
     }
 
     fn field_reference(instruction: &InsnNode) -> Option<crate::ir::FieldReference> {
-        match instruction.payload.reference.as_ref()? {
+        match instruction.payload.reference.as_deref()? {
             MemberReference::Field(field) => Some(field.clone()),
             MemberReference::Method(_) => None,
         }
@@ -1526,7 +1703,7 @@ impl ConstructorFieldFlow {
                 state.fields.insert(field, Some(value));
             }
         }
-        if let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() {
+        if let Some(MemberReference::Method(target)) = instruction.payload.reference.as_deref() {
             let receiver_is_this = instruction
                 .args
                 .first()
@@ -1668,8 +1845,8 @@ impl StaticFieldNullability {
         cfgs: &MethodCfgCatalog,
     ) -> BTreeSet<crate::ir::FieldReference> {
         classes
-            .iter()
-            .flat_map(|class| {
+            .par_iter()
+            .flat_map_iter(|class| {
                 let candidates = class
                     .fields()
                     .iter()
@@ -1802,7 +1979,7 @@ impl StaticFieldNullability {
             if let Some(field) = instruction
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .and_then(|reference| match reference {
                     MemberReference::Field(field) => Some(field.clone()),
                     MemberReference::Method(_) => None,

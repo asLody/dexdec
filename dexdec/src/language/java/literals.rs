@@ -91,6 +91,12 @@ mod tests {
     use crate::ir::Utf16String;
 
     #[test]
+    fn float_from_ieee_bits_prints_one() {
+        assert_eq!(f32::from_bits(1_065_353_216), 1.0);
+        assert_eq!(JavaLiterals::float(f32::from_bits(1_065_353_216)), "1.0f");
+    }
+
+    #[test]
     fn preserves_unpaired_surrogates_in_source_literals() {
         let value = Utf16String::from_utf16(vec![u16::from(b'a'), 0xd800, u16::from(b'b')]);
         assert_eq!(JavaLiterals::string(&value), "\"a\\ud800b\"");

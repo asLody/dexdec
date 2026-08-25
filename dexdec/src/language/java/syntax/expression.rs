@@ -33,7 +33,7 @@ impl ExpressionFacts<'_> {
             || operation
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .is_some_and(|reference| match reference {
                     MemberReference::Method(method) => {
                         method.descriptor.return_type == ArgType::BOOLEAN

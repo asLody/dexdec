@@ -84,7 +84,8 @@ impl<'a> DeclaredExceptionAnalysis<'a> {
             .flat_map(|block| &block.insns)
             .filter(|instruction| instruction.insn_type == InsnType::Invoke)
             .filter_map(|instruction| {
-                let Some(MemberReference::Method(method)) = instruction.payload.reference.as_ref()
+                let Some(MemberReference::Method(method)) =
+                    instruction.payload.reference.as_deref()
                 else {
                     return None;
                 };

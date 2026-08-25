@@ -1,5 +1,6 @@
 mod common;
 
+use dexdec::analysis::method_override::default_platform_class_details_are_frozen;
 use dexdec::api::DecompilerContext;
 use dexdec::frontend::AnalysisState;
 
@@ -76,4 +77,19 @@ fn reader_mut_load_class_is_recovered_by_decompile_method() {
 
     assert_eq!(ctx.reader().override_analysis_state(), AnalysisState::Ready);
     assert!(output.contains(": ArithmeticException)"), "{output}");
+}
+
+#[test]
+fn type_hierarchy_freezes_default_platform_class_details() {
+    let (mut ctx, class_name) = load_testcase("TryCatch");
+    ctx.load_class(&class_name)
+        .expect("class load should succeed")
+        .expect("class should exist");
+
+    ctx.type_hierarchy()
+        .expect("type hierarchy should be available");
+    assert!(
+        default_platform_class_details_are_frozen(),
+        "type_hierarchy must freeze platform class details before generate"
+    );
 }

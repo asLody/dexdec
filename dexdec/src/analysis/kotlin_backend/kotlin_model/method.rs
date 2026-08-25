@@ -177,6 +177,7 @@ impl KotlinMethodBody {
                 crate::ir::generic_types::GenericMethodContract,
             >,
         >,
+        class_generic_uses: std::sync::Arc<std::collections::BTreeSet<ArgType>>,
         method_nullability: std::sync::Arc<
             std::collections::BTreeMap<
                 crate::ir::MethodReference,
@@ -229,20 +230,9 @@ impl KotlinMethodBody {
                 used_types.extend(self.current_type.iter().cloned());
                 used_types.extend(self.return_type.iter().cloned());
                 used_types.insert(ArgType::object("java/lang/Object"));
-                let mut generic_uses = Vec::new();
-                for contract in generic_fields.values() {
-                    super::super::type_uses::GenericTypeUses::field_contract(
-                        contract,
-                        &mut generic_uses,
-                    );
-                }
-                for contract in generic_methods.values() {
-                    super::super::type_uses::GenericTypeUses::method_contract(
-                        contract,
-                        &mut generic_uses,
-                    );
-                }
-                used_types.extend(generic_uses);
+                // Collected once per class from the same contracts; see
+                // KotlinTypeLowering::new.
+                used_types.extend(class_generic_uses.iter().cloned());
                 let source_types = used_types
                     .iter()
                     .map(|ty| Ok((ty.clone(), type_names.resolve_type(ty)?)))
@@ -375,7 +365,7 @@ struct MemberReferenceCollector {
 
 impl crate::ir::SemanticVisitor for MemberReferenceCollector {
     fn enter_operation(&mut self, operation: &crate::ir::SemanticOperation) {
-        match operation.payload.reference.as_ref() {
+        match operation.payload.reference.as_deref() {
             Some(crate::ir::MemberReference::Method(method)) => {
                 self.methods.insert(method.clone());
             }

@@ -196,6 +196,74 @@ pub fn read_encoded_annotation(
     })
 }
 
+pub fn skip_encoded_annotation(
+    reader: &mut DexReader,
+    types: &DexTypes,
+) -> Result<String, DexError> {
+    let (type_idx, _) = reader.read_uleb128()?;
+    let annotation_type = types
+        .items
+        .get(type_idx as usize)
+        .ok_or(DexError::InvalidTypeIdx)?
+        .clone();
+    let (size, _) = reader.read_uleb128()?;
+    for _ in 0..size {
+        let (_, _) = reader.read_uleb128()?;
+        EncodedValue::skip(reader)?;
+    }
+    Ok(annotation_type)
+}
+
+impl EncodedValue {
+    pub(crate) fn skip(reader: &mut DexReader) -> Result<(), DexError> {
+        let header = reader.read_u8()?;
+        let value_type = header & 0x1f;
+        let value_arg = header >> 5;
+
+        match value_type {
+            0x00 | 0x02 | 0x03 | 0x04 | 0x06 | 0x10 | 0x11 => {
+                let byte_count = byte_count(value_arg, 8)?;
+                for _ in 0..byte_count {
+                    reader.read_u8()?;
+                }
+            }
+            0x15 | 0x16 | 0x17 | 0x18 | 0x19 | 0x1a | 0x1b => {
+                let byte_count = byte_count(value_arg, 4)?;
+                for _ in 0..byte_count {
+                    reader.read_u8()?;
+                }
+            }
+            0x1c => {
+                let (size, _) = reader.read_uleb128()?;
+                for _ in 0..size {
+                    Self::skip(reader)?;
+                }
+            }
+            0x1d => {
+                skip_nested_annotation(reader)?;
+            }
+            0x1e | 0x1f => {}
+            _ => {
+                let byte_count = byte_count(value_arg, 8)?;
+                for _ in 0..byte_count {
+                    reader.read_u8()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn skip_nested_annotation(reader: &mut DexReader) -> Result<(), DexError> {
+    let (_, _) = reader.read_uleb128()?;
+    let (size, _) = reader.read_uleb128()?;
+    for _ in 0..size {
+        let (_, _) = reader.read_uleb128()?;
+        EncodedValue::skip(reader)?;
+    }
+    Ok(())
+}
+
 fn read_encoded_array_inline(
     reader: &mut DexReader,
     strings: &DexStrings,

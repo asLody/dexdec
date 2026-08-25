@@ -687,7 +687,7 @@ impl Pass for RecoverConstructors<'_> {
                             aliases: &plan.aliases,
                             replacement,
                         };
-                        *value = InstructionTree::transform_arg(value.clone(), &mut rewriter)?;
+                        *value = InstructionTree::transform_arg((*value).clone(), &mut rewriter)?;
                     }
                 }
                 if let Some(target) = &mut instruction.payload.compound_target {
@@ -703,7 +703,10 @@ impl Pass for RecoverConstructors<'_> {
                             aliases: &plan.aliases,
                             replacement,
                         };
-                        *target = InstructionTree::transform_arg(target.clone(), &mut rewriter)?;
+                        *target = Box::new(InstructionTree::transform_arg(
+                            (**target).clone(),
+                            &mut rewriter,
+                        )?);
                     }
                 }
                 if let Some((value, ty)) = constructors.get(&position) {
@@ -711,7 +714,7 @@ impl Pass for RecoverConstructors<'_> {
                     result.ssa_version = Some(value.version);
                     instruction.insn_type = InsnType::Constructor;
                     instruction.result = Some(result);
-                    instruction.payload.class_type = Some(ty.clone());
+                    instruction.payload.class_type = Some(Box::new(ty.clone()));
                 }
                 rewritten.push(instruction);
             }
@@ -836,7 +839,7 @@ mod tests {
         let builder_type = ArgType::object("java/lang/StringBuilder");
         let mut allocation =
             InsnNode::new_instance(RegisterArg::new_ssa(0, 0, builder_type.clone()), 0);
-        allocation.payload.class_type = Some(builder_type);
+        allocation.payload.class_type = Some(Box::new(builder_type));
         let mut allocation_block = Block::new(allocation_id);
         allocation_block.push(allocation);
 
@@ -891,7 +894,7 @@ mod tests {
         let builder_type = ArgType::object("java/lang/StringBuilder");
         let mut allocation =
             InsnNode::new_instance(RegisterArg::new_ssa(0, 0, builder_type.clone()), 0);
-        allocation.payload.class_type = Some(builder_type);
+        allocation.payload.class_type = Some(Box::new(builder_type));
         let mut allocation_block = Block::new(allocation_id);
         allocation_block.push(allocation);
 

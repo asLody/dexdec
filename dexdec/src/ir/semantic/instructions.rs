@@ -1,6 +1,6 @@
 //! Expression transformation across Semantic IR.
 
-use crate::ir::{RegisterArg, SemanticFoldError, SemanticFolder};
+use crate::ir::{InsnNode, InsnType, RegisterArg, SemanticFoldError};
 
 use super::{
     SemanticExpression, SemanticNode, SemanticOperation, SemanticPredicate, SemanticStatement,
@@ -42,10 +42,63 @@ impl SemanticInstructions {
     where
         T: SemanticExpressionTransform + ?Sized,
     {
-        let body = std::mem::replace(root, SemanticNode::Empty);
-        let mut folder = ExpressionFolder { transform };
-        *root = folder.fold_node(body)?;
-        Ok(())
+        Self::transform_tree(root, transform)
+    }
+
+    fn transform_tree<T>(
+        node: &mut SemanticNode,
+        transform: &mut T,
+    ) -> Result<(), SemanticFoldError>
+    where
+        T: SemanticExpressionTransform + ?Sized,
+    {
+        match node {
+            SemanticNode::Empty | SemanticNode::BasicBlock(_) | SemanticNode::Leave(_) => {}
+            SemanticNode::Sequence(children) => {
+                for child in children {
+                    Self::transform_tree(child, transform)?;
+                }
+            }
+            SemanticNode::If {
+                then_node,
+                else_node,
+                ..
+            } => {
+                Self::transform_tree(then_node.as_mut(), transform)?;
+                if let Some(else_node) = else_node {
+                    Self::transform_tree(else_node.as_mut(), transform)?;
+                }
+            }
+            SemanticNode::Loop { test, body, .. } => {
+                Self::transform_tree(test.setup.as_mut(), transform)?;
+                Self::transform_tree(body.as_mut(), transform)?;
+            }
+            SemanticNode::For { body, .. } => Self::transform_tree(body.as_mut(), transform)?,
+            SemanticNode::ForEach { body, .. } => Self::transform_tree(body.as_mut(), transform)?,
+            SemanticNode::Switch { cases, .. } => {
+                for case in cases {
+                    Self::transform_tree(&mut case.body, transform)?;
+                }
+            }
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                Self::transform_tree(body.as_mut(), transform)?;
+                for catch in catches {
+                    Self::transform_tree(&mut catch.body, transform)?;
+                }
+                if let Some(finally) = finally {
+                    Self::transform_tree(finally.body.as_mut(), transform)?;
+                }
+            }
+            SemanticNode::Synchronized { body, .. } | SemanticNode::Label { body, .. } => {
+                Self::transform_tree(body.as_mut(), transform)?;
+            }
+        }
+        Self::transform_node(node, transform)
     }
 
     pub fn transform_node<T>(
@@ -116,8 +169,16 @@ impl SemanticInstructions {
     {
         match &mut statement.kind {
             SemanticStatementKind::Instruction(operation) => {
+                let taken = std::mem::replace(
+                    operation,
+                    SemanticOperation::from_parts(
+                        InsnNode::new(InsnType::Nop, 0),
+                        Vec::new(),
+                        None,
+                    ),
+                );
                 let expression = Self::transform_owned_expression(
-                    SemanticExpression::Operation(Box::new(operation.clone())),
+                    SemanticExpression::Operation(Box::new(taken)),
                     transform,
                 )?;
                 let SemanticExpression::Operation(transformed) = expression else {
@@ -307,22 +368,6 @@ impl SemanticInstructions {
     {
         *register = transform.transform_binding(register.clone());
         Ok(())
-    }
-}
-
-struct ExpressionFolder<'a, T: ?Sized> {
-    transform: &'a mut T,
-}
-
-impl<T> SemanticFolder for ExpressionFolder<'_, T>
-where
-    T: SemanticExpressionTransform + ?Sized,
-{
-    type Error = SemanticFoldError;
-
-    fn finish_node(&mut self, mut node: SemanticNode) -> Result<SemanticNode, Self::Error> {
-        SemanticInstructions::transform_node(&mut node, self.transform)?;
-        Ok(node)
     }
 }
 

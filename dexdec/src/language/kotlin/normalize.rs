@@ -1632,10 +1632,13 @@ impl KotlinAstNormalizer {
                 }
             }
         }
-        let [root] = results.as_slice() else {
+        if results.len() != 1 {
             return Err(super::KotlinStructuralError::MalformedWorkStack);
-        };
-        Ok((root.clone(), changed))
+        }
+        let root = results
+            .pop()
+            .ok_or(super::KotlinStructuralError::MalformedWorkStack)?;
+        Ok((root, changed))
     }
 
     fn flatten(children: Vec<KotlinStmt>) -> (Vec<KotlinStmt>, bool) {

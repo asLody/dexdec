@@ -322,7 +322,7 @@ impl KotlinDecompiler {
             outer_instance: outer_instance.as_ref(),
             function_object: super::FunctionObjectClass::analyze(class),
         };
-        let decoded_results = if methods.len() < 8 {
+        let decoded_results = if !self.config.parallel_methods || methods.len() < 8 {
             methods
                 .iter_mut()
                 .filter_map(ClassMethodInput::decoded_mut)
@@ -521,6 +521,7 @@ impl KotlinDecompiler {
                 &self.source_abi,
                 self.type_hierarchy.clone(),
                 self.observer.clone(),
+                self.config.parallel_methods,
             )
         })?;
         crate::profile_scope!("kotlin_backend.class.print", {

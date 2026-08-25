@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::analysis::java_backend::{FunctionObjectClass, JavaSourceAbi, SourceSignatureInference};
 use crate::analysis::kotlin_backend::KotlinSourceAbi;
 use crate::analysis::{
@@ -38,6 +40,12 @@ pub use decompiler::{
     ClassSelector, DecompileOptions, Decompiler, MethodOutput, MethodRequest, SourceLanguage,
     SourceUnit,
 };
+
+pub(crate) struct ClassRenderInput {
+    pub class_node: ClassNode,
+    pub methods: Vec<ClassMethodInput>,
+    pub nested: Vec<NestedClassInput>,
+}
 pub use references::{ReferenceLocation, ReferenceResults, ReferenceTarget};
 
 /// Decompiler context - holds state for decompilation
@@ -48,6 +56,9 @@ pub struct DecompilerContext {
     method_irs: HashMap<String, HashMap<String, CFG>>,
     /// Revision of the loaded class graph captured by `method_irs`.
     method_cache_revision: u64,
+    /// Archive collect may load extra ABI types after termination; keep
+    /// already-decoded CFGs across those revision bumps.
+    retain_decoded_methods: bool,
     /// Immutable hierarchy facts shared by every method in one class-graph revision.
     type_hierarchy_cache: Option<(u64, Arc<crate::ir::analysis::ClassHierarchyIndex>)>,
     /// Immutable target-language ABI facts shared by one class-graph revision.
@@ -176,6 +187,7 @@ impl DecompilerContext {
             reader,
             method_irs: HashMap::new(),
             method_cache_revision: 0,
+            retain_decoded_methods: false,
             type_hierarchy_cache: None,
             java_source_abi_cache: None,
             kotlin_source_abi_cache: None,
@@ -282,6 +294,59 @@ impl DecompilerContext {
         self.method_cache_revision = self.reader.loaded_classes_revision();
     }
 
+    pub(crate) fn set_retain_decoded_methods(&mut self, retain: bool) {
+        self.retain_decoded_methods = retain;
+    }
+
+    fn sync_method_cache_revision(&mut self) {
+        if self.method_cache_revision == self.reader.loaded_classes_revision() {
+            return;
+        }
+        if !self.retain_decoded_methods {
+            self.method_irs.clear();
+        }
+        self.method_cache_revision = self.reader.loaded_classes_revision();
+    }
+
+    pub(crate) fn abandon_archive_buffers(&mut self) {
+        self.retain_decoded_methods = false;
+        self.method_irs.clear();
+        self.reader.abandon_loaded_classes();
+        self.method_cache_revision = self.reader.loaded_classes_revision();
+    }
+
+    pub(crate) fn load_archive_selection<'a>(
+        &mut self,
+        class_names: impl IntoIterator<Item = &'a str>,
+        include_nested: bool,
+    ) -> Result<(), DecompileError> {
+        let mut queue = class_names
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::VecDeque<_>>();
+        let mut seen = queue
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        while !queue.is_empty() {
+            let batch = queue.drain(..).collect::<Vec<_>>();
+            self.reader.load_classes(&batch)?;
+            if include_nested {
+                for class_name in batch {
+                    let Some(class) = self.reader.get_class(&class_name) else {
+                        continue;
+                    };
+                    for nested in class.inner_class_names() {
+                        if seen.insert(nested.to_string()) {
+                            queue.push_back(nested.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Begin a fresh request-local class graph without reparsing DEX metadata.
     pub fn clear_analysis_scope(&mut self) {
         self.reader.clear_loaded_classes();
@@ -302,10 +367,7 @@ impl DecompilerContext {
         method_name: &str,
         descriptor: Option<&str>,
     ) -> DexResult<Option<&CFG>> {
-        if self.method_cache_revision != self.reader.loaded_classes_revision() {
-            self.method_irs.clear();
-            self.method_cache_revision = self.reader.loaded_classes_revision();
-        }
+        self.sync_method_cache_revision();
         // Form a cache key that includes descriptor to handle overloading
         let cache_key = if let Some(desc) = descriptor {
             format!("{}{}", method_name, desc)
@@ -385,7 +447,7 @@ impl DecompilerContext {
             .ok_or_else(|| crate::frontend::DexError::MissingDexForClass(class_name.to_string()))?;
 
         // Resolve symbol references using DEX file tables
-        self.resolve_symbols(&mut ir, dex_idx)?;
+        Self::resolve_symbols_with(&self.reader, &mut ir, dex_idx)?;
 
         // Cache and return
         let class_cache = self
@@ -402,71 +464,139 @@ impl DecompilerContext {
 
     /// Resolve symbol references in IR instructions
     fn resolve_symbols(&self, ir: &mut CFG, dex_idx: usize) -> DexResult<()> {
+        Self::resolve_symbols_with(&self.reader, ir, dex_idx)
+    }
+
+    fn resolve_symbols_with(reader: &DexFileReader, ir: &mut CFG, dex_idx: usize) -> DexResult<()> {
         for block in ir.blocks.values_mut() {
             for insn in &mut block.insns {
                 // Resolve method references
                 if let Some(method_idx) = insn.payload.method_index {
-                    let raw = self
-                        .reader
-                        .get_method(dex_idx, method_idx)
-                        .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
-                        .to_string();
-                    let method = raw.parse::<MethodReference>().map_err(|source| {
-                        crate::frontend::DexError::InvalidMemberReference {
-                            reference: raw,
-                            source,
+                    let method = if matches!(
+                        insn.payload.reference.as_deref(),
+                        Some(MemberReference::Method(_))
+                    ) {
+                        match *insn
+                            .payload
+                            .reference
+                            .take()
+                            .expect("method reference checked above")
+                        {
+                            MemberReference::Method(method) => method,
+                            MemberReference::Field(_) => unreachable!(),
                         }
-                    })?;
+                    } else {
+                        let raw = reader
+                            .get_method(dex_idx, method_idx)
+                            .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
+                            .to_string();
+                        raw.parse::<MethodReference>().map_err(|source| {
+                            crate::frontend::DexError::InvalidMemberReference {
+                                reference: raw,
+                                source,
+                            }
+                        })?
+                    };
                     normalize_invoke_args(insn, &method)?;
                     apply_invoke_return_type(insn, &method);
-                    insn.payload.reference = Some(MemberReference::Method(method));
+                    insn.payload.reference = Some(Box::new(MemberReference::Method(method)));
                 }
 
                 // Resolve field references
                 if let Some(field_idx) = insn.payload.field_index {
-                    let raw = self
-                        .reader
-                        .get_field(dex_idx, field_idx)
-                        .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
-                        .to_string();
-                    let field = raw.parse::<FieldReference>().map_err(|source| {
-                        crate::frontend::DexError::InvalidMemberReference {
-                            reference: raw,
-                            source,
+                    let field = if matches!(
+                        insn.payload.reference.as_deref(),
+                        Some(MemberReference::Field(_))
+                    ) {
+                        match *insn
+                            .payload
+                            .reference
+                            .take()
+                            .expect("field reference checked above")
+                        {
+                            MemberReference::Field(field) => field,
+                            MemberReference::Method(_) => unreachable!(),
                         }
-                    })?;
+                    } else {
+                        let raw = reader
+                            .get_field(dex_idx, field_idx)
+                            .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
+                            .to_string();
+                        raw.parse::<FieldReference>().map_err(|source| {
+                            crate::frontend::DexError::InvalidMemberReference {
+                                reference: raw,
+                                source,
+                            }
+                        })?
+                    };
                     apply_field_type(insn, &field);
-                    insn.payload.reference = Some(MemberReference::Field(field));
+                    insn.payload.reference = Some(Box::new(MemberReference::Field(field)));
                 }
 
                 // Resolve string references
                 if let Some(string_idx) = insn.payload.string_index {
                     if insn.payload.string_value.is_none() {
-                        let string = self
-                            .reader
+                        let string = reader
                             .get_string(dex_idx, string_idx)
                             .ok_or(crate::frontend::DexError::InvalidStringIndex(string_idx))?;
                         insn.payload.string_value =
-                            Some(Utf16String::from_utf16(string.utf16().to_vec()));
+                            Some(Box::new(Utf16String::from_utf16(string.utf16().to_vec())));
                     }
                 }
 
                 // Resolve type references
                 if let Some(type_idx) = insn.payload.type_index {
                     if insn.payload.class_type.is_none() {
-                        let descriptor = self
-                            .reader
+                        let descriptor = reader
                             .get_type(dex_idx, type_idx)
                             .ok_or(crate::frontend::DexError::InvalidTypeIndex(type_idx))?;
                         insn.payload.class_type =
-                            Some(descriptor.parse::<ArgType>().map_err(|source| {
-                                crate::frontend::DexError::InvalidDescriptor {
+                            Some(Box::new(descriptor.parse::<ArgType>().map_err(
+                                |source| crate::frontend::DexError::InvalidDescriptor {
                                     descriptor: descriptor.to_string(),
                                     source,
-                                }
-                            })?);
+                                },
+                            )?));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve member identities without changing the decoder's raw register
+    /// arguments or inferred types. Archive-wide Kotlin nullability consumes
+    /// this representation before full source-generation enrichment.
+    fn resolve_member_references_with(
+        reader: &DexFileReader,
+        ir: &mut CFG,
+        dex_idx: usize,
+    ) -> DexResult<()> {
+        for instruction in ir.blocks.values_mut().flat_map(|block| &mut block.insns) {
+            if let Some(method_idx) = instruction.payload.method_index {
+                let raw = reader
+                    .get_method(dex_idx, method_idx)
+                    .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
+                    .to_string();
+                let method = raw.parse::<MethodReference>().map_err(|source| {
+                    crate::frontend::DexError::InvalidMemberReference {
+                        reference: raw,
+                        source,
+                    }
+                })?;
+                instruction.payload.reference = Some(Box::new(MemberReference::Method(method)));
+            } else if let Some(field_idx) = instruction.payload.field_index {
+                let raw = reader
+                    .get_field(dex_idx, field_idx)
+                    .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
+                    .to_string();
+                let field = raw.parse::<FieldReference>().map_err(|source| {
+                    crate::frontend::DexError::InvalidMemberReference {
+                        reference: raw,
+                        source,
+                    }
+                })?;
+                instruction.payload.reference = Some(Box::new(MemberReference::Field(field)));
             }
         }
         Ok(())
@@ -528,6 +658,7 @@ impl DecompilerContext {
         let revision = self.reader.loaded_classes_revision();
         if let Some((cached_revision, hierarchy)) = &self.type_hierarchy_cache {
             if *cached_revision == revision {
+                crate::analysis::method_override::freeze_default_platform_class_details();
                 return Ok(Arc::clone(hierarchy));
             }
         }
@@ -536,6 +667,7 @@ impl DecompilerContext {
                 .map_err(crate::frontend::DexError::from)?,
         );
         self.type_hierarchy_cache = Some((revision, Arc::clone(&hierarchy)));
+        crate::analysis::method_override::freeze_default_platform_class_details();
         Ok(hierarchy)
     }
 
@@ -586,12 +718,21 @@ impl DecompilerContext {
     }
 
     fn prepare_java_source_abi(&mut self) -> Result<(), DecompileError> {
+        self.prepare_java_source_abi_with_cached_resolution(false)
+    }
+
+    fn prepare_java_source_abi_with_cached_resolution(
+        &mut self,
+        resolve_cached: bool,
+    ) -> Result<(), DecompileError> {
         let revision = self.reader.loaded_classes_revision();
-        if let Some((cached_revision, source_abi)) = &self.java_source_abi_cache {
+        if let Some((cached_revision, _)) = &self.java_source_abi_cache {
             if *cached_revision == revision {
                 return Ok(());
             }
         }
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let t0 = std::time::Instant::now();
         let candidates = self
             .reader
             .classes()
@@ -606,16 +747,50 @@ impl DecompilerContext {
             .collect::<Vec<_>>();
         let mut methods = Vec::with_capacity(candidates.len());
         for (owner, method) in candidates {
-            methods.push(self.decode_class_method(&owner, method));
+            methods.push(self.decode_class_method(&owner, method, false));
         }
+        if resolve_cached {
+            for method in &mut methods {
+                let Some(cfg) = method.cfg_mut() else {
+                    continue;
+                };
+                let owner = cfg.method().owner().to_descriptor();
+                let dex_idx = self
+                    .reader
+                    .get_dex_index(&owner)
+                    .ok_or_else(|| crate::frontend::DexError::MissingDexForClass(owner.clone()))?;
+                Self::resolve_symbols_with(&self.reader, cfg, dex_idx)?;
+            }
+        }
+        let fo_ms = t0.elapsed();
+        let t1 = std::time::Instant::now();
         let hierarchy = self.type_hierarchy()?;
+        let hier_ms = t1.elapsed();
+        let t2 = std::time::Instant::now();
         let signatures = SourceSignatureInference::analyze(hierarchy.as_ref(), &methods, &[]);
-        let source_abi = Arc::new(JavaSourceAbi::analyze(self.reader.classes(), |method| {
-            (
-                signatures.body_parameter_types(method),
-                signatures.return_type(method),
-            )
-        }));
+        let sig_ms = t2.elapsed();
+        let t3 = std::time::Instant::now();
+        let source_abi = Arc::new(JavaSourceAbi::analyze_with_hierarchy(
+            self.reader.classes(),
+            |method| {
+                (
+                    signatures.body_parameter_types(method),
+                    signatures.return_type(method),
+                )
+            },
+            Some(hierarchy.as_ref()),
+        ));
+        let analyze_ms = t3.elapsed();
+        if stats {
+            eprintln!(
+                "dexdec batch: java_abi_detail fo_decode={:.0}ms hierarchy={:.0}ms signatures={:.0}ms analyze={:.0}ms fo_methods={}",
+                fo_ms.as_secs_f64() * 1000.0,
+                hier_ms.as_secs_f64() * 1000.0,
+                sig_ms.as_secs_f64() * 1000.0,
+                analyze_ms.as_secs_f64() * 1000.0,
+                methods.len(),
+            );
+        }
         let revision = self.reader.loaded_classes_revision();
         self.java_source_abi_cache = Some((revision, Arc::clone(&source_abi)));
         Ok(())
@@ -905,8 +1080,40 @@ impl DecompilerContext {
         include_inner: bool,
         observer: Arc<dyn crate::ir::AnalysisObserver>,
     ) -> Result<Option<String>, DecompileError> {
+        let Some(mut input) = self.collect_class_render_input(
+            class_name,
+            include_inner,
+            Arc::clone(&observer),
+            true,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.prepare_source_backend::<B>()?;
         observer.checkpoint()?;
-        // Load class if needed
+        let hierarchy =
+            crate::profile_scope!("api.source_context.hierarchy", { self.type_hierarchy() })?;
+        observer.checkpoint()?;
+        let source = B::generate_class(
+            self,
+            config,
+            observer,
+            hierarchy,
+            &input.class_node,
+            &mut input.methods,
+            input.nested,
+        )?;
+        Ok(Some(source))
+    }
+
+    pub(crate) fn collect_class_render_input(
+        &mut self,
+        class_name: &str,
+        include_inner: bool,
+        observer: Arc<dyn crate::ir::AnalysisObserver>,
+        run_termination: bool,
+    ) -> Result<Option<ClassRenderInput>, DecompileError> {
+        observer.checkpoint()?;
         crate::profile_scope!("api.load_class", {
             if self.reader.get_class(class_name).is_none() {
                 self.reader.load_class(class_name)?;
@@ -915,7 +1122,6 @@ impl DecompilerContext {
         })?;
         observer.checkpoint()?;
 
-        // Collect class metadata and methods before mutating the decode cache.
         let Some((mut class_node, methods)): Option<(ClassNode, Vec<crate::frontend::MethodNode>)> =
             crate::profile_scope!("api.collect_class_methods", {
                 let class = match self.reader.get_class(class_name) {
@@ -939,21 +1145,17 @@ impl DecompilerContext {
             let mut method_models = Vec::new();
             for method in methods {
                 observer.checkpoint()?;
-                method_models.push(self.decode_class_method(class_name, method));
+                method_models.push(self.decode_class_method(class_name, method, !run_termination));
             }
             Ok::<_, DecompileError>(method_models)
         })?;
         observer.checkpoint()?;
 
-        // Discover and decompile inner classes nested under this one using
-        // frontend metadata recovered from Dalvik inner/enclosing annotations.
         let mut inner: Vec<NestedClassInput> = Vec::new();
         if include_inner {
             inner = crate::profile_scope!("api.collect_nested_class_inputs", {
-                self.collect_nested_class_inputs(&class_node)
+                self.collect_nested_class_inputs(&class_node, !run_termination)
             })?;
-            // Order inner classes deterministically: named classes before
-            // anonymous, then by descriptor.
             crate::profile_scope!("api.sort_nested_inputs", sort_nested_inputs(&mut inner));
         }
         observer.checkpoint()?;
@@ -979,41 +1181,246 @@ impl DecompilerContext {
             Ok::<(), DecompileError>(())
         })?;
         observer.checkpoint()?;
-        let mut termination_roots = method_models
-            .iter()
-            .filter_map(|method| method.cfg().cloned())
-            .collect::<Vec<_>>();
-        collect_nested_cfgs(&inner, &mut termination_roots);
-        self.set_kotlin_contract_roots(contract_roots(termination_roots.iter()));
-        let termination = crate::profile_scope!("api.method_termination", {
-            self.method_termination(termination_roots, observer.as_ref())
-        })?;
-        for method in &mut method_models {
-            if let Some(cfg) = method.cfg_mut() {
-                termination.apply(cfg);
+        if run_termination {
+            let mut termination_roots = method_models
+                .iter()
+                .filter_map(|method| method.cfg().cloned())
+                .collect::<Vec<_>>();
+            collect_nested_cfgs(&inner, &mut termination_roots);
+            self.set_kotlin_contract_roots(contract_roots(termination_roots.iter()));
+            let termination = crate::profile_scope!("api.method_termination", {
+                self.method_termination(termination_roots, observer.as_ref())
+            })?;
+            for method in &mut method_models {
+                if let Some(cfg) = method.cfg_mut() {
+                    termination.apply(cfg);
+                }
             }
+            apply_nested_termination(&termination, &mut inner);
         }
-        apply_nested_termination(&termination, &mut inner);
-        self.prepare_source_backend::<B>()?;
-        observer.checkpoint()?;
         if let Some(current) = self.reader.get_class(class_name) {
             class_node = current.clone();
         }
         Self::refresh_method_nodes(&self.reader, class_name, &mut method_models);
         Self::refresh_nested_class_nodes(&self.reader, &mut inner);
-        let hierarchy =
-            crate::profile_scope!("api.source_context.hierarchy", { self.type_hierarchy() })?;
-        observer.checkpoint()?;
-        let source = B::generate_class(
-            self,
-            config,
-            observer,
-            hierarchy,
-            &class_node,
-            &mut method_models,
-            inner,
-        )?;
-        Ok(Some(source))
+        Ok(Some(ClassRenderInput {
+            class_node,
+            methods: method_models,
+            nested: inner,
+        }))
+    }
+
+    pub(crate) fn prepare_archive_overrides(&mut self) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.prepare_archive_overrides", {
+            self.reader.ensure_override_analysis()?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn prepare_archive_source_abi_before_termination(
+        &mut self,
+        prepare_java: bool,
+        prepare_kotlin: bool,
+    ) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.prepare_archive_source_abi_before_termination", {
+            let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+            if prepare_kotlin {
+                let roots = self
+                    .method_irs
+                    .values()
+                    .flat_map(|methods| methods.values())
+                    .collect::<Vec<_>>();
+                self.set_kotlin_contract_roots(contract_roots(roots.into_iter()));
+            }
+            if prepare_java {
+                let started = std::time::Instant::now();
+                self.prepare_java_source_abi_with_cached_resolution(true)?;
+                if stats {
+                    eprintln!(
+                        "dexdec batch: java_abi={:.0}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn prepare_archive_source_abi_after_termination(
+        &mut self,
+        prepare_kotlin: bool,
+    ) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.prepare_archive_source_abi_after_termination", {
+            let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+            if prepare_kotlin {
+                let started = std::time::Instant::now();
+                self.prepare_kotlin_source_abi_from_archive_cfgs()?;
+                if stats {
+                    eprintln!(
+                        "dexdec batch: kotlin_abi={:.0}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            crate::profile_scope!(
+                "api.resolve_archive_method_symbols",
+                self.resolve_archive_method_symbols()
+            )?;
+            let started = std::time::Instant::now();
+            self.type_hierarchy()?;
+            if stats {
+                eprintln!(
+                    "dexdec batch: hierarchy={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_kotlin_source_abi_from_archive_cfgs(
+        &mut self,
+    ) -> Result<Arc<KotlinSourceAbi>, DecompileError> {
+        let revision = self.reader.loaded_classes_revision();
+        if let Some((cached_revision, source_abi)) = &self.kotlin_source_abi_cache {
+            if *cached_revision == revision {
+                return Ok(Arc::clone(source_abi));
+            }
+        }
+        let source_abi = {
+            let reader = &self.reader;
+            Arc::new(KotlinSourceAbi::analyze_with_preterminated_cfgs(
+                reader.classes(),
+                &self.kotlin_contract_roots,
+                self.method_irs
+                    .values()
+                    .flat_map(|methods| methods.values()),
+                |class, method_index| {
+                    let dex_index = reader.get_dex_index(class.type_descriptor())?;
+                    reader
+                        .get_method(dex_index, method_index)?
+                        .to_string()
+                        .parse()
+                        .ok()
+                },
+                |class, field_index| {
+                    let dex_index = reader.get_dex_index(class.type_descriptor())?;
+                    reader
+                        .get_field(dex_index, field_index)?
+                        .to_string()
+                        .parse()
+                        .ok()
+                },
+            ))
+        };
+        let dependencies = source_abi
+            .analysis_dependencies()
+            .map(ArgType::to_descriptor)
+            .collect::<Vec<_>>();
+        let before = self.reader.loaded_classes_revision();
+        for owner in dependencies {
+            self.reader.load_class(&owner)?;
+        }
+        if self.reader.loaded_classes_revision() != before {
+            // The decoded archive set no longer covers every loaded class.
+            // Fall back to the standalone path, which decodes the expanded
+            // graph and preserves the interactive/subset behavior exactly.
+            return self.kotlin_source_abi();
+        }
+        let revision = self.reader.loaded_classes_revision();
+        self.kotlin_source_abi_cache = Some((revision, Arc::clone(&source_abi)));
+        Ok(source_abi)
+    }
+
+    fn resolve_archive_method_symbols(&mut self) -> Result<(), DecompileError> {
+        let reader = &self.reader;
+        self.method_irs
+            .par_iter_mut()
+            .try_for_each(|(class_name, methods)| -> DexResult<()> {
+                let dex_idx = reader.get_dex_index(class_name).ok_or_else(|| {
+                    crate::frontend::DexError::MissingDexForClass(class_name.clone())
+                })?;
+                for cfg in methods.values_mut() {
+                    Self::resolve_symbols_with(reader, cfg, dex_idx)?;
+                }
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn prefetch_decoded_methods(&mut self) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.prefetch_decoded_methods", {
+            self.sync_method_cache_revision();
+
+            let mut specs = Vec::new();
+            for class in self.reader.classes() {
+                let class_name = class.type_descriptor();
+                let Some(dex_idx) = self.reader.get_dex_index(class_name) else {
+                    continue;
+                };
+                for method in class.methods() {
+                    let Some(code) = method.code() else {
+                        continue;
+                    };
+                    let descriptor = method.info.descriptor();
+                    let cache_key = format!("{}{}", method.info.name, descriptor);
+                    if self
+                        .method_irs
+                        .get(class_name)
+                        .is_some_and(|methods| methods.contains_key(&cache_key))
+                    {
+                        continue;
+                    }
+                    specs.push(MethodDecodeSpec {
+                        class_name,
+                        cache_key,
+                        method_name: &method.info.name,
+                        method_code: code,
+                        owner: class.class_type(),
+                        param_types: &method.info.param_types,
+                        return_type: &method.info.return_type,
+                        is_static: method.access_flags.is_static(),
+                        declared_synchronized: method.access_flags.is_declared_synchronized(),
+                        dex_idx,
+                    });
+                }
+            }
+
+            let reader = &self.reader;
+            let decoded = specs
+                .into_par_iter()
+                .map(|spec| spec.decode(reader))
+                .collect::<Vec<_>>();
+            for result in decoded {
+                if let Ok((class_name, cache_key, ir)) = result {
+                    self.method_irs
+                        .entry(class_name)
+                        .or_default()
+                        .insert(cache_key, ir);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn apply_archive_termination(&mut self) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.archive_termination", {
+            let termination = crate::ir::analysis::MethodTermination::analyze(
+                self.method_irs
+                    .values()
+                    .flat_map(|methods| methods.values()),
+            );
+            // Each CFG mutates independently, so the application order cannot
+            // matter.
+            self.method_irs
+                .values_mut()
+                .flat_map(|methods| methods.values_mut())
+                .par_bridge()
+                .for_each(|cfg| {
+                    termination.apply(cfg);
+                });
+            Ok(())
+        })
     }
 
     /// Recovers exact calls that cannot complete normally without decoding the
@@ -1139,6 +1546,7 @@ impl DecompilerContext {
         &mut self,
         class_name: &str,
         method: crate::frontend::MethodNode,
+        take: bool,
     ) -> ClassMethodInput {
         let method_name = method.info.name.clone();
         let descriptor = method.info.descriptor();
@@ -1149,11 +1557,20 @@ impl DecompilerContext {
             );
         }
         let cache_key = format!("{}{}", method_name, descriptor);
-        match self
-            .method_irs
-            .get_mut(class_name)
-            .and_then(|class_cache| class_cache.remove(&cache_key))
-        {
+        let cfg = if take {
+            self.method_irs
+                .get_mut(class_name)
+                .and_then(|class_cache| class_cache.remove(&cache_key))
+        } else {
+            self.method_irs
+                .get(class_name)
+                .and_then(|class_cache| class_cache.get(&cache_key).cloned())
+        };
+        match cfg.or_else(|| {
+            self.method_irs
+                .get(class_name)
+                .and_then(|class_cache| class_cache.get(&cache_key).cloned())
+        }) {
             Some(cfg) => ClassMethodInput::decoded(method, cfg),
             None => ClassMethodInput::failed(
                 method,
@@ -1181,7 +1598,7 @@ impl DecompilerContext {
             .filter(|method| method.code().is_some())
             .cloned()
         {
-            methods.push(self.decode_class_method(class_name, method));
+            methods.push(self.decode_class_method(class_name, method, false));
         }
         Ok(NestedClassInput {
             class,
@@ -1193,6 +1610,7 @@ impl DecompilerContext {
     fn collect_nested_class_inputs(
         &mut self,
         outer: &ClassNode,
+        take: bool,
     ) -> Result<Vec<NestedClassInput>, DecompileError> {
         let root_names = outer
             .inner_class_names()
@@ -1230,7 +1648,7 @@ impl DecompilerContext {
                         .filter(|method| method.code().is_some())
                         .cloned()
                     {
-                        methods.push(self.decode_class_method(&class_name, method));
+                        methods.push(self.decode_class_method(&class_name, method, take));
                     }
                     let child_names = class_node
                         .inner_class_names()
@@ -1300,10 +1718,12 @@ fn exact_call_targets(cfg: &CFG) -> impl Iterator<Item = MethodReference> + '_ {
                     Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                 )
         })
-        .filter_map(|instruction| match instruction.payload.reference.as_ref() {
-            Some(MemberReference::Method(method)) => Some(method.clone()),
-            _ => None,
-        })
+        .filter_map(
+            |instruction| match instruction.payload.reference.as_deref() {
+                Some(MemberReference::Method(method)) => Some(method.clone()),
+                _ => None,
+            },
+        )
 }
 
 fn contract_roots<'a>(
@@ -1316,10 +1736,12 @@ fn contract_roots<'a>(
             cfg.blocks
                 .values()
                 .flat_map(|block| &block.insns)
-                .filter_map(|instruction| match instruction.payload.reference.as_ref() {
-                    Some(MemberReference::Method(method)) => Some(method.clone()),
-                    _ => None,
-                }),
+                .filter_map(
+                    |instruction| match instruction.payload.reference.as_deref() {
+                        Some(MemberReference::Method(method)) => Some(method.clone()),
+                        _ => None,
+                    },
+                ),
         );
     }
     roots
@@ -1368,7 +1790,7 @@ impl SourceAbiClosure {
             .into_iter()
             .flat_map(|cfg| cfg.blocks.values())
             .flat_map(|block| &block.insns)
-            .filter_map(|instruction| instruction.payload.reference.as_ref())
+            .filter_map(|instruction| instruction.payload.reference.as_deref())
         {
             match reference {
                 MemberReference::Field(field) => {
@@ -1642,6 +2064,42 @@ fn apply_field_type(insn: &mut InsnNode, field: &FieldReference) {
             }
         }
         _ => {}
+    }
+}
+
+struct MethodDecodeSpec<'a> {
+    class_name: &'a str,
+    cache_key: String,
+    method_name: &'a str,
+    method_code: &'a MethodCode,
+    owner: &'a ArgType,
+    param_types: &'a [ArgType],
+    return_type: &'a ArgType,
+    is_static: bool,
+    declared_synchronized: bool,
+    dex_idx: usize,
+}
+
+impl MethodDecodeSpec<'_> {
+    fn decode(
+        self,
+        reader: &DexFileReader,
+    ) -> Result<(String, String, CFG), crate::frontend::DexError> {
+        let mut ir = DecompilerContext::decode_method_code(self.method_code)?;
+        ir.set_method(
+            MethodContext::new(
+                self.owner.clone(),
+                self.method_name.to_string(),
+                MethodDescriptor {
+                    parameters: self.param_types.to_vec(),
+                    return_type: self.return_type.clone(),
+                },
+                self.is_static,
+            )
+            .with_declared_synchronization(self.declared_synchronized),
+        );
+        DecompilerContext::resolve_member_references_with(reader, &mut ir, self.dex_idx)?;
+        Ok((self.class_name.to_string(), self.cache_key, ir))
     }
 }
 

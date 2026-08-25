@@ -21,7 +21,7 @@ impl ThrowEffect {
                 instruction
                     .args
                     .iter()
-                    .chain(instruction.payload.compound_target.iter())
+                    .chain(instruction.payload.compound_target.as_deref().into_iter())
                     .filter_map(|argument| match argument {
                         InsnArg::Wrapped(child) => Some(child.as_ref()),
                         InsnArg::Reg(_) | InsnArg::Lit(_) => None,
@@ -180,7 +180,7 @@ impl InstructionEffects {
                 instruction
                     .args
                     .iter()
-                    .chain(instruction.payload.compound_target.iter())
+                    .chain(instruction.payload.compound_target.as_deref().into_iter())
                     .filter_map(|argument| match argument {
                         InsnArg::Wrapped(child) => Some(child.as_ref()),
                         InsnArg::Reg(_) | InsnArg::Lit(_) => None,
@@ -255,7 +255,7 @@ impl InstructionEffects {
         {
             return false;
         }
-        let Some(MemberReference::Method(method)) = instruction.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = instruction.payload.reference.as_deref() else {
             return false;
         };
         method.owner == ArgType::object("kotlin/jvm/internal/InlineMarker")
@@ -310,7 +310,7 @@ struct IntrinsicMethodEffects;
 
 impl IntrinsicMethodEffects {
     fn resolve(instruction: &InsnNode) -> Option<InstructionEffects> {
-        let MemberReference::Method(method) = instruction.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = instruction.payload.reference.as_deref()? else {
             return None;
         };
         Self::floating_predicate(method).then_some(InstructionEffects::PURE)

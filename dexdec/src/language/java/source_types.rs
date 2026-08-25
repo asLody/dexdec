@@ -16,6 +16,68 @@ use crate::ir::{
 
 use super::{JavaClassType, JavaClassTypeSegment, JavaIdentifier, JavaType, JavaTypeArgument};
 
+/// Function-object identities visible to Java body lowering.
+///
+/// A miss is treated as "not a function object" at runtime. `identities` is the
+/// expected FO set for this crop (CU types ∩ ABI FOs, plus local catalog keys),
+/// not every function object in the archive. Debug builds panic when a miss is
+/// in that expected set so tests cannot silently drop a resolved lambda.
+/// Release builds compile the assertion out and still return `None`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceObjectTypes {
+    types: BTreeMap<ArgType, JavaType>,
+    identities: Arc<BTreeSet<ArgType>>,
+}
+
+impl SourceObjectTypes {
+    pub(crate) fn new(
+        types: BTreeMap<ArgType, JavaType>,
+        identities: Arc<BTreeSet<ArgType>>,
+    ) -> Self {
+        Self { types, identities }
+    }
+
+    pub(crate) fn checked(
+        types: BTreeMap<ArgType, JavaType>,
+        identities: Arc<BTreeSet<ArgType>>,
+    ) -> Self {
+        debug_assert!(
+            identities.iter().all(|ty| types.contains_key(ty)),
+            "source_object_types omitted expected function object {:?}",
+            identities.iter().find(|ty| !types.contains_key(*ty))
+        );
+        Self::new(types, identities)
+    }
+
+    pub(crate) fn get(&self, ty: &ArgType) -> Option<&JavaType> {
+        if let Some(resolved) = self.types.get(ty) {
+            return Some(resolved);
+        }
+        debug_assert!(
+            !self.identities.contains(ty),
+            "source_object_types miss for function object {ty:?}"
+        );
+        None
+    }
+
+    pub(crate) fn contains_key(&self, ty: &ArgType) -> bool {
+        self.get(ty).is_some()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ArgType, &JavaType)> {
+        self.types.iter()
+    }
+}
+
+impl From<BTreeMap<ArgType, JavaType>> for SourceObjectTypes {
+    fn from(types: BTreeMap<ArgType, JavaType>) -> Self {
+        Self {
+            types,
+            identities: Arc::new(BTreeSet::new()),
+        }
+    }
+}
+
 pub(super) fn invocation_expression_signature<'a>(
     operation: &SemanticOperation,
     contract: &'a GenericMethodContract,
@@ -45,7 +107,7 @@ fn owner_type_parameter_name(argument: &TypeArgument) -> Option<&str> {
     }
 }
 
-pub(crate) trait GenericTypeProjection: std::fmt::Debug + Send + Sync {
+pub(crate) trait GenericTypeProjection: std::fmt::Debug {
     fn specialize_subtype(
         &self,
         subtype: &ArgType,
@@ -96,19 +158,49 @@ pub(crate) trait GenericTypeProjection: std::fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug, Clone, Default)]
-struct JavaTypeErasureIndex {
-    erasures: HashMap<JavaType, ArgType>,
+pub(super) struct JavaTypeErasureIndex {
+    classes: HashMap<String, ArgType>,
+    primitives: HashMap<JavaType, ArgType>,
 }
 
 impl JavaTypeErasureIndex {
-    fn from_source_types(source_types: &BTreeMap<ArgType, JavaType>) -> Self {
-        let mut erasures = HashMap::with_capacity(source_types.len());
+    pub(super) fn from_source_types(source_types: &BTreeMap<ArgType, JavaType>) -> Self {
+        let mut classes = HashMap::with_capacity(source_types.len());
+        let mut primitives = HashMap::new();
         for (erased, source) in source_types {
-            if let Some(key) = Self::direct_key(source) {
-                erasures.entry(key).or_insert_with(|| erased.clone());
+            match source {
+                JavaType::Class(class) => {
+                    classes
+                        .entry(Self::class_key(class))
+                        .or_insert_with(|| erased.clone());
+                }
+                JavaType::Primitive(_) => {
+                    primitives
+                        .entry(source.clone())
+                        .or_insert_with(|| erased.clone());
+                }
+                JavaType::Array(_) | JavaType::Variable(_) => {}
             }
         }
-        Self { erasures }
+        Self {
+            classes,
+            primitives,
+        }
+    }
+
+    fn class_key(class: &JavaClassType) -> String {
+        let mut key = String::new();
+        for (index, segment) in class.segments.iter().enumerate() {
+            if index > 0 {
+                key.push('/');
+            }
+            key.push_str(segment.name.as_str());
+        }
+        key
+    }
+
+    fn class_erasure(&self, class: &JavaClassType) -> Option<ArgType> {
+        self.classes.get(&Self::class_key(class)).cloned()
     }
 
     fn erasure_of(
@@ -124,26 +216,8 @@ impl JavaTypeErasureIndex {
                 .get(variable)
                 .cloned()
                 .or_else(|| Some(ArgType::object("java/lang/Object"))),
-            JavaType::Class(_) | JavaType::Primitive(_) => {
-                self.erasures.get(&Self::direct_key(ty)?).cloned()
-            }
-        }
-    }
-
-    fn direct_key(ty: &JavaType) -> Option<JavaType> {
-        match ty {
-            JavaType::Class(class) => Some(JavaType::Class(JavaClassType {
-                segments: class
-                    .segments
-                    .iter()
-                    .map(|segment| JavaClassTypeSegment {
-                        name: segment.name.clone(),
-                        arguments: Vec::new(),
-                    })
-                    .collect(),
-            })),
-            JavaType::Primitive(_) => Some(ty.clone()),
-            JavaType::Variable(_) | JavaType::Array(_) => None,
+            JavaType::Class(class) => self.class_erasure(class),
+            JavaType::Primitive(_) => self.primitives.get(ty).cloned(),
         }
     }
 }
@@ -151,7 +225,7 @@ impl JavaTypeErasureIndex {
 pub(super) struct JavaTypeRelations<'a> {
     source_types: &'a BTreeMap<ArgType, JavaType>,
     source_erasures: Option<&'a JavaTypeErasureIndex>,
-    direct_supertypes: Option<&'a BTreeMap<ArgType, JavaType>>,
+    direct_supertypes: Option<&'a SourceObjectTypes>,
     variable_erasures: &'a BTreeMap<JavaIdentifier, ArgType>,
     variable_bounds: Option<&'a BTreeMap<JavaIdentifier, JavaType>>,
     hierarchy: Option<&'a dyn GenericTypeProjection>,
@@ -174,14 +248,14 @@ impl<'a> JavaTypeRelations<'a> {
         }
     }
 
-    fn with_erasure_index(mut self, index: Option<&'a JavaTypeErasureIndex>) -> Self {
+    pub(super) fn with_erasure_index(mut self, index: Option<&'a JavaTypeErasureIndex>) -> Self {
         self.source_erasures = index;
         self
     }
 
     pub(super) fn with_direct_supertypes(
         mut self,
-        supertypes: Option<&'a BTreeMap<ArgType, JavaType>>,
+        supertypes: Option<&'a SourceObjectTypes>,
     ) -> Self {
         self.direct_supertypes = supertypes;
         self
@@ -205,12 +279,7 @@ impl<'a> JavaTypeRelations<'a> {
         match ty {
             JavaType::Array(element) => Some(ArgType::array(self.erasure_of(element)?)),
             JavaType::Class(class) => self
-                .source_types
-                .iter()
-                .find_map(|(erased, source)| {
-                    matches!(source, JavaType::Class(source) if source.name() == class.name())
-                        .then(|| erased.clone())
-                })
+                .class_erasure(class)
                 .or_else(|| {
                     self.hierarchy
                         .and_then(|hierarchy| hierarchy.erasure_of(ty))
@@ -221,11 +290,35 @@ impl<'a> JavaTypeRelations<'a> {
                 .get(variable)
                 .cloned()
                 .or_else(|| Some(ArgType::object("java/lang/Object"))),
-            JavaType::Primitive(_) => self
-                .source_types
-                .iter()
-                .find_map(|(erased, source)| (source == ty).then(|| erased.clone())),
+            JavaType::Primitive(_) => {
+                if self.source_erasures.is_some() {
+                    None
+                } else {
+                    self.source_types
+                        .iter()
+                        .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
+                }
+            }
         }
+    }
+
+    fn class_erasure(&self, class: &JavaClassType) -> Option<ArgType> {
+        if let Some(index) = self.source_erasures {
+            return index.class_erasure(class);
+        }
+        self.source_types.iter().find_map(|(erased, source)| {
+            matches!(source, JavaType::Class(source) if Self::same_class_name(source, class))
+                .then(|| erased.clone())
+        })
+    }
+
+    fn erased_class(&self, class: &JavaClassType) -> Option<ArgType> {
+        self.class_erasure(class)
+            .or_else(|| {
+                self.hierarchy
+                    .and_then(|hierarchy| hierarchy.erasure_of(&JavaType::Class(class.clone())))
+            })
+            .or_else(|| Self::synthesized_class_erasure(class))
     }
 
     /// Recover a DEX binary name for a raw class that never entered `source_types`.
@@ -306,49 +399,51 @@ impl<'a> JavaTypeRelations<'a> {
         source: &super::JavaClassType,
         target: &super::JavaClassType,
     ) -> bool {
-        let source = JavaType::Class(source.clone());
-        let target = JavaType::Class(target.clone());
-        if self.erasure_of(&target) == Some(ArgType::object("java/lang/Object")) {
+        let target_erasure = self.erased_class(target);
+        if target_erasure
+            .as_ref()
+            .is_some_and(|ty| ty.as_object() == Some("java/lang/Object"))
+        {
             return true;
         }
-        if let Some(supertype) = self
-            .erasure_of(&source)
-            .and_then(|source| self.direct_supertypes?.get(&source))
-            .filter(|supertype| *supertype != &source)
+        let source_erasure = self.erased_class(source);
+        if let Some(supertype) = source_erasure
+            .as_ref()
+            .and_then(|erased| self.direct_supertypes?.get(erased))
         {
-            if self.is_assignable(supertype, &target) {
+            if !matches!(supertype, JavaType::Class(class) if class == source)
+                && self.class_assignable_from_supertype(supertype, target)
+            {
                 return true;
             }
         }
-        let erased_subtype = self
-            .erasure_of(&source)
-            .zip(self.erasure_of(&target))
+        let erased_subtype = source_erasure
+            .as_ref()
+            .zip(target_erasure.as_ref())
             .is_some_and(|(source, target)| {
                 self.hierarchy
-                    .is_some_and(|hierarchy| hierarchy.is_subtype(&source, &target))
+                    .is_some_and(|hierarchy| hierarchy.is_subtype(source, target))
             });
-        if erased_subtype && Self::is_reifiable_class(&target) {
+        if erased_subtype && Self::class_is_reifiable(target) {
             return true;
         }
-        let comparable = if Self::same_erasure(&source, &target) {
+        let projected;
+        let source = if Self::same_class_name(source, target) {
             source
         } else {
-            let Some(target_erasure) = self.erasure_of(&target) else {
+            let Some(target_erasure) = target_erasure.as_ref() else {
                 return false;
             };
-            let Some(projected) = self
-                .hierarchy
-                .and_then(|hierarchy| hierarchy.project_supertype(&source, &target_erasure))
-            else {
+            let Some(value) = self.hierarchy.and_then(|hierarchy| {
+                hierarchy.project_supertype(&JavaType::Class(source.clone()), target_erasure)
+            }) else {
+                return false;
+            };
+            projected = value;
+            let JavaType::Class(projected) = &projected else {
                 return false;
             };
             projected
-        };
-        let JavaType::Class(source) = comparable else {
-            return false;
-        };
-        let JavaType::Class(target) = target else {
-            unreachable!();
         };
         source.segments.len() == target.segments.len()
             && source
@@ -359,6 +454,17 @@ impl<'a> JavaTypeRelations<'a> {
                     source.name == target.name
                         && self.arguments_are_assignable(&source.arguments, &target.arguments)
                 })
+    }
+
+    fn class_assignable_from_supertype(
+        &self,
+        supertype: &JavaType,
+        target: &super::JavaClassType,
+    ) -> bool {
+        match supertype {
+            JavaType::Class(source) => self.class_is_assignable(source, target),
+            _ => self.is_assignable(supertype, &JavaType::Class(target.clone())),
+        }
     }
 
     fn arguments_are_assignable(
@@ -397,27 +503,27 @@ impl<'a> JavaTypeRelations<'a> {
         }
     }
 
-    fn same_erasure(left: &JavaType, right: &JavaType) -> bool {
-        match (left, right) {
-            (JavaType::Class(left), JavaType::Class(right)) => left.name() == right.name(),
-            (JavaType::Array(left), JavaType::Array(right)) => Self::same_erasure(left, right),
-            (JavaType::Primitive(left), JavaType::Primitive(right)) => left == right,
-            _ => left == right,
-        }
+    fn same_class_name(left: &super::JavaClassType, right: &super::JavaClassType) -> bool {
+        left.segments.len() == right.segments.len()
+            && left
+                .segments
+                .iter()
+                .zip(&right.segments)
+                .all(|(left, right)| left.name == right.name)
     }
 
     fn is_raw(ty: &JavaType) -> bool {
         matches!(ty, JavaType::Class(class) if class.segments.iter().all(|segment| segment.arguments.is_empty()))
     }
 
-    fn is_reifiable_class(ty: &JavaType) -> bool {
-        matches!(ty, JavaType::Class(class) if class.segments.iter().all(|segment| {
+    fn class_is_reifiable(class: &super::JavaClassType) -> bool {
+        class.segments.iter().all(|segment| {
             segment.arguments.is_empty()
                 || segment
                     .arguments
                     .iter()
                     .all(|argument| matches!(argument, JavaTypeArgument::Any))
-        }))
+        })
     }
 
     fn is_array_supertype(ty: &ArgType) -> bool {
@@ -525,7 +631,7 @@ impl<'a> GenericTypeSolver<'a> {
         }
     }
 
-    fn with_erasure_index(mut self, index: Option<Arc<JavaTypeErasureIndex>>) -> Self {
+    pub(super) fn with_erasure_index(mut self, index: Option<Arc<JavaTypeErasureIndex>>) -> Self {
         self.source_erasures = index;
         self
     }
@@ -2513,7 +2619,7 @@ impl SourceTypeFacts {
 pub(super) struct SourceTypeFlow<'a> {
     fields: &'a BTreeMap<FieldReference, JavaType>,
     generic_fields: &'a BTreeMap<FieldReference, GenericFieldContract>,
-    object_types: &'a BTreeMap<ArgType, JavaType>,
+    object_types: &'a SourceObjectTypes,
     generic_methods: &'a BTreeMap<MethodReference, GenericMethodContract>,
     generic_projection: Option<&'a dyn GenericTypeProjection>,
     source_types: &'a BTreeMap<ArgType, JavaType>,
@@ -2559,7 +2665,7 @@ impl<'a> SourceTypeFlow<'a> {
         root: &crate::ir::SemanticNode,
         fields: &'a BTreeMap<FieldReference, JavaType>,
         generic_fields: &'a BTreeMap<FieldReference, GenericFieldContract>,
-        object_types: &'a BTreeMap<ArgType, JavaType>,
+        object_types: &'a SourceObjectTypes,
         generic_methods: &'a BTreeMap<MethodReference, GenericMethodContract>,
         generic_projection: Option<&'a dyn GenericTypeProjection>,
         source_types: &'a BTreeMap<ArgType, JavaType>,
@@ -2638,10 +2744,12 @@ impl<'a> SourceTypeFlow<'a> {
         } else {
             Vec::new()
         };
-        let definition_variables =
-            Self::retained_states(flow.definition_states.clone(), &flow.contextual_variables);
+        let definition_variables = Self::retained_states(
+            std::mem::take(&mut flow.definition_states),
+            &flow.contextual_variables,
+        );
         let definition_values = Self::retained_states(
-            flow.value_definition_states.clone(),
+            std::mem::take(&mut flow.value_definition_states),
             &flow.contextual_values,
         );
         let requirements = Self::preferred_requirement_states(
@@ -2709,7 +2817,8 @@ impl<'a> SourceTypeFlow<'a> {
         self.invocations
             .iter()
             .filter_map(|operation| {
-                let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+                let MemberReference::Method(method) = operation.payload.reference.as_deref()?
+                else {
                     return None;
                 };
                 let Some((mut solver, _, contract)) = self.invocation_solver(operation) else {
@@ -2856,8 +2965,16 @@ impl<'a> SourceTypeFlow<'a> {
         self.definition_states = self.states.clone();
         self.constrain_runtime_type_tests();
 
+        // Element equations are structural: their variable/iterable pair is
+        // fixed once collected, so extract it once here instead of
+        // deep-cloning every expression on every convergence round.
+        let elements = self
+            .elements
+            .iter()
+            .map(|equation| (equation.variable.clone(), equation.iterable.clone()))
+            .collect::<Vec<_>>();
         loop {
-            self.converge_facts();
+            self.converge_facts(&elements);
             let replacements = self.apply_requirements();
             let value_replacements = self.apply_value_requirements();
             if replacements.is_empty() && value_replacements.is_empty() {
@@ -2979,22 +3096,21 @@ impl<'a> SourceTypeFlow<'a> {
             || self.erased_reference_result_fits(equation, requirement)
     }
 
-    fn converge_facts(&mut self) {
+    fn converge_facts(&mut self, elements: &[(RegisterArg, SemanticExpression)]) {
         loop {
             let mut changed = self.converge_equations();
-            for index in 0..self.elements.len() {
-                let equation = self.elements[index].clone();
-                if let Some(element) = self.iterable_element_type(&equation.iterable) {
-                    changed |= self.constrain_register(&equation.variable, element);
+            for (variable, iterable) in elements {
+                if let Some(element) = self.iterable_element_type(iterable) {
+                    changed |= self.constrain_register(variable, element);
                 }
                 let element = self
-                    .register_type(&equation.variable)
+                    .register_type(variable)
                     .cloned()
-                    .or_else(|| self.resolved_type(&equation.variable.ty));
-                if let Some(expected) = element
-                    .and_then(|element| self.iterable_context_type(&equation.iterable, element))
+                    .or_else(|| self.resolved_type(&variable.ty));
+                if let Some(expected) =
+                    element.and_then(|element| self.iterable_context_type(iterable, element))
                 {
-                    changed |= self.constrain_expression_context(&equation.iterable, expected);
+                    changed |= self.constrain_expression_context(iterable, expected);
                 }
             }
             for index in self.equation_graph.take_dirty_invocations() {
@@ -3569,15 +3685,14 @@ impl<'a> SourceTypeFlow<'a> {
             SemanticExpression::Operation(operation)
                 if operation.insn_type == InsnType::Constructor =>
             {
-                let Some(owner) =
-                    operation
-                        .payload
-                        .reference
-                        .as_ref()
-                        .and_then(|reference| match reference {
-                            MemberReference::Method(method) => Some(&method.owner),
-                            MemberReference::Field(_) => None,
-                        })
+                let Some(owner) = operation
+                    .payload
+                    .reference
+                    .as_deref()
+                    .and_then(|reference| match reference {
+                        MemberReference::Method(method) => Some(&method.owner),
+                        MemberReference::Field(_) => None,
+                    })
                 else {
                     return false;
                 };
@@ -3723,7 +3838,7 @@ impl<'a> SourceTypeFlow<'a> {
         let Some(target) = self.indexed_erased_type(target) else {
             return false;
         };
-        operation.payload.class_type.as_ref() == Some(&target)
+        operation.payload.class_type.as_deref() == Some(&target)
             || operation
                 .result
                 .as_ref()
@@ -3816,7 +3931,7 @@ impl<'a> SourceTypeFlow<'a> {
                 continue;
             };
             let target = match operation.insn_type {
-                InsnType::InstanceOf => operation.payload.class_type.as_ref(),
+                InsnType::InstanceOf => operation.payload.class_type.as_deref(),
                 InsnType::CheckCast => operation.conversion_type(),
                 _ => None,
             };
@@ -3932,15 +4047,12 @@ impl<'a> SourceTypeFlow<'a> {
                     .result
                     .as_ref()
                     .is_some_and(|result| result.ty == ArgType::BOOLEAN)
-                    || operation
-                        .payload
-                        .reference
-                        .as_ref()
-                        .and_then(|reference| match reference {
+                    || operation.payload.reference.as_deref().and_then(
+                        |reference| match reference {
                             MemberReference::Method(method) => Some(&method.descriptor.return_type),
                             MemberReference::Field(field) => Some(&field.field_type),
-                        })
-                        == Some(&ArgType::BOOLEAN)
+                        },
+                    ) == Some(&ArgType::BOOLEAN)
             }
             SemanticExpression::Register(register) => {
                 register.ty == ArgType::BOOLEAN
@@ -4388,7 +4500,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn constrain_invocation(&mut self, operation: &SemanticOperation) -> bool {
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let operand_receiver = Self::operand_receiver(operation);
@@ -4495,7 +4607,7 @@ impl<'a> SourceTypeFlow<'a> {
         if operation.payload.invoke_type == Some(crate::ir::InvokeType::Static) {
             return None;
         }
-        let method = match operation.payload.reference.as_ref()? {
+        let method = match operation.payload.reference.as_deref()? {
             MemberReference::Method(method) => method,
             MemberReference::Field(_) => return None,
         };
@@ -4523,7 +4635,7 @@ impl<'a> SourceTypeFlow<'a> {
         Vec<&'operation SemanticExpression>,
         &'a GenericMethodContract,
     )> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         let contract = self.generic_methods.get(method)?;
@@ -4685,7 +4797,7 @@ impl<'a> SourceTypeFlow<'a> {
                 })
             }
             SemanticExpression::Operation(operation) => {
-                let Some(reference) = operation.payload.reference.as_ref() else {
+                let Some(reference) = operation.payload.reference.as_deref() else {
                     return false;
                 };
                 match reference {
@@ -5315,7 +5427,7 @@ impl<'a> SourceTypeFlow<'a> {
                 operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => {
                             self.field_type(field, operation.operands().first())
@@ -5372,7 +5484,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn invocation_type(&self, operation: &SemanticOperation) -> Option<JavaType> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         let Some((mut solver, arguments, contract)) = self.invocation_solver(operation) else {
@@ -5468,7 +5580,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn constructor_type(&self, operation: &SemanticOperation) -> Option<JavaType> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         if let Some(allocation) = operation
@@ -5583,7 +5695,7 @@ impl<'a> SourceTypeFlow<'a> {
     }
 
     fn record_erased_generic_boundaries(&mut self, operation: &SemanticOperation) {
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return;
         };
         let Some(projection) = self.generic_projection else {
@@ -5694,7 +5806,7 @@ impl SemanticVisitor for SourceTypeFlow<'_> {
                     let field_type = operation
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .and_then(|reference| match reference {
                             MemberReference::Field(field) => Some((
                                 field,
@@ -5957,6 +6069,30 @@ mod tests {
     }
 
     #[test]
+    fn indexed_class_assignability_matches_linear_scan() {
+        let source_types = test_source_types();
+        let variables = BTreeMap::new();
+        let index = JavaTypeErasureIndex::from_source_types(&source_types);
+        let unindexed = JavaTypeRelations::new(&source_types, &variables, Some(&ParentProjection));
+        let indexed = JavaTypeRelations::new(&source_types, &variables, Some(&ParentProjection))
+            .with_erasure_index(Some(&index));
+        let child = class("example/Child", Vec::new());
+        let parent = class("example/Parent", vec![JavaTypeArgument::Any]);
+        let object = class("java/lang/Object", Vec::new());
+
+        assert_eq!(indexed.erasure_of(&child), unindexed.erasure_of(&child));
+        assert_eq!(indexed.erasure_of(&parent), unindexed.erasure_of(&parent));
+        assert_eq!(
+            indexed.is_assignable(&child, &object),
+            unindexed.is_assignable(&child, &object)
+        );
+        assert_eq!(
+            indexed.is_assignable(&child, &parent),
+            unindexed.is_assignable(&child, &parent)
+        );
+    }
+
+    #[test]
     fn erased_subtype_is_assignable_to_unbounded_generic_supertype() {
         let source_types = test_source_types();
         let variables = BTreeMap::new();
@@ -5993,7 +6129,7 @@ mod tests {
                 class("java/util/function/Function", Vec::new()),
             ),
         ]);
-        let direct_supertypes = BTreeMap::from([(
+        let direct_supertypes = SourceObjectTypes::from(BTreeMap::from([(
             ArgType::object("example/SyntheticFunction"),
             class(
                 "java/util/function/Function",
@@ -6002,7 +6138,7 @@ mod tests {
                     JavaTypeArgument::Exact(class("java/lang/String", Vec::new())),
                 ],
             ),
-        )]);
+        )]));
         let variables = BTreeMap::new();
         let relations = JavaTypeRelations::new(&source_types, &variables, None)
             .with_direct_supertypes(Some(&direct_supertypes));
@@ -6709,5 +6845,48 @@ mod tests {
             solver.owner_type(&stream_owner),
             Some(class("java/util/stream/Stream", Vec::new()))
         );
+    }
+
+    #[test]
+    fn source_object_types_miss_of_known_function_object_fails_in_debug() {
+        let identity = ArgType::object("example/Fn");
+        let types = SourceObjectTypes::new(
+            BTreeMap::new(),
+            Arc::new(BTreeSet::from([identity.clone()])),
+        );
+        if cfg!(debug_assertions) {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                types.contains_key(&identity)
+            }))
+            .is_err();
+            assert!(
+                panicked,
+                "cropped source_object_types must not silently treat a function object as missing"
+            );
+        } else {
+            assert!(!types.contains_key(&identity));
+        }
+        assert!(!types.contains_key(&ArgType::object("java/lang/Object")));
+    }
+
+    #[test]
+    fn source_object_types_get_returns_resolved_function_object() {
+        let identity = ArgType::object("example/Fn");
+        let interface = class("java/lang/Runnable", Vec::new());
+        let types = SourceObjectTypes::new(
+            BTreeMap::from([(identity.clone(), interface.clone())]),
+            Arc::new(BTreeSet::from([identity.clone()])),
+        );
+        assert_eq!(types.get(&identity), Some(&interface));
+        assert!(types.contains_key(&identity));
+    }
+
+    #[test]
+    fn source_object_types_miss_outside_expected_identities_is_non_fo() {
+        let types = SourceObjectTypes::new(
+            BTreeMap::new(),
+            Arc::new(BTreeSet::from([ArgType::object("example/Fn")])),
+        );
+        assert!(!types.contains_key(&ArgType::object("example/OtherFn")));
     }
 }

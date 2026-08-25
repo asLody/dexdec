@@ -141,6 +141,10 @@ impl DefinitionSet {
         }
     }
 
+    fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
     fn differs_under(&self, other: &Self, mask: &Self) -> bool {
         self.words
             .iter()
@@ -681,9 +685,10 @@ impl SemanticFlowGraph {
             queued[node] = true;
             pending.push_back(node);
         }
+        let mut delta = DefinitionSet::new(definition_count);
         while let Some(node) = pending.pop_front() {
             queued[node] = false;
-            let delta = std::mem::replace(&mut deltas[node], DefinitionSet::new(definition_count));
+            std::mem::swap(&mut delta, &mut deltas[node]);
             for successor in &successors[node] {
                 let first_reach = !reachable[*successor];
                 if first_reach {
@@ -705,6 +710,7 @@ impl SemanticFlowGraph {
                     pending.push_back(*successor);
                 }
             }
+            delta.clear();
         }
         let mut reaching = points
             .into_iter()
@@ -1870,6 +1876,39 @@ mod tests {
             sparse.reaches_any_between(points[0], points[5], &candidates),
             dense.reaches_any_between(points[0], points[5], &candidates)
         );
+    }
+
+    #[test]
+    fn reaching_values_propagate_across_revisited_cycle_nodes() {
+        let points = (0..4).map(point).collect::<Vec<_>>();
+        let mut graph = SemanticFlowGraph {
+            complete: true,
+            ..SemanticFlowGraph::default()
+        };
+        for (source, target) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 1)] {
+            graph
+                .successors
+                .entry(points[source])
+                .or_default()
+                .push(points[target]);
+            graph
+                .predecessors
+                .entry(points[target])
+                .or_default()
+                .push((points[source], SemanticFlowEdgeKind::Normal));
+        }
+        graph.entries.insert(points[0]);
+
+        let reaching = graph.reaching_values(
+            &[
+                SemanticValueDefinition::new(points[0], 0, 0),
+                SemanticValueDefinition::new(points[1], 0, 1),
+            ],
+            1,
+            &BTreeSet::from([points[3]]),
+        );
+
+        assert_eq!(reaching.at(0, points[3]), Some(vec![0, 1]));
     }
 }
 

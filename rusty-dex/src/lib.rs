@@ -3,7 +3,6 @@
 use error::DexError;
 
 use crate::dex::file::DexFile;
-use crate::dex::instructions::Instructions;
 use crate::dex::reader::DexReader;
 
 pub mod adler32;
@@ -39,7 +38,7 @@ pub fn get_bytecode_for_method(
     dex: &DexFile,
     class_name: &String,
     method_name: &String,
-) -> Option<Vec<Instructions>> {
+) -> Option<Vec<u16>> {
     if let Some(class_def) = dex.get_class_def(class_name) {
         if let Some(encoded_method) = class_def.get_encoded_method(method_name) {
             if let Some(code_item) = &encoded_method.code_item {

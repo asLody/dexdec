@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     analysis::SsaVar, IfOp, InsnType, RegisterArg, SemanticExpression, SemanticExpressionTransform,
-    SemanticFolder, SemanticInstructions, SemanticNode, SemanticOperation, SemanticPredicate,
+    SemanticInstructions, SemanticNode, SemanticOperation, SemanticPredicate,
     SemanticStatementKind,
 };
 
@@ -99,9 +99,58 @@ impl ValueSchedule {
     }
 
     pub(super) fn apply(mut self, root: &mut SemanticNode) -> Result<bool, ValueRecoveryError> {
-        let body = std::mem::replace(root, SemanticNode::Empty);
-        *root = self.fold_node(body)?;
+        self.apply_tree(root)?;
         Ok(self.changed)
+    }
+
+    fn apply_tree(&mut self, node: &mut SemanticNode) -> Result<(), ValueRecoveryError> {
+        match node {
+            SemanticNode::Empty | SemanticNode::BasicBlock(_) | SemanticNode::Leave(_) => {}
+            SemanticNode::Sequence(children) => {
+                for child in children {
+                    self.apply_tree(child)?;
+                }
+            }
+            SemanticNode::If {
+                then_node,
+                else_node,
+                ..
+            } => {
+                self.apply_tree(then_node.as_mut())?;
+                if let Some(else_node) = else_node {
+                    self.apply_tree(else_node.as_mut())?;
+                }
+            }
+            SemanticNode::Loop { test, body, .. } => {
+                self.apply_tree(test.setup.as_mut())?;
+                self.apply_tree(body.as_mut())?;
+            }
+            SemanticNode::For { body, .. } => self.apply_tree(body.as_mut())?,
+            SemanticNode::ForEach { body, .. } => self.apply_tree(body.as_mut())?,
+            SemanticNode::Switch { cases, .. } => {
+                for case in cases {
+                    self.apply_tree(&mut case.body)?;
+                }
+            }
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                self.apply_tree(body.as_mut())?;
+                for catch in catches {
+                    self.apply_tree(&mut catch.body)?;
+                }
+                if let Some(finally) = finally {
+                    self.apply_tree(finally.body.as_mut())?;
+                }
+            }
+            SemanticNode::Synchronized { body, .. } | SemanticNode::Label { body, .. } => {
+                self.apply_tree(body.as_mut())?;
+            }
+        }
+        self.apply_node(node)
     }
 
     fn canonicalize(&mut self) -> Result<(), ValueRecoveryError> {
@@ -184,16 +233,21 @@ impl ValueSchedule {
         Ok(())
     }
 
-    fn apply_node(&mut self, mut node: SemanticNode) -> Result<SemanticNode, ValueRecoveryError> {
-        let mut substitution = ValueSubstitution {
-            replacements: &self.replacements,
-            discarded_results: &self.discarded_results,
-            identity: self.identity,
-            changed: false,
-        };
-        SemanticInstructions::transform_node(&mut node, &mut substitution)?;
-        self.changed |= substitution.changed;
-        match &mut node {
+    fn apply_node(&mut self, node: &mut SemanticNode) -> Result<(), ValueRecoveryError> {
+        if !self.replacements.is_empty()
+            || !self.discarded_results.is_empty()
+            || SemanticExpressionReduction::node_contains_select(node)
+        {
+            let mut substitution = ValueSubstitution {
+                replacements: &self.replacements,
+                discarded_results: &self.discarded_results,
+                identity: self.identity,
+                changed: false,
+            };
+            SemanticInstructions::transform_node(node, &mut substitution)?;
+            self.changed |= substitution.changed;
+        }
+        match node {
             SemanticNode::BasicBlock(block) => {
                 for statement in &mut block.statements {
                     self.apply_statement_site(statement)?;
@@ -226,7 +280,7 @@ impl ValueSchedule {
             }
             _ => {}
         }
-        if let SemanticNode::Leave(leave) = &mut node {
+        if let SemanticNode::Leave(leave) = node {
             if let Some(replacements) = leave
                 .site
                 .and_then(|site| self.site_replacements.get(&UseSite::Leave(site)))
@@ -242,7 +296,7 @@ impl ValueSchedule {
                 }
             }
         }
-        if let SemanticNode::BasicBlock(block) = &mut node {
+        if let SemanticNode::BasicBlock(block) = node {
             let before = block.statements.len();
             block.statements.retain(|statement| {
                 if statement
@@ -258,7 +312,7 @@ impl ValueSchedule {
             });
             self.changed |= block.statements.len() != before;
         }
-        Ok(node)
+        Ok(())
     }
 
     fn apply_statement_site(
@@ -270,8 +324,14 @@ impl ValueSchedule {
         };
         match &mut statement.kind {
             SemanticStatementKind::Instruction(instruction) => {
+                let replacements = self.site_replacements.get(&UseSite::Statement(site));
+                if replacements.is_none()
+                    && !SemanticExpressionReduction::operation_contains_select(instruction)
+                {
+                    return Ok(());
+                }
                 let mut expression = SemanticExpression::Operation(Box::new(instruction.clone()));
-                if let Some(replacements) = self.site_replacements.get(&UseSite::Statement(site)) {
+                if let Some(replacements) = replacements {
                     let mut substitution = SiteSubstitution {
                         replacements,
                         identity: self.identity,
@@ -281,7 +341,11 @@ impl ValueSchedule {
                     self.changed |= substitution.changed;
                 }
                 let (expression, reduced) =
-                    SemanticExpressionReduction::new(self.identity).reduce(expression)?;
+                    if SemanticExpressionReduction::contains_select(&expression) {
+                        SemanticExpressionReduction::new(self.identity).reduce(expression)?
+                    } else {
+                        (expression, false)
+                    };
                 let SemanticExpression::Operation(operation) = expression else {
                     return Err(crate::ir::SemanticFoldError::NonOperationStatement.into());
                 };
@@ -289,7 +353,12 @@ impl ValueSchedule {
                 self.changed |= reduced;
             }
             SemanticStatementKind::Definition { value, .. } => {
-                self.apply_selected_value_sites(site, value)?;
+                if self.has_selected_value_replacements(site) {
+                    self.apply_selected_value_sites(site, value)?;
+                }
+                if !SemanticExpressionReduction::contains_select(value) {
+                    return Ok(());
+                }
                 let (reduced, changed) =
                     SemanticExpressionReduction::new(self.identity).reduce(value.clone())?;
                 *value = reduced;
@@ -297,6 +366,24 @@ impl ValueSchedule {
             }
         }
         Ok(())
+    }
+
+    fn has_selected_value_replacements(&self, site: crate::ir::SemanticSiteId) -> bool {
+        if self.site_replacements.is_empty() {
+            return false;
+        }
+        self.site_replacements
+            .range(UseSite::SelectedArgument(site, 0)..=UseSite::SelectedArgument(site, u32::MAX))
+            .next()
+            .is_some()
+            || self
+                .site_replacements
+                .range(
+                    UseSite::SelectedPredicate(site, 0)
+                        ..=UseSite::SelectedPredicate(site, u32::MAX),
+                )
+                .next()
+                .is_some()
     }
 
     fn apply_selected_value_sites(
@@ -403,6 +490,109 @@ struct SemanticExpressionReduction {
 impl SemanticExpressionReduction {
     fn new(identity: ValueIdentity) -> Self {
         Self { identity }
+    }
+
+    fn operation_contains_select(operation: &SemanticOperation) -> bool {
+        let mut pending = Vec::new();
+        for value in operation
+            .operands()
+            .iter()
+            .chain(operation.compound_target())
+        {
+            match value {
+                SemanticExpression::Select { .. } => return true,
+                SemanticExpression::Operation(operation) => pending.push(operation.as_ref()),
+                SemanticExpression::Register(_) | SemanticExpression::Literal(_) => {}
+            }
+        }
+        while let Some(operation) = pending.pop() {
+            for value in operation
+                .operands()
+                .iter()
+                .chain(operation.compound_target())
+            {
+                match value {
+                    SemanticExpression::Select { .. } => return true,
+                    SemanticExpression::Operation(operation) => pending.push(operation.as_ref()),
+                    SemanticExpression::Register(_) | SemanticExpression::Literal(_) => {}
+                }
+            }
+        }
+        false
+    }
+
+    fn contains_select(value: &SemanticExpression) -> bool {
+        match value {
+            SemanticExpression::Select { .. } => true,
+            SemanticExpression::Operation(operation) => Self::operation_contains_select(operation),
+            SemanticExpression::Register(_) | SemanticExpression::Literal(_) => false,
+        }
+    }
+
+    fn predicate_contains_select(predicate: &SemanticPredicate) -> bool {
+        let mut pending = Vec::new();
+        let mut current = predicate;
+        loop {
+            match current {
+                SemanticPredicate::Test(operation) => {
+                    if Self::operation_contains_select(operation) {
+                        return true;
+                    }
+                }
+                SemanticPredicate::Not(inner) => pending.push(inner.as_ref()),
+                SemanticPredicate::And(terms) | SemanticPredicate::Or(terms) => {
+                    pending.extend(terms);
+                }
+                SemanticPredicate::True | SemanticPredicate::False => {}
+            }
+            let Some(next) = pending.pop() else {
+                return false;
+            };
+            current = next;
+        }
+    }
+
+    fn statement_contains_select(statement: &crate::ir::SemanticStatement) -> bool {
+        match &statement.kind {
+            SemanticStatementKind::Instruction(operation) => {
+                Self::operation_contains_select(operation)
+            }
+            SemanticStatementKind::Definition { value, .. } => Self::contains_select(value),
+        }
+    }
+
+    fn node_contains_select(node: &SemanticNode) -> bool {
+        match node {
+            SemanticNode::BasicBlock(block) => {
+                block.statements.iter().any(Self::statement_contains_select)
+            }
+            SemanticNode::If { condition, .. } => Self::predicate_contains_select(condition),
+            SemanticNode::Loop { test, .. } => Self::predicate_contains_select(&test.condition),
+            SemanticNode::For {
+                init,
+                condition,
+                update,
+                ..
+            } => {
+                Self::statement_contains_select(init)
+                    || Self::predicate_contains_select(condition)
+                    || Self::statement_contains_select(update)
+            }
+            SemanticNode::ForEach { iterable, .. } => Self::contains_select(iterable),
+            SemanticNode::Switch { selector, .. } => Self::contains_select(selector),
+            SemanticNode::Synchronized { lock, .. } => Self::contains_select(lock),
+            SemanticNode::Leave(leave) => {
+                leave
+                    .condition
+                    .as_ref()
+                    .is_some_and(Self::predicate_contains_select)
+                    || leave.value().is_some_and(Self::contains_select)
+            }
+            SemanticNode::Empty
+            | SemanticNode::Sequence(_)
+            | SemanticNode::Try { .. }
+            | SemanticNode::Label { .. } => false,
+        }
     }
 
     fn reduce(
@@ -708,14 +898,6 @@ impl ReplacementGraph {
     }
 }
 
-impl SemanticFolder for ValueSchedule {
-    type Error = ValueRecoveryError;
-
-    fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
-        self.apply_node(node)
-    }
-}
-
 struct ExpressionDependencies;
 
 impl ExpressionDependencies {
@@ -860,6 +1042,30 @@ impl SemanticExpressionTransform for ValueSubstitution<'_> {
 mod tests {
     use super::*;
     use crate::ir::{ArgType, InsnArg, InsnNode, InsnType};
+
+    #[test]
+    fn select_scan_skips_flat_expressions_and_finds_nested_selects() {
+        let literal =
+            |value| SemanticExpression::from_argument(InsnArg::lit(value, ArgType::INT)).unwrap();
+        let flat =
+            SemanticOperation::from_parts(InsnNode::new(InsnType::Move, 1), vec![literal(1)], None);
+        assert!(!SemanticExpressionReduction::operation_contains_select(
+            &flat
+        ));
+
+        let nested = SemanticOperation::from_parts(
+            InsnNode::new(InsnType::Move, 1),
+            vec![SemanticExpression::select(
+                SemanticPredicate::True,
+                literal(1),
+                literal(0),
+            )],
+            None,
+        );
+        assert!(SemanticExpressionReduction::operation_contains_select(
+            &nested
+        ));
+    }
 
     #[test]
     fn strongly_connected_replacements_keep_their_definitions() {

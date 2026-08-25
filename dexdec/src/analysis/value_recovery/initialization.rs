@@ -20,16 +20,23 @@ pub(super) struct SourceInitializationRecovery {
 
 impl SourceInitializationRecovery {
     pub(super) fn apply(root: &mut SemanticNode) -> Result<bool, ValueRecoveryError> {
+        if !contains_initializer_candidate(root) {
+            return Ok(false);
+        }
         let original = std::mem::replace(root, SemanticNode::Empty);
         let before = crate::ir::semantic::SemanticCompletion::analyze(&original);
         let mut recovery = Self { changed: false };
         let rewritten = recovery.fold_node(original)?;
-        let after = crate::ir::semantic::SemanticCompletion::analyze(&rewritten);
-        if !before.same_control_outcomes(&after) {
-            return Err(SemanticFoldError::CompletionChanged {
-                transform: "source-initialization",
+        if recovery.changed {
+            // Only a rewrite can change completion; verifying an untouched
+            // fold result would compare the tree against itself.
+            let after = crate::ir::semantic::SemanticCompletion::analyze(&rewritten);
+            if !before.same_control_outcomes(&after) {
+                return Err(SemanticFoldError::CompletionChanged {
+                    transform: "source-initialization",
+                }
+                .into());
             }
-            .into());
         }
         *root = rewritten;
         Ok(recovery.changed)
@@ -107,6 +114,58 @@ impl SourceInitializationRecovery {
                     facts.get(initializer.variable) == Some(initializer.value)
                 }))
     }
+}
+
+fn contains_initializer_candidate(root: &SemanticNode) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        match node {
+            SemanticNode::If {
+                then_node,
+                else_node,
+                ..
+            } => {
+                if LeadingInitializer::from_node(then_node).is_some()
+                    || else_node
+                        .as_deref()
+                        .and_then(LeadingInitializer::from_node)
+                        .is_some()
+                {
+                    return true;
+                }
+                if let Some(else_node) = else_node {
+                    pending.push(else_node);
+                }
+                pending.push(then_node);
+            }
+            SemanticNode::Sequence(children) => pending.extend(children.iter().rev()),
+            SemanticNode::Loop { test, body, .. } => {
+                pending.push(body);
+                pending.push(&test.setup);
+            }
+            SemanticNode::For { body, .. }
+            | SemanticNode::ForEach { body, .. }
+            | SemanticNode::Synchronized { body, .. }
+            | SemanticNode::Label { body, .. } => pending.push(body),
+            SemanticNode::Switch { cases, .. } => {
+                pending.extend(cases.iter().rev().map(|case| &case.body));
+            }
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                if let Some(finally) = finally {
+                    pending.push(&finally.body);
+                }
+                pending.extend(catches.iter().rev().map(|catch| &catch.body));
+                pending.push(body);
+            }
+            SemanticNode::Empty | SemanticNode::BasicBlock(_) | SemanticNode::Leave(_) => {}
+        }
+    }
+    false
 }
 
 impl SemanticFolder for SourceInitializationRecovery {

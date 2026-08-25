@@ -262,7 +262,7 @@ fn insn_to_short_string(insn: &InsnNode) -> String {
             let method = insn
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .map(|m| shorten_method(m))
                 .unwrap_or_else(|| "?".to_string());
             format!("invoke-{} {}", kind, method)
@@ -271,7 +271,7 @@ fn insn_to_short_string(insn: &InsnNode) -> String {
             let method = insn
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .map(|m| shorten_method(m))
                 .unwrap_or_else(|| "?".to_string());
             format!("{}constructor {}", dest_str, method)
@@ -328,7 +328,7 @@ fn insn_to_short_string(insn: &InsnNode) -> String {
             let field = insn
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .map(|f| shorten_field(f))
                 .unwrap_or_else(|| "?".to_string());
             let prefix = if insn.insn_type == InsnType::Sget {
@@ -342,7 +342,7 @@ fn insn_to_short_string(insn: &InsnNode) -> String {
             let field = insn
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .map(|f| shorten_field(f))
                 .unwrap_or_else(|| "?".to_string());
             let val = insn

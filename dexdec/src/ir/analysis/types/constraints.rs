@@ -223,9 +223,10 @@ impl TypeConstraintGraph {
                 }
             }
             InsnType::NewInstance => {
-                if let (Some(result), Some(ty)) =
-                    (&instruction.result, instruction.payload.class_type.as_ref())
-                {
+                if let (Some(result), Some(ty)) = (
+                    &instruction.result,
+                    instruction.payload.class_type.as_deref(),
+                ) {
                     self.add_register_bound(result, BoundKind::Exact, ty.clone());
                 }
             }
@@ -258,7 +259,7 @@ impl TypeConstraintGraph {
             InsnType::Aput => self.constrain_array_put(instruction),
             InsnType::NewArray | InsnType::FilledNewArray => {
                 if let Some(result) = &instruction.result {
-                    if let Some(array_type) = instruction.payload.class_type.as_ref() {
+                    if let Some(array_type) = instruction.payload.class_type.as_deref() {
                         self.add_register_bound(result, BoundKind::Exact, array_type.clone());
                     }
                 }
@@ -299,7 +300,7 @@ impl TypeConstraintGraph {
     }
 
     fn constrain_invoke(&mut self, instruction: &InsnNode) -> Result<(), TypeConstraintError> {
-        let reference = instruction.payload.reference.as_ref().ok_or(
+        let reference = instruction.payload.reference.as_deref().ok_or(
             TypeConstraintError::MissingReference {
                 offset: instruction.offset,
                 instruction: instruction.insn_type,
@@ -349,7 +350,7 @@ impl TypeConstraintGraph {
     }
 
     fn constrain_field(&mut self, instruction: &InsnNode) -> Result<(), TypeConstraintError> {
-        let reference = instruction.payload.reference.as_ref().ok_or(
+        let reference = instruction.payload.reference.as_deref().ok_or(
             TypeConstraintError::MissingReference {
                 offset: instruction.offset,
                 instruction: instruction.insn_type,

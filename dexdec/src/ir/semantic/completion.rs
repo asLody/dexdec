@@ -311,10 +311,13 @@ pub(crate) struct SemanticCompletion {
 
 impl SemanticCompletion {
     pub(crate) fn analyze(root: &SemanticNode) -> Self {
-        match CompletionInterpreter::analyze(root, &SemanticCompletionDomain) {
-            Ok(completion) => completion,
-            Err(error) => match error {},
-        }
+        crate::profile_scope!(
+            "completion.analyze",
+            match CompletionInterpreter::analyze(root, &SemanticCompletionDomain) {
+                Ok(completion) => completion,
+                Err(error) => match error {},
+            }
+        )
     }
 
     pub(crate) fn can_complete_normally(&self) -> bool {
@@ -528,7 +531,10 @@ impl CompletionDomain for SemanticCompletionDomain {
         )))
     }
 
-    fn sequence(&self, children: Vec<Self::State>) -> Result<Self::State, Self::Error> {
+    fn sequence(
+        &self,
+        children: impl IntoIterator<Item = Self::State>,
+    ) -> Result<Self::State, Self::Error> {
         Ok(SemanticCompletion::sequence(children))
     }
 
@@ -608,7 +614,7 @@ impl CompletionDomain for SemanticCompletionDomain {
         &self,
         region: Option<RegionId>,
         has_default: bool,
-        cases: Vec<Self::State>,
+        cases: impl IntoIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         let mut result = SemanticCompletion::alternatives(cases);
         if let Some(region) = region {
@@ -629,10 +635,10 @@ impl CompletionDomain for SemanticCompletionDomain {
         &self,
         catches: usize,
         has_finally: bool,
-        mut children: Vec<Self::State>,
+        mut children: impl DoubleEndedIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
-        let finally = has_finally.then(|| children.pop().expect("finally child"));
-        let protected = SemanticCompletion::alternatives(children.drain(..=catches));
+        let finally = has_finally.then(|| children.next_back().expect("finally child"));
+        let protected = SemanticCompletion::alternatives(children.take(catches + 1));
         let Some(finally) = finally else {
             return Ok(protected);
         };
@@ -667,7 +673,10 @@ pub(crate) trait CompletionDomain {
         self.normal()
     }
     fn leave(&self, leave: &SemanticLeave) -> Result<Self::State, Self::Error>;
-    fn sequence(&self, children: Vec<Self::State>) -> Result<Self::State, Self::Error>;
+    fn sequence(
+        &self,
+        children: impl IntoIterator<Item = Self::State>,
+    ) -> Result<Self::State, Self::Error>;
     fn branch(
         &self,
         condition: &SemanticPredicate,
@@ -697,13 +706,13 @@ pub(crate) trait CompletionDomain {
         &self,
         region: Option<RegionId>,
         has_default: bool,
-        cases: Vec<Self::State>,
+        cases: impl IntoIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error>;
     fn try_node(
         &self,
         catches: usize,
         has_finally: bool,
-        children: Vec<Self::State>,
+        children: impl DoubleEndedIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error>;
     fn synchronized(&self, body: Self::State) -> Result<Self::State, Self::Error>;
     fn label(&self, label: SemanticLabel, body: Self::State) -> Result<Self::State, Self::Error>;
@@ -711,23 +720,23 @@ pub(crate) trait CompletionDomain {
 
 enum CompletionTask<'a> {
     Visit(&'a SemanticNode),
-    Combine(&'a SemanticNode, CompletionFrame),
+    Combine(&'a SemanticNode, CompletionFrame<'a>),
 }
 
-enum CompletionFrame {
+enum CompletionFrame<'a> {
     Sequence(usize),
     If {
-        condition: SemanticPredicate,
+        condition: &'a SemanticPredicate,
         has_else: bool,
     },
     Loop {
         control: SemanticLoopControl,
         kind: SemanticLoopKind,
-        condition: SemanticPredicate,
+        condition: &'a SemanticPredicate,
     },
     For {
         control: SemanticLoopControl,
-        condition: SemanticPredicate,
+        condition: &'a SemanticPredicate,
     },
     ForEach {
         control: SemanticLoopControl,
@@ -745,22 +754,6 @@ enum CompletionFrame {
     Label(SemanticLabel),
 }
 
-impl CompletionFrame {
-    fn child_count(&self) -> usize {
-        match self {
-            Self::Sequence(count) => *count,
-            Self::If { has_else, .. } => usize::from(*has_else) + 1,
-            Self::Loop { .. } => 2,
-            Self::For { .. } | Self::ForEach { .. } | Self::Synchronized | Self::Label(_) => 1,
-            Self::Switch { cases, .. } => *cases,
-            Self::Try {
-                catches,
-                has_finally,
-            } => 1 + *catches + usize::from(*has_finally),
-        }
-    }
-}
-
 pub(crate) struct CompletionInterpreter;
 
 impl CompletionInterpreter {
@@ -768,6 +761,9 @@ impl CompletionInterpreter {
         root: &SemanticNode,
         domain: &D,
     ) -> Result<D::State, D::Error> {
+        if let Some(state) = Self::leaf_state(root, domain) {
+            return state;
+        }
         Self::analyze_with(root, domain, |_, _| {})
     }
 
@@ -779,10 +775,39 @@ impl CompletionInterpreter {
         D::State: Clone,
     {
         let mut facts = std::collections::BTreeMap::new();
+        if let Some(state) = Self::leaf_state(root, domain) {
+            let state = state?;
+            facts.insert(std::ptr::from_ref(root).addr(), state);
+            return Ok(facts);
+        }
         Self::analyze_with(root, domain, |node, state| {
             facts.insert(std::ptr::from_ref(node).addr(), state.clone());
         })?;
         Ok(facts)
+    }
+
+    fn leaf_state<D: CompletionDomain>(
+        node: &SemanticNode,
+        domain: &D,
+    ) -> Option<Result<D::State, D::Error>> {
+        match node {
+            SemanticNode::Empty => Some(domain.normal()),
+            SemanticNode::BasicBlock(block) => Some(if block_has_no_return_call(block) {
+                domain.no_return_call()
+            } else {
+                domain.basic_block(block)
+            }),
+            SemanticNode::Leave(leave) => Some(domain.leave(leave)),
+            SemanticNode::Sequence(_)
+            | SemanticNode::If { .. }
+            | SemanticNode::Loop { .. }
+            | SemanticNode::For { .. }
+            | SemanticNode::ForEach { .. }
+            | SemanticNode::Switch { .. }
+            | SemanticNode::Try { .. }
+            | SemanticNode::Synchronized { .. }
+            | SemanticNode::Label { .. } => None,
+        }
     }
 
     fn analyze_with<D: CompletionDomain>(
@@ -798,9 +823,7 @@ impl CompletionInterpreter {
                     Self::schedule(node, domain, &mut tasks, &mut results, &mut record)?
                 }
                 CompletionTask::Combine(node, frame) => {
-                    let count = frame.child_count();
-                    let children = results.split_off(results.len().saturating_sub(count));
-                    let state = Self::combine(frame, children, domain)?;
+                    let state = Self::combine(frame, &mut results, domain)?;
                     record(node, &state);
                     results.push(state);
                 }
@@ -854,7 +877,7 @@ impl CompletionInterpreter {
                 tasks.push(CompletionTask::Combine(
                     node,
                     CompletionFrame::If {
-                        condition: condition.value.clone(),
+                        condition: &condition.value,
                         has_else: else_node.is_some(),
                     },
                 ));
@@ -875,7 +898,7 @@ impl CompletionInterpreter {
                     CompletionFrame::Loop {
                         control: *control,
                         kind: *kind,
-                        condition: test.condition.value.clone(),
+                        condition: &test.condition.value,
                     },
                 ));
                 tasks.push(CompletionTask::Visit(body));
@@ -891,7 +914,7 @@ impl CompletionInterpreter {
                     node,
                     CompletionFrame::For {
                         control: *control,
-                        condition: condition.value.clone(),
+                        condition: &condition.value,
                     },
                 ));
                 tasks.push(CompletionTask::Visit(body));
@@ -959,48 +982,78 @@ impl CompletionInterpreter {
     }
 
     fn combine<D: CompletionDomain>(
-        frame: CompletionFrame,
-        mut children: Vec<D::State>,
+        frame: CompletionFrame<'_>,
+        results: &mut Vec<D::State>,
         domain: &D,
     ) -> Result<D::State, D::Error> {
         match frame {
-            CompletionFrame::Sequence(_) => domain.sequence(children),
+            CompletionFrame::Sequence(count) => {
+                let start = results
+                    .len()
+                    .checked_sub(count)
+                    .expect("completion sequence result stack");
+                domain.sequence(results.drain(start..))
+            }
             CompletionFrame::If {
                 condition,
                 has_else,
             } => {
-                let then_state = children.remove(0);
-                let else_state = has_else.then(|| children.remove(0));
-                domain.branch(&condition, then_state, else_state)
+                let else_state =
+                    has_else.then(|| results.pop().expect("completion else result stack"));
+                let then_state = results.pop().expect("completion then result stack");
+                domain.branch(condition, then_state, else_state)
             }
             CompletionFrame::Loop {
                 control,
                 kind,
                 condition,
-            } => domain.loop_node(
-                control,
-                kind,
-                &condition,
-                children.remove(0),
-                children.remove(0),
-            ),
+            } => {
+                let body = results.pop().expect("completion loop body result stack");
+                let setup = results.pop().expect("completion loop setup result stack");
+                domain.loop_node(control, kind, condition, setup, body)
+            }
             CompletionFrame::For { control, condition } => {
-                domain.for_node(control, &condition, children.remove(0))
+                let body = results.pop().expect("completion for body result stack");
+                domain.for_node(control, condition, body)
             }
             CompletionFrame::ForEach { control } => {
-                domain.for_each_node(control, children.remove(0))
+                let body = results
+                    .pop()
+                    .expect("completion for-each body result stack");
+                domain.for_each_node(control, body)
             }
             CompletionFrame::Switch {
                 region,
+                cases,
                 has_default,
-                ..
-            } => domain.switch_node(region, has_default, children),
+            } => {
+                let start = results
+                    .len()
+                    .checked_sub(cases)
+                    .expect("completion switch result stack");
+                domain.switch_node(region, has_default, results.drain(start..))
+            }
             CompletionFrame::Try {
                 catches,
                 has_finally,
-            } => domain.try_node(catches, has_finally, children),
-            CompletionFrame::Synchronized => domain.synchronized(children.remove(0)),
-            CompletionFrame::Label(label) => domain.label(label, children.remove(0)),
+            } => {
+                let count = 1 + catches + usize::from(has_finally);
+                let start = results
+                    .len()
+                    .checked_sub(count)
+                    .expect("completion try result stack");
+                domain.try_node(catches, has_finally, results.drain(start..))
+            }
+            CompletionFrame::Synchronized => {
+                let body = results
+                    .pop()
+                    .expect("completion synchronized body result stack");
+                domain.synchronized(body)
+            }
+            CompletionFrame::Label(label) => {
+                let body = results.pop().expect("completion label body result stack");
+                domain.label(label, body)
+            }
         }
     }
 }
@@ -1036,8 +1089,11 @@ impl CompletionDomain for FallthroughDomain {
         Ok(BoolExpr::False)
     }
 
-    fn sequence(&self, children: Vec<Self::State>) -> Result<Self::State, Self::Error> {
-        Ok(BoolExpr::and(children))
+    fn sequence(
+        &self,
+        children: impl IntoIterator<Item = Self::State>,
+    ) -> Result<Self::State, Self::Error> {
+        Ok(BoolExpr::and(children.into_iter().collect()))
     }
 
     fn branch(
@@ -1091,7 +1147,7 @@ impl CompletionDomain for FallthroughDomain {
         &self,
         _region: Option<RegionId>,
         _has_default: bool,
-        _cases: Vec<Self::State>,
+        _cases: impl IntoIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         Ok(BoolExpr::True)
     }
@@ -1100,7 +1156,7 @@ impl CompletionDomain for FallthroughDomain {
         &self,
         _catches: usize,
         _has_finally: bool,
-        _children: Vec<Self::State>,
+        _children: impl DoubleEndedIterator<Item = Self::State>,
     ) -> Result<Self::State, Self::Error> {
         Ok(BoolExpr::True)
     }

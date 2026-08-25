@@ -165,7 +165,7 @@ impl ResultBindingAnalysis {
                 let method = producer
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .ok_or(ResultBindingError::MissingReference(producer.offset))?;
                 let MemberReference::Method(method) = method else {
                     return Err(ResultBindingError::InvalidReferenceKind(producer.offset));
@@ -178,7 +178,8 @@ impl ResultBindingAnalysis {
             InsnType::FilledNewArray => producer
                 .payload
                 .class_type
-                .clone()
+                .as_deref()
+                .cloned()
                 .ok_or(ResultBindingError::MissingReference(producer.offset)),
             _ => Err(ResultBindingError::InvalidProducer {
                 offset: producer.offset,

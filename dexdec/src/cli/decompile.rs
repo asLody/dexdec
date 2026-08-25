@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::{ClassSelector, DecompileOptions, Decompiler, MethodRequest, SourceLanguage};
+use crate::{
+    ClassFailure, ClassSelector, DecompileOptions, Decompiler, MethodRequest, SourceLanguage,
+    SourceUnit,
+};
 
 use super::error::{CliError, CliResult};
 use super::model::{DecompileRequest, ExitStatus, LanguageSelection, OutputFormat};
@@ -51,13 +54,28 @@ impl DecompileCommand {
         context: &mut CommandContext<'_, H>,
         request: &DecompileRequest,
     ) -> CliResult<ExitStatus> {
+        let open_started = std::time::Instant::now();
         let mut decompiler = Decompiler::open(&request.input)?;
+        let open_ms = open_started.elapsed();
         let catalog = decompiler.catalog();
+        let select_started = std::time::Instant::now();
         let classes =
             SelectionResolver::new(&catalog).resolve(context, &mut decompiler, request)?;
+        let select_ms = select_started.elapsed();
+        if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
+            let _ = context.host_mut().note(&format!(
+                "dexdec batch: open={:.0}ms select={:.0}ms classes={}",
+                open_ms.as_secs_f64() * 1000.0,
+                select_ms.as_secs_f64() * 1000.0,
+                classes.len()
+            ));
+        }
         Self::validate_destination(request, classes.len())?;
 
-        let options = DecompileOptions::default().with_nested(request.include_nested);
+        let isolate_requests = request.fail_fast || classes.len() <= 1;
+        let options = DecompileOptions::default()
+            .with_nested(request.include_nested)
+            .with_isolated_requests(isolate_requests);
         decompiler.set_options(options.clone());
         if let Some(method) = request.method.as_deref() {
             return Self::method(
@@ -77,37 +95,48 @@ impl DecompileCommand {
         let mut results = Vec::with_capacity(requested);
         let mut failures = Vec::new();
         let mut output_paths = SourceOutputPaths::default();
-        for (index, class) in classes.iter().enumerate() {
-            context.progress(&format!(
-                "[{}/{}] decompile {}",
-                index + 1,
-                requested,
-                class
-            ))?;
-            decompiler.clear_analysis_scope();
-            let language = match Self::language_for(&mut decompiler, class, request.language) {
-                Ok(language) => language,
+        let mut jobs = Vec::with_capacity(requested);
+        for class in &classes {
+            match Self::language_for(&mut decompiler, class, request.language) {
+                Ok(language) => jobs.push((class.clone(), language)),
                 Err(error) if !request.fail_fast => {
                     failures.push(GenerationFailure {
                         class: class.clone(),
                         error: error.to_string(),
                     });
-                    continue;
                 }
                 Err(error) => return Err(error),
-            };
-            decompiler.set_options(options.clone().with_language(language));
-            let unit = match decompiler.class(class.clone()) {
+            }
+        }
+        if !isolate_requests {
+            context.progress(&format!("preparing {} classes", jobs.len()))?;
+        }
+        let generate_started = std::time::Instant::now();
+        let generated = if request.fail_fast {
+            Self::generate_classes_fail_fast(&mut decompiler, jobs)
+        } else {
+            decompiler.generate_classes(jobs)?
+        };
+        let generate_wall = generate_started.elapsed();
+        let write_started = std::time::Instant::now();
+        for unit in generated {
+            let unit = match unit {
                 Ok(unit) => unit,
-                Err(error) if !request.fail_fast => {
+                Err(failure) if !request.fail_fast => {
                     failures.push(GenerationFailure {
-                        class: class.clone(),
-                        error: error.to_string(),
+                        class: failure.class,
+                        error: failure.error.to_string(),
                     });
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(failure) => return Err(failure.error.into()),
             };
+            context.progress(&format!(
+                "[{}/{}] write {}",
+                results.len() + failures.len() + 1,
+                requested,
+                unit.class
+            ))?;
             let output_path = if let Some(directory) = request.output_dir.as_deref() {
                 let path = prepare_file_path(&directory.join(output_paths.claim(&unit.path)));
                 match context.host_mut().write(&path, unit.source.as_bytes()) {
@@ -119,7 +148,7 @@ impl DecompileCommand {
                             .host_mut()
                             .note(&format!("Save file error: {error}"));
                         failures.push(GenerationFailure {
-                            class: class.clone(),
+                            class: unit.class,
                             error: error.to_string(),
                         });
                         continue;
@@ -144,6 +173,15 @@ impl DecompileCommand {
                     .then_some(unit.source),
             });
         }
+        let write_ms = write_started.elapsed();
+        let report_started = std::time::Instant::now();
+        if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
+            let _ = context.host_mut().note(&format!(
+                "dexdec batch: generate_wall={:.0}ms write={:.0}ms",
+                generate_wall.as_secs_f64() * 1000.0,
+                write_ms.as_secs_f64() * 1000.0
+            ));
+        }
 
         let report = DecompileReport {
             selection: "classes",
@@ -160,11 +198,50 @@ impl DecompileCommand {
         };
         let text = Self::format_report(&report, context.format());
         context.respond("decompile", &report, &text)?;
-        Ok(if report.failed == 0 {
+        if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
+            let _ = context.host_mut().note(&format!(
+                "dexdec batch: report={:.0}ms",
+                report_started.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+        let status = if report.failed == 0 {
             ExitStatus::Success
         } else {
             ExitStatus::PartialFailure
-        })
+        };
+        if !isolate_requests {
+            // The process is about to exit. Running Drop for the full loaded
+            // archive is observable shutdown cost and does not affect output.
+            std::mem::forget(decompiler);
+        }
+        Ok(status)
+    }
+
+    fn generate_classes_fail_fast(
+        decompiler: &mut Decompiler,
+        jobs: Vec<(String, SourceLanguage)>,
+    ) -> Vec<Result<SourceUnit, ClassFailure>> {
+        let mut generated = Vec::with_capacity(jobs.len());
+        for (class, language) in jobs {
+            decompiler.clear_analysis_scope();
+            decompiler.set_options(decompiler.options().clone().with_language(language));
+            let method_count = decompiler
+                .reader()
+                .get_class(&class)
+                .map_or(0, |node| node.methods().len());
+            match decompiler.class(class.clone()) {
+                Ok(unit) => generated.push(Ok(unit)),
+                Err(error) => {
+                    generated.push(Err(ClassFailure {
+                        class,
+                        method_count,
+                        error,
+                    }));
+                    break;
+                }
+            }
+        }
+        generated
     }
 
     fn method<H: CliHost>(

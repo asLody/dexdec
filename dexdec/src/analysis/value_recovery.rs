@@ -38,6 +38,7 @@ pub struct ValueRecovery {
     ssa_constants: BTreeMap<SsaVar, crate::ir::InsnArg>,
     source_bindings: BTreeSet<SsaVar>,
     diagnostics: crate::ir::ValueRecoveryDiagnostics,
+    source_flow_cache: Option<source::SourceFlowCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +176,7 @@ impl ValueRecovery {
             ssa_constants: SparseConstantPropagation::new(cfg).solve(),
             source_bindings: BTreeSet::new(),
             diagnostics: crate::ir::ValueRecoveryDiagnostics::default(),
+            source_flow_cache: None,
         })
     }
 
@@ -196,7 +198,12 @@ impl ValueRecovery {
         &mut self,
         method: &mut SemanticMethod<State>,
     ) -> Result<bool, ValueRecoveryError> {
-        source::SourceValueRecovery::recover(method, RecoveryMode::Full, &self.source_bindings)
+        source::SourceValueRecovery::recover(
+            method,
+            RecoveryMode::Full,
+            &self.source_bindings,
+            &mut self.source_flow_cache,
+        )
     }
 
     pub fn prepare_source<State: SourceVariableContext>(
@@ -207,6 +214,7 @@ impl ValueRecovery {
             method,
             RecoveryMode::Structural,
             &self.source_bindings,
+            &mut self.source_flow_cache,
         )
     }
 }
@@ -440,6 +448,7 @@ impl<'a> SsaValueSolver<'a> {
         method: &mut SemanticMethod<SsaSemantics>,
     ) -> Result<BTreeMap<SsaVar, crate::ir::InsnArg>, ValueRecoveryError> {
         let mut constants = BTreeMap::new();
+        let mut flow_cache = None;
         loop {
             crate::profile_scope!(
                 "value.ssa.solve.numbering",
@@ -447,7 +456,12 @@ impl<'a> SsaValueSolver<'a> {
             )?;
             let mut graph = crate::profile_scope!(
                 "value.ssa.solve.graph",
-                ValueFlowGraph::build(method.body(), method.state().values(), self.constants)
+                ValueFlowGraph::build_with_flow_cache(
+                    method.body(),
+                    method.state().values(),
+                    self.constants,
+                    &mut flow_cache
+                )
             )?;
             graph.exclude_phis(self.recovered_phis);
             graph.retain_values(self.retained_values.iter().copied());

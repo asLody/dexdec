@@ -22,6 +22,8 @@ use crate::ir::analysis::SsaVar;
 pub(super) struct ValuePlanner<'a> {
     facts: SparseValueFacts<'a>,
     mode: RecoveryMode,
+    has_predicate_uses: bool,
+    early_returns: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +89,16 @@ impl<'a> ValuePlanner<'a> {
         graph: &'a ValueFlowGraph<'a>,
         mode: RecoveryMode,
     ) -> Result<Self, ValueRecoveryError> {
+        let facts = SparseValueFacts::analyze(graph)?;
+        let has_predicate_uses = facts.uses().values().any(|uses| {
+            uses.iter()
+                .any(|usage| usage.context == UseContext::Predicate)
+        });
         Ok(Self {
-            facts: SparseValueFacts::analyze(graph)?,
+            facts,
             mode,
+            has_predicate_uses,
+            early_returns: crate::ir::trivial_early_returns(),
         })
     }
 
@@ -683,6 +692,7 @@ impl<'a> ValuePlanner<'a> {
             return Ok(Some(action));
         }
         let inline = match self.mode {
+            RecoveryMode::Structural if !self.has_predicate_uses && self.early_returns => false,
             RecoveryMode::Structural => uses
                 .first()
                 .is_some_and(|usage| usage.context == UseContext::Predicate),
@@ -1604,7 +1614,7 @@ impl<'a> ValuePlanner<'a> {
         }
         if let SemanticExpression::Operation(operation) = value {
             if operation.insn_type == InsnType::ConstStr {
-                if let Some(value) = operation.payload.string_value.clone() {
+                if let Some(value) = operation.payload.string_value.as_deref().cloned() {
                     return SelectedValue::String(value);
                 }
             }

@@ -3,7 +3,7 @@
 use crate::ir::{
     analysis::SsaVar, semantic::SemanticCompletion, BlockId, BoolExpr, BoolVariable, InstructionId,
     SemanticBlock, SemanticExpressionFacts, SemanticFoldError, SemanticFolder, SemanticNode,
-    SemanticPredicate, SemanticStatement,
+    SemanticPredicate, SemanticStatement, SemanticVisitor,
 };
 
 use super::ValueRecoveryError;
@@ -20,6 +20,9 @@ pub(super) struct PredicateRegionFormation {
 
 impl PredicateRegionFormation {
     pub(super) fn apply(root: &mut SemanticNode) -> Result<bool, ValueRecoveryError> {
+        if crate::ir::trivial_early_returns() && !needs_predicate_regions(root) {
+            return Ok(false);
+        }
         let before = SemanticCompletion::analyze(root);
         let mut changed = false;
         loop {
@@ -31,12 +34,16 @@ impl PredicateRegionFormation {
             }
             changed = true;
         }
-        let after = SemanticCompletion::analyze(root);
-        if before != after {
-            return Err(SemanticFoldError::CompletionChanged {
-                transform: "predicate-region-formation",
+        if changed {
+            // Only a rewrite can change completion; verifying an untouched
+            // tree would compare it against itself.
+            let after = SemanticCompletion::analyze(root);
+            if before != after {
+                return Err(SemanticFoldError::CompletionChanged {
+                    transform: "predicate-region-formation",
+                }
+                .into());
             }
-            .into());
         }
         Ok(changed)
     }
@@ -92,15 +99,18 @@ impl PredicateRegionFormation {
                 else_node: None,
             } = &node
             {
-                let prefix = SemanticNode::sequence(std::mem::take(&mut formed));
-                let (prefix, distributed) = GuardDistribution::apply(prefix, condition, then_node)?;
-                if distributed {
-                    formed.push(prefix);
-                    self.changed = true;
-                    continue;
-                }
-                if !matches!(prefix, SemanticNode::Empty) {
-                    formed.push(prefix);
+                // PathInjector only rewrites the last sequential child. Passing
+                // the whole prefix cloned the growing if-chain on every
+                // candidate (O(n²) completion walks). Apply against the last
+                // node only; a long if-chain stays a flat sequence.
+                if !formed.is_empty() && GuardDistribution::should_try(condition, then_node) {
+                    let last = formed.pop().expect("non-empty prefix");
+                    let (last, distributed) = GuardDistribution::apply(last, condition, then_node)?;
+                    formed.push(last);
+                    if distributed {
+                        self.changed = true;
+                        continue;
+                    }
                 }
             }
             formed.push(node);
@@ -185,6 +195,24 @@ impl PredicateRegionFormation {
         }
         true
     }
+}
+
+fn needs_predicate_regions(root: &SemanticNode) -> bool {
+    struct Finder {
+        needed: bool,
+    }
+    impl SemanticVisitor for Finder {
+        fn enter_node(&mut self, node: &SemanticNode) {
+            self.needed |= matches!(node, SemanticNode::If { .. });
+        }
+
+        fn visit_statement(&mut self, statement: &SemanticStatement) {
+            self.needed |= GuardedAssignment::is_self_selecting(statement);
+        }
+    }
+    let mut finder = Finder { needed: false };
+    finder.visit_node(root);
+    finder.needed
 }
 
 struct PredicateEquivalence {
@@ -418,5 +446,12 @@ mod tests {
         assert!(!changed);
         assert_eq!(SemanticCompletion::analyze(&root), before);
         assert!(matches!(root, SemanticNode::Sequence(nodes) if nodes.len() == 2));
+    }
+
+    #[test]
+    fn skips_trees_without_if_or_self_selecting_select() {
+        let mut root = SemanticNode::Empty;
+        assert!(!PredicateRegionFormation::apply(&mut root).unwrap());
+        assert!(matches!(root, SemanticNode::Empty));
     }
 }

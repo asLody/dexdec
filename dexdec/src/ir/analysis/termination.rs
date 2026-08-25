@@ -5,7 +5,9 @@
 //! contributes a normal continuation only after its target is known to have
 //! one. Exception dispatch remains reachable independently.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use rayon::prelude::*;
 
 use crate::ir::{
     ArgType, EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG,
@@ -19,26 +21,74 @@ pub struct MethodTermination {
 
 impl MethodTermination {
     pub fn analyze<'a>(methods: impl IntoIterator<Item = &'a CFG>) -> Self {
+        let methods = methods.into_iter().collect::<Vec<&CFG>>();
         let methods = methods
-            .into_iter()
-            .map(|cfg| (Self::method_reference(cfg), cfg))
+            .par_iter()
+            .map(|cfg| (Self::method_reference(cfg), *cfg))
             .collect::<BTreeMap<_, _>>();
-        let members = methods.keys().cloned().collect::<BTreeSet<_>>();
-        let mut may_return = BTreeSet::new();
-
-        loop {
-            let discovered = methods
-                .iter()
-                .filter_map(|(method, cfg)| {
-                    (!may_return.contains(method)
-                        && ReturnReachability::new(&members, &may_return).analyze(cfg))
-                    .then_some(method.clone())
+        let members = methods
+            .par_iter()
+            .map(|(method, _)| method.clone())
+            .collect::<BTreeSet<_>>();
+        // The caller-index sweep touches every instruction of every method;
+        // folding per-thread partial indexes keeps the same target→callers
+        // sets regardless of how the work splits.
+        let member_refs = &members;
+        let callers = methods
+            .par_iter()
+            .flat_map_iter(|(method, cfg)| {
+                cfg.block_ids().into_iter().flat_map(move |block| {
+                    cfg.block(block).into_iter().flat_map(move |body| {
+                        body.insns.iter().filter_map(|instruction| {
+                            exact_internal_target(instruction, member_refs)
+                                .map(|target| (target.clone(), method.clone()))
+                        })
+                    })
                 })
-                .collect::<Vec<_>>();
-            if discovered.is_empty() {
-                break;
+            })
+            .fold(
+                BTreeMap::<MethodReference, BTreeSet<MethodReference>>::new,
+                |mut callers, (target, caller)| {
+                    callers.entry(target).or_default().insert(caller);
+                    callers
+                },
+            )
+            .reduce(
+                BTreeMap::<MethodReference, BTreeSet<MethodReference>>::new,
+                |mut left, right| {
+                    for (target, callers_of_target) in right {
+                        left.entry(target).or_default().extend(callers_of_target);
+                    }
+                    left
+                },
+            );
+        let mut may_return = BTreeSet::new();
+        let mut pending = methods
+            .par_iter()
+            .filter_map(|(method, cfg)| {
+                ReturnReachability::new(&members, &may_return)
+                    .analyze(cfg)
+                    .then_some(method.clone())
+            })
+            .collect::<VecDeque<_>>();
+        may_return.extend(pending.iter().cloned());
+
+        while let Some(returning) = pending.pop_front() {
+            let Some(affected) = callers.get(&returning) else {
+                continue;
+            };
+            for caller in affected {
+                if may_return.contains(caller) {
+                    continue;
+                }
+                let Some(cfg) = methods.get(caller) else {
+                    continue;
+                };
+                if ReturnReachability::new(&members, &may_return).analyze(cfg) {
+                    may_return.insert(caller.clone());
+                    pending.push_back(caller.clone());
+                }
             }
-            may_return.extend(discovered);
         }
 
         let no_return = members.difference(&may_return).cloned().collect();
@@ -91,18 +141,25 @@ impl MethodTermination {
         &'a self,
         instruction: &'a InsnNode,
     ) -> Option<&'a MethodReference> {
-        let exact = matches!(
-            instruction.payload.invoke_type,
-            Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
-        );
-        if instruction.insn_type != InsnType::Invoke || !exact {
-            return None;
-        }
-        let MemberReference::Method(target) = instruction.payload.reference.as_ref()? else {
-            return None;
-        };
-        self.members.contains(target).then_some(target)
+        exact_internal_target(instruction, &self.members)
     }
+}
+
+fn exact_internal_target<'a>(
+    instruction: &'a InsnNode,
+    members: &'a BTreeSet<MethodReference>,
+) -> Option<&'a MethodReference> {
+    let exact = matches!(
+        instruction.payload.invoke_type,
+        Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
+    );
+    if instruction.insn_type != InsnType::Invoke || !exact {
+        return None;
+    }
+    let MemberReference::Method(target) = instruction.payload.reference.as_deref()? else {
+        return None;
+    };
+    members.contains(target).then_some(target)
 }
 
 struct ReturnReachability<'a> {
@@ -161,7 +218,7 @@ impl<'a> ReturnReachability<'a> {
         {
             return false;
         }
-        let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(target)) = instruction.payload.reference.as_deref() else {
             return false;
         };
         self.members.contains(target)
@@ -216,7 +273,7 @@ mod tests {
 
     fn call(target: &str) -> InsnNode {
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(reference(target)));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(reference(target))));
         invoke
     }
 
@@ -316,7 +373,7 @@ mod tests {
         let mut caller = graph("caller");
         let mut entry = Block::new(0);
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(marker));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(marker)));
         entry.push(invoke);
         entry.push(InsnNode::goto(1));
         caller.add_block(entry);
@@ -360,7 +417,7 @@ mod tests {
         let mut caller = graph("caller");
         let mut entry = Block::new(0);
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(target));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(target)));
         entry.push(invoke);
         entry.push(InsnNode::goto(1));
         caller.add_block(entry);

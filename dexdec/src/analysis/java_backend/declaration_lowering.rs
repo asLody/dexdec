@@ -6,7 +6,7 @@ use crate::language::java::{
     JavaFieldDeclaration, JavaFieldSymbol, JavaIdentifier, JavaLiteral, JavaMemberNames,
     JavaMethodBody, JavaMethodDeclaration, JavaMethodDeclarationKind, JavaMethodParameter,
     JavaMethodSymbol, JavaModifier, JavaStmt, JavaType, JavaTypeArgument, JavaTypeDeclaration,
-    JavaTypeDeclarationKind, JavaTypeParameter,
+    JavaTypeDeclarationKind, JavaTypeParameter, SourceObjectTypes,
 };
 
 use super::anonymous_lowering::{
@@ -84,6 +84,15 @@ impl JavaCompilationUnitLowering {
             }
             type_uses
         });
+        let local_function_object_types = FunctionObjectTypeCatalog::collect(class);
+        let cu_types = CompilationUnitAbiTypes::collect(
+            Some(class),
+            &field_references,
+            &method_references,
+            type_uses.iter().cloned(),
+            current_type.as_ref(),
+            &local_function_object_types,
+        );
         let names = crate::profile_scope!("java_backend.lower.type_names", {
             JavaTypeNameResolver::for_class(
                 class,
@@ -143,17 +152,32 @@ impl JavaCompilationUnitLowering {
                 ))
             })
             .collect::<Result<_, JavaDecompilerError>>()?;
-        let local_function_object_types = FunctionObjectTypeCatalog::collect(class);
-        let source_object_types = source_abi
-            .function_object_types()
-            .map(|(identity, interface)| (identity.clone(), interface.clone()))
-            .chain(local_function_object_types)
-            .map(|(identity, interface)| Ok((identity, names.resolve_generic_type(&interface)?)))
-            .collect::<Result<_, JavaDecompilerError>>()?;
+        let source_object_types = SourceObjectTypes::checked(
+            source_abi
+                .referenced_function_object_types(cu_types.iter())
+                .into_iter()
+                .chain(
+                    local_function_object_types
+                        .iter()
+                        .map(|(identity, interface)| (identity.clone(), interface.clone())),
+                )
+                .map(|(identity, interface)| {
+                    Ok((identity, names.resolve_generic_type(&interface)?))
+                })
+                .collect::<Result<_, JavaDecompilerError>>()?,
+            source_abi.expected_function_object_identities(
+                cu_types.iter(),
+                local_function_object_types.keys().cloned(),
+            ),
+        );
         let outer_instances = source_abi
-            .outer_instances()
-            .chain(class.outer_instances())
-            .map(|(field, outer)| (field.clone(), outer.clone()))
+            .referenced_outer_instances(cu_types.iter())
+            .into_iter()
+            .chain(
+                class
+                    .outer_instances()
+                    .map(|(field, outer)| (field.clone(), outer.clone())),
+            )
             .collect();
         let imports = names
             .imports()
@@ -218,6 +242,29 @@ impl JavaSingleMethodLowering {
         for contract in generic_methods.values() {
             GenericTypeUses::method_contract(contract, &mut type_uses);
         }
+        let body_current_type = method
+            .body
+            .as_ref()
+            .and_then(super::java_model::method::JavaMethodBody::current_type);
+        let current_type = current_type.or(body_current_type);
+        let local_function_object_types = method_local_function_objects(method, current_type);
+        let mut cu_types = CompilationUnitAbiTypes::collect(
+            None,
+            &field_references,
+            &method_references,
+            type_uses.iter().cloned(),
+            current_type,
+            &local_function_object_types,
+        );
+        if let Some((field, outer)) = method
+            .body
+            .as_ref()
+            .and_then(super::java_model::method::JavaMethodBody::outer_instance_field)
+        {
+            CompilationUnitAbiTypes::insert(&mut cu_types, &field.owner);
+            CompilationUnitAbiTypes::insert(&mut cu_types, &field.field_type);
+            CompilationUnitAbiTypes::insert(&mut cu_types, outer);
+        }
         let names = JavaTypeNameResolver::new(current_package, current_type, type_uses)?;
         let members = std::sync::Arc::new(
             ClassMemberNames::method_only(current_type, method)
@@ -235,10 +282,25 @@ impl JavaSingleMethodLowering {
                 ))
             })
             .collect::<Result<_, JavaDecompilerError>>()?;
-        let mut outer_instances = source_abi
-            .outer_instances()
-            .map(|(field, outer)| (field.clone(), outer.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let source_object_types = SourceObjectTypes::checked(
+            source_abi
+                .referenced_function_object_types(cu_types.iter())
+                .into_iter()
+                .chain(
+                    local_function_object_types
+                        .iter()
+                        .map(|(identity, interface)| (identity.clone(), interface.clone())),
+                )
+                .map(|(identity, interface)| {
+                    Ok((identity, names.resolve_generic_type(&interface)?))
+                })
+                .collect::<Result<_, JavaDecompilerError>>()?,
+            source_abi.expected_function_object_identities(
+                cu_types.iter(),
+                local_function_object_types.keys().cloned(),
+            ),
+        );
+        let mut outer_instances = source_abi.referenced_outer_instances(cu_types.iter());
         if let Some((field, outer)) = method
             .body
             .as_ref()
@@ -257,7 +319,7 @@ impl JavaSingleMethodLowering {
             generic_fields,
             generic_methods,
             ConstructorMethodReturnTypes::new(),
-            std::collections::BTreeMap::new(),
+            source_object_types,
             outer_instances,
             observer,
         );
@@ -268,6 +330,89 @@ impl JavaSingleMethodLowering {
             None,
             &lowering.source_field_types,
         )
+    }
+}
+
+fn method_local_function_objects(
+    method: &JavaMethodModel,
+    current_type: Option<&ArgType>,
+) -> std::collections::BTreeMap<ArgType, crate::ir::generic_types::JvmTypeSignature> {
+    let Some(interface) = method.declaration.function_interface.clone() else {
+        return std::collections::BTreeMap::new();
+    };
+    let Some(identity) = current_type.cloned() else {
+        return std::collections::BTreeMap::new();
+    };
+    std::collections::BTreeMap::from([(identity, interface)])
+}
+
+/// Types that a compilation unit can mention without scanning the full ABI.
+///
+/// Function-object and outer-instance maps are cropped to this set so lowering
+/// does not copy every archive identity into each class.
+struct CompilationUnitAbiTypes;
+
+impl CompilationUnitAbiTypes {
+    fn collect(
+        class: Option<&JavaClassModel>,
+        field_references: &std::collections::BTreeSet<crate::ir::FieldReference>,
+        method_references: &std::collections::BTreeSet<crate::ir::MethodReference>,
+        type_uses: impl IntoIterator<Item = ArgType>,
+        current_type: Option<&ArgType>,
+        local_function_objects: &std::collections::BTreeMap<
+            ArgType,
+            crate::ir::generic_types::JvmTypeSignature,
+        >,
+    ) -> std::collections::BTreeSet<ArgType> {
+        let mut types = std::collections::BTreeSet::new();
+        if let Some(current_type) = current_type {
+            Self::insert(&mut types, current_type);
+        }
+        for ty in type_uses {
+            Self::insert(&mut types, &ty);
+        }
+        for field in field_references {
+            Self::insert(&mut types, &field.owner);
+            Self::insert(&mut types, &field.field_type);
+        }
+        for method in method_references {
+            Self::insert(&mut types, &method.owner);
+            for parameter in &method.descriptor.parameters {
+                Self::insert(&mut types, parameter);
+            }
+            Self::insert(&mut types, &method.descriptor.return_type);
+        }
+        for (identity, interface) in local_function_objects {
+            Self::insert(&mut types, identity);
+            Self::insert(&mut types, &interface.erased());
+        }
+        if let Some(class) = class {
+            let mut pending = vec![class];
+            while let Some(class) = pending.pop() {
+                pending.extend(class.nested.iter());
+                if let Some(current) = class.declaration.current_type() {
+                    Self::insert(&mut types, &current);
+                }
+                if let Some(extends) = &class.declaration.extends {
+                    Self::insert(&mut types, extends);
+                }
+                for interface in &class.declaration.implements {
+                    Self::insert(&mut types, interface);
+                }
+            }
+        }
+        types
+    }
+
+    fn insert(types: &mut std::collections::BTreeSet<ArgType>, ty: &ArgType) {
+        let mut current = ty;
+        loop {
+            types.insert(current.clone());
+            match current {
+                ArgType::Array(element) => current = element.as_ref(),
+                _ => break,
+            }
+        }
     }
 }
 
@@ -292,9 +437,9 @@ struct JavaTypeLowering<'a> {
         >,
     >,
     constructor_method_return_types: ConstructorMethodReturnTypes,
-    source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
+    source_object_types: std::sync::Arc<SourceObjectTypes>,
     outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
-    generic_type_projection: std::sync::Arc<dyn crate::language::java::GenericTypeProjection>,
+    generic_type_projection: std::rc::Rc<dyn crate::language::java::GenericTypeProjection>,
     observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
 }
 
@@ -309,14 +454,16 @@ struct SourceGenericTypeProjection {
 #[derive(Debug, Default)]
 struct GenericProjectionCache {
     specialized:
-        std::sync::Mutex<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
-    inferred: std::sync::Mutex<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
-    projected: std::sync::Mutex<std::collections::BTreeMap<(JavaType, ArgType), Option<JavaType>>>,
-    subtype_relations: std::sync::Mutex<
+        std::cell::RefCell<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
+    inferred: std::cell::RefCell<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
+    projected:
+        std::cell::RefCell<std::collections::BTreeMap<(JavaType, ArgType), Option<JavaType>>>,
+    subtype_relations: std::cell::RefCell<
         std::collections::BTreeMap<(ArgType, ArgType), crate::ir::analysis::SubtypeRelation>,
     >,
-    common_types: std::sync::Mutex<std::collections::BTreeMap<(ArgType, ArgType), Option<ArgType>>>,
-    resolved: std::sync::Mutex<std::collections::BTreeMap<ArgType, JavaType>>,
+    common_types:
+        std::cell::RefCell<std::collections::BTreeMap<(ArgType, ArgType), Option<ArgType>>>,
+    resolved: std::cell::RefCell<std::collections::BTreeMap<ArgType, JavaType>>,
 }
 
 impl SourceGenericTypeProjection {
@@ -349,7 +496,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         expected_supertype: &JavaType,
     ) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.specialized.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.specialized.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -359,15 +506,14 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .and_then(|specialized| self.names.resolve_generic_type(&specialized).ok());
         self.cache
             .specialized
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
 
     fn infer_subtype(&self, subtype: &ArgType, expected_supertype: &JavaType) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.inferred.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.inferred.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -375,7 +521,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .source_signature(expected_supertype)
             .and_then(|expected| self.source_abi.infer_subtype(subtype, &expected))
             .and_then(|inferred| self.names.resolve_generic_type(&inferred).ok());
-        self.cache.inferred.lock().ok()?.insert(key, result.clone());
+        self.cache.inferred.borrow_mut().insert(key, result.clone());
         result
     }
 
@@ -385,7 +531,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         expected_supertype: &ArgType,
     ) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.projected.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.projected.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -398,8 +544,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .and_then(|projected| self.names.resolve_generic_type(&projected).ok());
         self.cache
             .projected
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
@@ -411,13 +556,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
     ) -> crate::ir::analysis::SubtypeRelation {
         use crate::ir::analysis::{SubtypeRelation, TypeHierarchy};
         let key = (subtype.clone(), supertype.clone());
-        if let Some(result) = self
-            .cache
-            .subtype_relations
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&key).copied())
-        {
+        if let Some(result) = self.cache.subtype_relations.borrow().get(&key).copied() {
             return result;
         }
         let source_relation = (self.source_abi.is_subtype(subtype, supertype)
@@ -437,9 +576,10 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
                 }
                 _ => SubtypeRelation::Unknown,
             });
-        if let Ok(mut cache) = self.cache.subtype_relations.lock() {
-            cache.insert(key, result);
-        }
+        self.cache
+            .subtype_relations
+            .borrow_mut()
+            .insert(key, result);
         result
     }
 
@@ -450,7 +590,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         } else {
             (right.clone(), left.clone())
         };
-        if let Some(result) = self.cache.common_types.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.common_types.borrow().get(&key).cloned() {
             return result;
         }
         let result = match (left.as_object(), right.as_object()) {
@@ -462,8 +602,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         };
         self.cache
             .common_types
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
@@ -473,37 +612,29 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
     }
 
     fn resolve_type(&self, ty: &ArgType) -> Option<JavaType> {
-        if let Some(resolved) = self
-            .cache
-            .resolved
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(ty).cloned())
-        {
+        if let Some(resolved) = self.cache.resolved.borrow().get(ty).cloned() {
             return Some(resolved);
         }
         let resolved = self.names.resolve_type(ty).ok()?;
-        if let Ok(mut cache) = self.cache.resolved.lock() {
-            cache.insert(ty.clone(), resolved.clone());
-        }
+        self.cache
+            .resolved
+            .borrow_mut()
+            .insert(ty.clone(), resolved.clone());
         Some(resolved)
     }
 
     fn erasure_of(&self, ty: &JavaType) -> Option<ArgType> {
-        self.cache
+        let hit = self
+            .cache
             .resolved
-            .lock()
-            .ok()
-            .and_then(|cache| {
-                cache
-                    .iter()
-                    .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
-            })
-            .or_else(|| {
-                self.names
-                    .source_signature(ty)
-                    .map(|signature| signature.erased())
-            })
+            .borrow()
+            .iter()
+            .find_map(|(erased, source)| (source == ty).then(|| erased.clone()));
+        hit.or_else(|| {
+            self.names
+                .source_signature(ty)
+                .map(|signature| signature.erased())
+        })
     }
 
     fn declared_type_parameters(
@@ -532,7 +663,7 @@ impl<'a> JavaTypeLowering<'a> {
             crate::ir::generic_types::GenericMethodContract,
         >,
         constructor_method_return_types: ConstructorMethodReturnTypes,
-        source_object_types: std::collections::BTreeMap<ArgType, JavaType>,
+        source_object_types: SourceObjectTypes,
         outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
         observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
     ) -> Self {
@@ -548,7 +679,7 @@ impl<'a> JavaTypeLowering<'a> {
             constructor_method_return_types,
             source_object_types: std::sync::Arc::new(source_object_types),
             outer_instances,
-            generic_type_projection: std::sync::Arc::new(SourceGenericTypeProjection {
+            generic_type_projection: std::rc::Rc::new(SourceGenericTypeProjection {
                 names: names.clone(),
                 source_abi: shared_source_abi,
                 hierarchy,
@@ -1731,8 +1862,10 @@ fn method_kind(kind: MethodModelKind) -> JavaMethodDeclarationKind {
 
 #[cfg(test)]
 mod tests {
+    use super::super::java_model::JavaClassDeclaration;
     use super::*;
-    use crate::ir::generic_types::GenericSignatures;
+    use crate::ir::generic_types::{ClassTypeSignature, GenericSignatures, JvmTypeSignature};
+    use crate::ir::{FieldReference, MethodDescriptor, MethodReference};
     use crate::language::java::GenericTypeProjection;
 
     #[test]
@@ -1894,5 +2027,136 @@ mod tests {
                     .expect("source ArrayList type"),
             )
         );
+    }
+
+    fn class_model(
+        descriptor: &str,
+        extends: Option<ArgType>,
+        implements: Vec<ArgType>,
+        nested: Vec<JavaClassModel>,
+    ) -> JavaClassModel {
+        let simple = descriptor
+            .trim_start_matches('L')
+            .trim_end_matches(';')
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit('$').next())
+            .unwrap_or(descriptor);
+        let mut declaration = JavaClassDeclaration::new(JavaIdentifier::from_dex(simple));
+        declaration.type_descriptor = Some(descriptor.to_string());
+        declaration.extends = extends;
+        declaration.implements = implements;
+        JavaClassModel {
+            declaration,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            function_object: false,
+            outer_instance: None,
+            nested,
+        }
+    }
+
+    #[test]
+    fn compilation_unit_abi_types_covers_constructor_field_and_nested_lookups() {
+        let ctor_owner = ArgType::object("example/Fn");
+        let alloc = ArgType::object("example/Alloc");
+        let field_owner = ArgType::object("example/Outer$Inner");
+        let captured = ArgType::object("example/Captured");
+        let method_references = std::collections::BTreeSet::from([MethodReference {
+            owner: ctor_owner.clone(),
+            name: "<init>".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: vec![ArgType::object("example/Arg")],
+                return_type: ArgType::VOID,
+            },
+        }]);
+        let field_references = std::collections::BTreeSet::from([FieldReference {
+            owner: field_owner.clone(),
+            name: "this$0".to_string(),
+            field_type: ArgType::array(captured.clone()),
+        }]);
+        let local_fo = std::collections::BTreeMap::from([(
+            ArgType::object("example/LocalFn"),
+            JvmTypeSignature::ClassType(ClassTypeSignature {
+                raw_name: "java/lang/Runnable".to_string(),
+                type_arguments: Vec::new(),
+                inner_segments: Vec::new(),
+            }),
+        )]);
+        let current = ArgType::object("example/Host");
+        let class = class_model(
+            "Lexample/Host;",
+            Some(ArgType::object("example/Base")),
+            vec![ArgType::object("example/Iface")],
+            vec![class_model(
+                "Lexample/Host$Nested;",
+                Some(ArgType::object("java/lang/Object")),
+                vec![ArgType::object("java/lang/Runnable")],
+                Vec::new(),
+            )],
+        );
+
+        let types = CompilationUnitAbiTypes::collect(
+            Some(&class),
+            &field_references,
+            &method_references,
+            [ArgType::array(alloc.clone())],
+            Some(&current),
+            &local_fo,
+        );
+
+        assert!(
+            types.contains(&ctor_owner),
+            "constructor/new owners must be in the CU set"
+        );
+        assert!(types.contains(&ArgType::object("example/Arg")));
+        assert!(
+            types.contains(&field_owner),
+            "field owners must be in the CU set"
+        );
+        assert!(
+            types.contains(&captured),
+            "array field types must peel to the element erasure"
+        );
+        assert!(types.contains(&ArgType::array(captured)));
+        assert!(types.contains(&ArgType::object("example/LocalFn")));
+        assert!(
+            types.contains(&ArgType::object("java/lang/Runnable")),
+            "local FO interface erasure must be in the CU set"
+        );
+        assert!(types.contains(&current));
+        assert!(types.contains(&ArgType::object("example/Base")));
+        assert!(types.contains(&ArgType::object("example/Iface")));
+        assert!(types.contains(&ArgType::object("example/Host$Nested")));
+        assert!(
+            types.contains(&alloc),
+            "ClassTypeUses / allocation class_type keys must be in the CU set"
+        );
+        assert!(types.contains(&ArgType::array(alloc)));
+    }
+
+    #[test]
+    fn method_local_abi_types_include_current_type_and_constructor_owner() {
+        let current = ArgType::object("example/Host");
+        let ctor_owner = ArgType::object("example/Fn");
+        let method_references = std::collections::BTreeSet::from([MethodReference {
+            owner: ctor_owner.clone(),
+            name: "<init>".to_string(),
+            descriptor: MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::VOID,
+            },
+        }]);
+        let types = CompilationUnitAbiTypes::collect(
+            None,
+            &std::collections::BTreeSet::new(),
+            &method_references,
+            std::iter::empty(),
+            Some(&current),
+            &std::collections::BTreeMap::new(),
+        );
+
+        assert!(types.contains(&current));
+        assert!(types.contains(&ctor_owner));
     }
 }

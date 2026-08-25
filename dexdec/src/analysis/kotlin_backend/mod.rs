@@ -53,12 +53,16 @@ pub(crate) use kotlin_model::{FunctionObjectClass, KotlinSourceAbi};
 pub struct KotlinDecompilerConfig {
     /// Indent string (default: 4 spaces)
     pub indent: String,
+    /// Lower methods of one class through rayon. Batch callers running class
+    /// jobs on the shared pool turn this off to avoid nested parallelism.
+    pub parallel_methods: bool,
 }
 
 impl Default for KotlinDecompilerConfig {
     fn default() -> Self {
         Self {
             indent: "    ".to_string(),
+            parallel_methods: true,
         }
     }
 }
@@ -85,6 +89,15 @@ impl KotlinDecompiler {
     pub fn with_shared_type_hierarchy(mut self, hierarchy: Arc<ClassHierarchyIndex>) -> Self {
         self.type_hierarchy = hierarchy;
         self
+    }
+
+    pub fn with_parallel_methods(mut self, parallel_methods: bool) -> Self {
+        self.config.parallel_methods = parallel_methods;
+        self
+    }
+
+    pub(crate) fn parallel_methods(&self) -> bool {
+        self.config.parallel_methods
     }
 
     pub fn with_analysis_observer(

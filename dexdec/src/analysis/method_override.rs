@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
+
+use rayon::prelude::*;
 
 use crate::frontend::{
     AccessInfo, AnalysisDiagnostic, AnalysisLocation, ClassNode, DexFileReader, MethodNode,
@@ -12,7 +14,7 @@ use crate::ir::generic_types::{
     ClassSignature, ClassTypeSignature, GenericMethodContract, GenericSignatures, JvmTypeSignature,
     MethodSignature, SignatureSubstitutionError, TypeArgument, TypeParameter, TypeSubstitution,
 };
-use crate::ir::ty::ArgType;
+use crate::ir::ty::{ArgType, MethodDescriptor};
 use crate::platform_symbols::{default_platform_symbols, PlatformClass, PlatformSymbolSet};
 
 #[derive(Debug)]
@@ -105,10 +107,11 @@ pub(crate) struct ClassDetails {
     generic_signature: Option<ClassSignature>,
     instantiated_self: Option<ClassTypeSignature>,
     methods: Vec<MethodDetails>,
+    method_candidates: OnceLock<HashMap<MethodCandidateKey, Vec<usize>>>,
 }
 
 pub(crate) trait ClassHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails>;
+    fn class_details(&self, ty: &ArgType) -> Option<Arc<ClassDetails>>;
 }
 
 pub(crate) fn collect_instantiated_super_types<H: ClassHierarchy>(
@@ -157,9 +160,25 @@ pub(crate) trait OverrideAnalysisTarget {
     );
 }
 
+pub(crate) trait LoadedOverrideAnalysisTarget {
+    fn loaded_override_classes(&self) -> Vec<ClassDetails>;
+}
+
+impl LoadedOverrideAnalysisTarget for DexFileReader {
+    fn loaded_override_classes(&self) -> Vec<ClassDetails> {
+        let classes = self
+            .classes()
+            .filter_map(|class| MetadataDecoder::default().class(class).ok())
+            .collect();
+        classes
+    }
+}
+
 pub(crate) struct MethodOverrideAnalyzer<'a, H> {
     hierarchy: &'a H,
 }
+
+type MethodCandidateKey = (String, usize);
 
 impl<'a, H> MethodOverrideAnalyzer<'a, H>
 where
@@ -179,6 +198,28 @@ where
             };
             for method in &class.methods {
                 let Ok(semantics) = self.analyze_method(class, method, &ancestors) else {
+                    continue;
+                };
+                target.set_method_override(
+                    &method.reference.declaring_class,
+                    &method.reference.short_id,
+                    semantics,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn analyze_loaded<T>(&self, target: &mut T) -> OverrideResult<()>
+    where
+        T: LoadedOverrideAnalysisTarget + OverrideAnalysisTarget,
+    {
+        for details in target.loaded_override_classes() {
+            let Ok(ancestors) = self.collect_super_types(&details) else {
+                continue;
+            };
+            for method in &details.methods {
+                let Ok(semantics) = self.analyze_method(&details, method, &ancestors) else {
                     continue;
                 };
                 target.set_method_override(
@@ -253,13 +294,16 @@ where
         owner: &ClassDetails,
     ) -> OverrideResult<Option<(MethodDetails, Option<MethodSignature>)>> {
         let mut best: Option<(&MethodDetails, Option<MethodSignature>)> = None;
-        for candidate in &ancestor.methods {
-            if candidate.access_flags.is_static()
-                || !method_visible_from(candidate, ancestor, owner)
-                || method_name(&candidate.reference.short_id)
-                    != method_name(&method.reference.short_id)
-                || candidate.params.len() != method.params.len()
-            {
+        let key = (
+            method_name(&method.reference.short_id).to_string(),
+            method.params.len(),
+        );
+        let Some(indices) = ancestor.method_candidates().get(&key) else {
+            return Ok(None);
+        };
+        for index in indices {
+            let candidate = &ancestor.methods[*index];
+            if !method_visible_from(candidate, ancestor, owner) {
                 continue;
             }
             let candidate_signature = candidate
@@ -388,13 +432,34 @@ where
             if details.descriptor == format!("L{base};") {
                 return true;
             }
-            queue.extend(details.parents);
+            queue.extend(details.parents.iter().cloned());
         }
         false
     }
 }
 
 impl ClassDetails {
+    fn method_candidates(&self) -> &HashMap<MethodCandidateKey, Vec<usize>> {
+        self.method_candidates.get_or_init(|| {
+            let mut candidates: HashMap<MethodCandidateKey, Vec<usize>> = HashMap::new();
+            for (index, method) in self.methods.iter().enumerate() {
+                if method.reference.short_id.starts_with("<init>(")
+                    || method.reference.short_id.starts_with("<clinit>(")
+                    || method.access_flags.is_static()
+                    || method.access_flags.is_private()
+                {
+                    continue;
+                }
+                let key = (
+                    method_name(&method.reference.short_id).to_string(),
+                    method.params.len(),
+                );
+                candidates.entry(key).or_default().push(index);
+            }
+            candidates
+        })
+    }
+
     fn is_raw_instantiation(&self) -> bool {
         self.instantiated_self
             .as_ref()
@@ -480,6 +545,7 @@ pub(crate) fn bind_class<H: ClassHierarchy>(
         generic_signature: class.generic_signature.clone(),
         instantiated_self: class_type_signature_from_java_signature(instantiated_self).cloned(),
         methods,
+        method_candidates: OnceLock::new(),
     })
 }
 
@@ -652,7 +718,7 @@ fn method_visible_from(
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoadedClassHierarchy {
-    classes: BTreeMap<String, ClassDetails>,
+    classes: BTreeMap<String, Arc<ClassDetails>>,
 }
 
 impl LoadedClassHierarchy {
@@ -669,15 +735,45 @@ impl LoadedClassHierarchy {
             .map(|class| decoder.class(class))
             .collect::<OverrideResult<Vec<_>>>()?
             .into_iter()
-            .map(|class| (class.descriptor.clone(), class))
+            .map(|class| (class.descriptor.clone(), Arc::new(class)))
             .collect();
         Ok((Self { classes }, decoder.diagnostics))
     }
 }
 
+type MethodOverloadKey = (String, usize);
+type MethodOverloadSet = Vec<MethodDescriptor>;
+type MethodOverloadsByKey = BTreeMap<MethodOverloadKey, MethodOverloadSet>;
+
+/// Owner → (name, arity) → overloads declared on that owner or a parent.
+/// Sets store descriptors only; lookup remaps `MethodReference.owner` so the
+/// returned order still matches the previous `BTreeSet` walk.
+#[derive(Debug, Default)]
+struct MethodOverloadIndex {
+    by_owner: RwLock<BTreeMap<ArgType, MethodOverloadsByKey>>,
+}
+
+fn remap_overloads(
+    owner: &ArgType,
+    name: &str,
+    descriptors: &[MethodDescriptor],
+) -> Vec<crate::ir::MethodReference> {
+    descriptors
+        .iter()
+        .map(|descriptor| crate::ir::MethodReference {
+            owner: owner.clone(),
+            name: name.to_string(),
+            descriptor: descriptor.clone(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GenericTypeHierarchy {
     hierarchy: CompositeClassHierarchy,
+    method_overloads: Arc<MethodOverloadIndex>,
+    method_contracts:
+        Arc<RwLock<HashMap<crate::ir::MethodReference, Option<GenericMethodContract>>>>,
 }
 
 impl GenericTypeHierarchy {
@@ -685,9 +781,20 @@ impl GenericTypeHierarchy {
         classes: impl IntoIterator<Item = &'a ClassNode>,
     ) -> OverrideResult<Self> {
         let (loaded, _) = LoadedClassHierarchy::decode_classes(classes)?;
-        Ok(Self {
+        let owners = loaded
+            .classes
+            .keys()
+            .filter_map(|descriptor| descriptor.parse().ok())
+            .collect::<Vec<_>>();
+        let hierarchy = Self {
             hierarchy: CompositeClassHierarchy::from_loaded(loaded)?,
-        })
+            method_overloads: Arc::new(MethodOverloadIndex::default()),
+            method_contracts: Arc::new(RwLock::new(HashMap::new())),
+        };
+        owners
+            .into_par_iter()
+            .for_each(|owner| hierarchy.ensure_method_overloads(&owner));
+        Ok(hierarchy)
     }
 
     pub(crate) fn inherited_method_signature(
@@ -721,27 +828,49 @@ impl GenericTypeHierarchy {
         self.hierarchy.class_details(ty).map(|class| {
             class
                 .generic_signature
-                .map(|signature| signature.type_parameters)
+                .as_ref()
+                .map(|signature| signature.type_parameters.clone())
                 .unwrap_or_default()
         })
     }
 
     pub(crate) fn is_subtype(&self, subtype: &ArgType, supertype: &ArgType) -> bool {
-        let mut pending = VecDeque::from([subtype.clone()]);
+        crate::profile_scope!("hierarchy.is_subtype", {
+            let mut pending = VecDeque::from([subtype.clone()]);
+            let mut visited = BTreeSet::new();
+            while let Some(candidate) = pending.pop_front() {
+                if candidate == *supertype {
+                    return true;
+                }
+                if !visited.insert(candidate.clone()) {
+                    continue;
+                }
+                let Some(declared) = self.hierarchy.class_details(&candidate) else {
+                    continue;
+                };
+                pending.extend(declared.parents.iter().cloned());
+            }
+            false
+        })
+    }
+
+    /// Every type reachable from `ty` through parent links, including `ty`.
+    /// `is_subtype(ty, other)` holds exactly when `other` is in this closure,
+    /// so callers testing many candidates against one type can reuse a single
+    /// walk instead of one search per candidate.
+    pub(crate) fn ancestor_closure(&self, ty: &ArgType) -> BTreeSet<ArgType> {
+        let mut pending = VecDeque::from([ty.clone()]);
         let mut visited = BTreeSet::new();
         while let Some(candidate) = pending.pop_front() {
-            if candidate == *supertype {
-                return true;
-            }
             if !visited.insert(candidate.clone()) {
                 continue;
             }
             let Some(declared) = self.hierarchy.class_details(&candidate) else {
                 continue;
             };
-            pending.extend(declared.parents);
+            pending.extend(declared.parents.iter().cloned());
         }
-        false
+        visited
     }
 
     pub(crate) fn functional_interface(
@@ -783,7 +912,7 @@ impl GenericTypeHierarchy {
             let Some(declared) = self.hierarchy.class_details(&candidate) else {
                 continue;
             };
-            for method in declared.methods {
+            for method in &declared.methods {
                 if method.access_flags.is_static() || method.access_flags.is_private() {
                     continue;
                 }
@@ -794,7 +923,7 @@ impl GenericTypeHierarchy {
                     .entry((reference.name, reference.descriptor.parameters))
                     .or_insert_with(|| method.access_flags.is_abstract());
             }
-            pending.extend(declared.parents);
+            pending.extend(declared.parents.iter().cloned());
         }
         methods
     }
@@ -803,7 +932,7 @@ impl GenericTypeHierarchy {
         self.hierarchy
             .class_details(owner)
             .into_iter()
-            .flat_map(|declared| declared.methods)
+            .flat_map(|declared| declared.methods.clone())
             .filter(|method| {
                 !method.access_flags.is_static()
                     && !method.access_flags.is_private()
@@ -825,6 +954,49 @@ impl GenericTypeHierarchy {
     }
 
     pub(crate) fn method_overloads(
+        &self,
+        method: &crate::ir::MethodReference,
+    ) -> Vec<crate::ir::MethodReference> {
+        self.ensure_method_overloads(&method.owner);
+        let key = (method.name.clone(), method.descriptor.parameters.len());
+        let Ok(index) = self.method_overloads.by_owner.read() else {
+            return remap_overloads(
+                &method.owner,
+                &method.name,
+                self.collect_owner_overloads(&method.owner)
+                    .remove(&key)
+                    .unwrap_or_default()
+                    .as_slice(),
+            );
+        };
+        index
+            .get(&method.owner)
+            .and_then(|overloads| overloads.get(&key))
+            .map(|descriptors| remap_overloads(&method.owner, &method.name, descriptors))
+            .unwrap_or_default()
+    }
+
+    fn ensure_method_overloads(&self, owner: &ArgType) {
+        if self
+            .method_overloads
+            .by_owner
+            .read()
+            .map(|index| index.contains_key(owner))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let grouped = self.collect_owner_overloads(owner);
+        if let Ok(mut index) = self.method_overloads.by_owner.write() {
+            // Recheck after the walk so a concurrent fill of the same owner is kept.
+            if !index.contains_key(owner) {
+                index.insert(owner.clone(), grouped);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn method_overloads_walk(
         &self,
         method: &crate::ir::MethodReference,
     ) -> Vec<crate::ir::MethodReference> {
@@ -854,12 +1026,61 @@ impl GenericTypeHierarchy {
                         descriptor: candidate.descriptor,
                     }),
             );
-            pending.extend(declared.parents);
+            pending.extend(declared.parents.iter().cloned());
         }
         overloads.into_iter().collect()
     }
 
+    fn collect_owner_overloads(&self, owner: &ArgType) -> MethodOverloadsByKey {
+        let mut overloads = MethodOverloadsByKey::new();
+        let mut pending = vec![owner.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let Some(declared) = self.hierarchy.class_details(&current) else {
+                continue;
+            };
+            for candidate in declared
+                .methods
+                .iter()
+                .filter_map(|candidate| Self::ir_method_reference(&candidate.reference))
+            {
+                let arity = candidate.descriptor.parameters.len();
+                overloads
+                    .entry((candidate.name, arity))
+                    .or_default()
+                    .push(candidate.descriptor);
+            }
+            pending.extend(declared.parents.iter().cloned());
+        }
+        for descriptors in overloads.values_mut() {
+            descriptors.sort();
+            descriptors.dedup();
+        }
+        overloads
+    }
+
     pub(crate) fn method_contract(
+        &self,
+        method: &crate::ir::MethodReference,
+    ) -> Option<GenericMethodContract> {
+        if let Ok(guard) = self.method_contracts.read() {
+            if let Some(cached) = guard.get(method) {
+                return cached.clone();
+            }
+        }
+        let computed = self.method_contract_uncached(method);
+        if let Ok(mut guard) = self.method_contracts.write() {
+            guard
+                .entry(method.clone())
+                .or_insert_with(|| computed.clone());
+        }
+        computed
+    }
+
+    fn method_contract_uncached(
         &self,
         method: &crate::ir::MethodReference,
     ) -> Option<GenericMethodContract> {
@@ -1109,25 +1330,29 @@ impl GenericTypeHierarchy {
         instantiated_owner: &JvmTypeSignature,
         declaring_owner: &ClassTypeSignature,
     ) -> Option<TypeSubstitution> {
-        let owner = self.hierarchy.class_details(&instantiated_owner.erased())?;
-        let bound = bind_class(&self.hierarchy, &owner, instantiated_owner).ok()?;
-        let super_types = collect_instantiated_super_types(&self.hierarchy, &bound).ok()?;
-        let declaring_erasure = JvmTypeSignature::ClassType(declaring_owner.clone()).erased();
-        let projected_owner = std::iter::once(bound)
-            .chain(super_types)
-            .find_map(|candidate| {
-                candidate.instantiated_self.filter(|candidate| {
-                    JvmTypeSignature::ClassType(candidate.clone()).erased() == declaring_erasure
-                })
-            })?;
-        let declaration = self.hierarchy.class_details(&declaring_erasure)?;
-        let substitutions = class_type_substitution(
-            &self.hierarchy,
-            &declaration,
-            &JvmTypeSignature::ClassType(projected_owner),
-        )
-        .ok()?;
-        Some(substitutions)
+        crate::profile_scope!("hierarchy.member_substitution", {
+            let owner = self.hierarchy.class_details(&instantiated_owner.erased())?;
+            let bound = bind_class(&self.hierarchy, &owner, instantiated_owner).ok()?;
+            let super_types = collect_instantiated_super_types(&self.hierarchy, &bound).ok()?;
+            let declaring_erasure = JvmTypeSignature::ClassType(declaring_owner.clone()).erased();
+            let projected_owner =
+                std::iter::once(bound)
+                    .chain(super_types)
+                    .find_map(|candidate| {
+                        candidate.instantiated_self.filter(|candidate| {
+                            JvmTypeSignature::ClassType(candidate.clone()).erased()
+                                == declaring_erasure
+                        })
+                    })?;
+            let declaration = self.hierarchy.class_details(&declaring_erasure)?;
+            let substitutions = class_type_substitution(
+                &self.hierarchy,
+                &declaration,
+                &JvmTypeSignature::ClassType(projected_owner),
+            )
+            .ok()?;
+            Some(substitutions)
+        })
     }
 }
 
@@ -1254,7 +1479,7 @@ pub fn platform_generic_method_contract(
 }
 
 impl ClassHierarchy for LoadedClassHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
+    fn class_details(&self, ty: &ArgType) -> Option<Arc<ClassDetails>> {
         let descriptor = ty.to_descriptor();
         self.classes.get(&descriptor).cloned()
     }
@@ -1276,7 +1501,7 @@ impl CompositeClassHierarchy {
 }
 
 impl ClassHierarchy for CompositeClassHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
+    fn class_details(&self, ty: &ArgType) -> Option<Arc<ClassDetails>> {
         self.loaded.class_details(ty).or_else(|| {
             self.platform
                 .as_ref()
@@ -1285,17 +1510,26 @@ impl ClassHierarchy for CompositeClassHierarchy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum DetailsTable {
+    Filling(HashMap<String, Arc<ClassDetails>>),
+    Frozen {
+        map: Arc<HashMap<String, Arc<ClassDetails>>>,
+        extras: RwLock<HashMap<String, Arc<ClassDetails>>>,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct PlatformClassSet {
     symbols: Arc<PlatformSymbolSet>,
-    details: Arc<std::sync::RwLock<BTreeMap<String, ClassDetails>>>,
+    details: RwLock<DetailsTable>,
 }
 
 impl PlatformClassSet {
     pub fn load_default() -> io::Result<Self> {
         Ok(Self {
             symbols: default_platform_symbols()?,
-            details: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            details: RwLock::new(DetailsTable::Filling(HashMap::new())),
         })
     }
 
@@ -1316,22 +1550,108 @@ impl PlatformClassSet {
         }
     }
 
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
-        let descriptor = ty.to_descriptor();
-        if let Some(details) = self
-            .details
-            .read()
-            .ok()
-            .and_then(|details| details.get(&descriptor).cloned())
-        {
-            return Some(details);
+    pub(crate) fn freeze_details(&self) {
+        let Ok(mut table) = self.details.write() else {
+            return;
+        };
+        if let DetailsTable::Filling(map) = &mut *table {
+            let map = std::mem::take(map);
+            *table = DetailsTable::Frozen {
+                map: Arc::new(map),
+                extras: RwLock::new(HashMap::new()),
+            };
         }
-        let details = platform_class_details(self.symbols.class(&descriptor)?).ok()?;
-        if let Ok(mut cache) = self.details.write() {
-            cache.entry(descriptor).or_insert_with(|| details.clone());
-        }
-        Some(details)
     }
+
+    fn class_details(&self, ty: &ArgType) -> Option<Arc<ClassDetails>> {
+        let descriptor = ty.to_descriptor();
+        match self.details.read() {
+            Ok(table) => match &*table {
+                DetailsTable::Frozen { map, extras } => {
+                    if let Some(details) = map.get(&descriptor) {
+                        return Some(Arc::clone(details));
+                    }
+                    if let Ok(extra) = extras.read() {
+                        if let Some(details) = extra.get(&descriptor) {
+                            return Some(Arc::clone(details));
+                        }
+                    }
+                }
+                DetailsTable::Filling(map) => {
+                    if let Some(details) = map.get(&descriptor) {
+                        return Some(Arc::clone(details));
+                    }
+                }
+            },
+            Err(_) => {
+                return parse_symbol_class_details(&self.symbols, &descriptor).map(Arc::new);
+            }
+        }
+
+        let details = Arc::new(parse_symbol_class_details(&self.symbols, &descriptor)?);
+        let mut table = match self.details.write() {
+            Ok(table) => table,
+            Err(_) => return Some(details),
+        };
+        match &mut *table {
+            DetailsTable::Frozen { map, extras } => {
+                if let Some(existing) = map.get(&descriptor) {
+                    return Some(Arc::clone(existing));
+                }
+                if let Ok(mut extra) = extras.write() {
+                    extra
+                        .entry(descriptor)
+                        .or_insert_with(|| Arc::clone(&details));
+                }
+                Some(details)
+            }
+            DetailsTable::Filling(map) => {
+                Some(Arc::clone(map.entry(descriptor).or_insert_with(|| details)))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_class_count(&self) -> usize {
+        match self.details.read() {
+            Ok(table) => match &*table {
+                DetailsTable::Filling(map) => map.len(),
+                DetailsTable::Frozen { map, extras } => {
+                    map.len() + extras.read().map(|extra| extra.len()).unwrap_or(0)
+                }
+            },
+            Err(_) => 0,
+        }
+    }
+
+    fn is_frozen(&self) -> bool {
+        matches!(
+            self.details.read().as_deref(),
+            Ok(DetailsTable::Frozen { .. })
+        )
+    }
+}
+
+fn parse_symbol_class_details(
+    symbols: &PlatformSymbolSet,
+    descriptor: &str,
+) -> Option<ClassDetails> {
+    symbols
+        .class(descriptor)
+        .and_then(|class| platform_class_details(class).ok())
+}
+
+pub fn freeze_default_platform_class_details() {
+    if let Ok(platform) = PlatformClassSet::default_cached() {
+        platform.freeze_details();
+    }
+}
+
+#[doc(hidden)]
+pub fn default_platform_class_details_are_frozen() -> bool {
+    PlatformClassSet::default_cached()
+        .ok()
+        .is_some_and(|platform| platform.is_frozen())
 }
 
 fn platform_class_details(class: &PlatformClass) -> io::Result<ClassDetails> {
@@ -1421,6 +1741,7 @@ fn platform_class_details(class: &PlatformClass) -> io::Result<ClassDetails> {
         generic_signature,
         instantiated_self: None,
         methods,
+        method_candidates: OnceLock::new(),
     })
 }
 
@@ -1538,6 +1859,7 @@ fn platform_hierarchy_index() -> OverrideResult<Arc<ClassHierarchyIndex>> {
                     },
                 );
             }
+            freeze_shared_hierarchy(&mut index);
             let index = Arc::new(index);
             match PLATFORM_HIERARCHY.set(Arc::clone(&index)) {
                 Ok(()) => Ok(index),
@@ -1572,7 +1894,22 @@ pub(crate) fn type_hierarchy_index(reader: &DexFileReader) -> OverrideResult<Cla
         })
         .collect::<OverrideResult<Vec<_>>>()?;
     index.extend_declared_types(declarations);
+    freeze_shared_hierarchy(&mut index);
     Ok(index)
+}
+
+fn freeze_shared_hierarchy(index: &mut ClassHierarchyIndex) {
+    // DEXDEC_HIERARCHY_LAZY=1 skips precomputation. Read at OnceLock fill and
+    // each type_hierarchy_index call.
+    if hierarchy_lazy_distances() {
+        return;
+    }
+    index.freeze_distances();
+    index.set_frozen_required(true);
+}
+
+fn hierarchy_lazy_distances() -> bool {
+    std::env::var_os("DEXDEC_HIERARCHY_LAZY").is_some_and(|value| value == "1")
 }
 
 fn hierarchy_object_name(descriptor: &str) -> OverrideResult<String> {
@@ -1590,7 +1927,7 @@ fn hierarchy_object_name(descriptor: &str) -> OverrideResult<String> {
 }
 
 impl ClassHierarchy for PlatformClassSet {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
+    fn class_details(&self, ty: &ArgType) -> Option<Arc<ClassDetails>> {
         PlatformClassSet::class_details(self, ty)
     }
 }
@@ -1657,6 +1994,7 @@ impl MetadataDecoder {
             generic_signature,
             instantiated_self: None,
             methods,
+            method_candidates: OnceLock::new(),
         })
     }
 
@@ -1768,14 +2106,13 @@ pub fn analyze_loaded_method_overrides(reader: &mut DexFileReader) -> OverrideRe
         "override.loaded_hierarchy",
         LoadedClassHierarchy::decode(reader)
     )?;
-    let classes = loaded.classes.values().cloned().collect::<Vec<_>>();
     let hierarchy = crate::profile_scope!(
         "override.composite_hierarchy",
         CompositeClassHierarchy::from_loaded(loaded)
     )?;
     crate::profile_scope!(
         "override.method_analysis",
-        MethodOverrideAnalyzer::new(&hierarchy).analyze(reader, &classes)
+        MethodOverrideAnalyzer::new(&hierarchy).analyze_loaded(reader)
     )?;
     reader.replace_analysis_diagnostics(diagnostics);
     Ok(())

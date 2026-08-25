@@ -60,7 +60,7 @@ impl<'a> SynchronizationAnalysis<'a> {
                     .block(position.block)
                     .and_then(|block| block.insns.get(position.index))?;
                 (instruction.insn_type == InsnType::ConstClass)
-                    .then(|| instruction.payload.class_type.clone())
+                    .then(|| instruction.payload.class_type.as_deref().cloned())
                     .flatten()
                     .map(|class| {
                         (
@@ -953,9 +953,9 @@ mod tests {
 
     fn invocation(reference: &str) -> InsnNode {
         let mut instruction = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        instruction.payload.reference = Some(MemberReference::Method(
+        instruction.payload.reference = Some(Box::new(MemberReference::Method(
             reference.parse::<MethodReference>().unwrap(),
-        ));
+        )));
         instruction
     }
 
@@ -984,7 +984,7 @@ mod tests {
         let result = RegisterArg::with_ssa(register, ArgType::class(), version);
         let argument = InsnArg::Reg(result.clone());
         let mut instruction = InsnNode::const_class(result, type_index);
-        instruction.payload.class_type = Some(ArgType::object(class));
+        instruction.payload.class_type = Some(Box::new(ArgType::object(class)));
         (instruction, argument)
     }
 

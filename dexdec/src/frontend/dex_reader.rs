@@ -548,6 +548,39 @@ impl DexFileReader {
         Ok(self.classes.get(class_name))
     }
 
+    /// Load many classes while rebuilding class-graph facts only once.
+    pub fn load_classes(
+        &mut self,
+        class_names: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> DexResult<()> {
+        let mut changed = false;
+        for class_name in class_names {
+            changed |= self.load_class_without_relinking(class_name.as_ref())?;
+        }
+        if changed {
+            self.mark_override_analysis_dirty();
+            self.link_inner_classes();
+        }
+        Ok(())
+    }
+
+    fn load_class_without_relinking(&mut self, class_name: &str) -> DexResult<bool> {
+        if self.classes.contains_key(class_name) {
+            return Ok(false);
+        }
+        let Some(&(dex_index, class_index)) = self.class_locations.get(class_name) else {
+            return Ok(false);
+        };
+        self.dex_files[dex_index].materialize_class(class_index)?;
+        let id = self.classes.len() as u32;
+        let class_node = {
+            let dex = &self.dex_files[dex_index];
+            self.load_class_from_def(id, &dex.classes.items[class_index], dex)?
+        };
+        self.classes.insert(class_name.to_string(), class_node);
+        Ok(true)
+    }
+
     /// Load a class from ClassDefItem
     fn load_class_from_def(
         &self,
@@ -674,63 +707,8 @@ impl DexFileReader {
         &self,
         code_item: &rusty_dex::dex::code_item::CodeItem,
     ) -> DexResult<MethodCode> {
-        // Convert instructions to raw u16 words
-        // NOTE: rusty_dex payload instructions (packed/sparse switch) return empty bytes(),
-        // so we manually serialize their payload data here.
         let insns: Vec<u16> = if let Some(insns) = &code_item.insns {
-            let mut words = Vec::new();
-            for insn in insns {
-                match insn {
-                    rusty_dex::dex::instructions::Instructions::PackedSwitchPayload(payload) => {
-                        words.push(0x0100);
-                        words.push(payload.get_size() as u16);
-
-                        let first_key = payload.get_first_key() as u32;
-                        words.push((first_key & 0xFFFF) as u16);
-                        words.push((first_key >> 16) as u16);
-
-                        for &target in payload.get_targets() {
-                            let target = target as u32;
-                            words.push((target & 0xFFFF) as u16);
-                            words.push((target >> 16) as u16);
-                        }
-                    }
-                    rusty_dex::dex::instructions::Instructions::SparseSwitchPayload(payload) => {
-                        words.push(0x0200);
-                        words.push(payload.get_size() as u16);
-
-                        for &key in payload.get_keys() {
-                            let key = key as u32;
-                            words.push((key & 0xFFFF) as u16);
-                            words.push((key >> 16) as u16);
-                        }
-
-                        for &target in payload.get_targets() {
-                            let target = target as u32;
-                            words.push((target & 0xFFFF) as u16);
-                            words.push((target >> 16) as u16);
-                        }
-                    }
-                    rusty_dex::dex::instructions::Instructions::FillArrayDataPayload(payload) => {
-                        words.push(0x0300);
-                        words.push(payload.get_element_width());
-
-                        let size = payload.get_size();
-                        words.push((size & 0xFFFF) as u16);
-                        words.push((size >> 16) as u16);
-
-                        for chunk in payload.get_data().chunks(2) {
-                            let low = chunk.first().copied().unwrap_or(0) as u16;
-                            let high = chunk.get(1).copied().unwrap_or(0) as u16;
-                            words.push(low | (high << 8));
-                        }
-                    }
-                    _ => {
-                        words.extend(insn.bytes().iter().copied());
-                    }
-                }
-            }
-            words
+            insns.clone()
         } else {
             Vec::new()
         };
@@ -851,6 +829,15 @@ impl DexFileReader {
         }
         self.classes.clear();
         self.mark_override_analysis_dirty();
+    }
+
+    /// Drop loaded class nodes after archive collect clones render inputs.
+    ///
+    /// Marks override analysis dirty so a later request cannot reuse Ready
+    /// state on an empty graph. CLI process exit may still `mem::forget` the
+    /// whole `Decompiler` to skip remaining destructor time.
+    pub(crate) fn abandon_loaded_classes(&mut self) {
+        self.clear_loaded_classes();
     }
 
     /// Get the index of the DEX file containing the class

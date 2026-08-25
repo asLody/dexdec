@@ -63,7 +63,7 @@ impl InstructionTree {
                 InsnArg::Lit(_) => {}
                 InsnArg::Wrapped(instruction) => {
                     visitor.visit_instruction(instruction);
-                    pending.extend(instruction.payload.compound_target.iter());
+                    pending.extend(instruction.payload.compound_target.as_deref().iter());
                     pending.extend(instruction.args.iter().rev());
                 }
             }
@@ -103,7 +103,13 @@ impl InstructionTree {
                         let argument_count = instruction.args.len();
                         let has_target = instruction.payload.compound_target.is_some();
                         let mut children = std::mem::take(&mut instruction.args);
-                        children.extend(instruction.payload.compound_target.take());
+                        children.extend(
+                            instruction
+                                .payload
+                                .compound_target
+                                .take()
+                                .map(|target| *target),
+                        );
                         pending.push(TransformTask::Instruction {
                             instruction,
                             argument_count,
@@ -128,11 +134,15 @@ impl InstructionTree {
                         .args
                         .extend(children.by_ref().take(argument_count));
                     if has_target {
-                        instruction.payload.compound_target =
-                            Some(children.next().ok_or(InstructionTreeError::ChildArity {
-                                expected: child_count,
-                                actual: child_count.saturating_sub(1),
-                            })?);
+                        instruction.payload.compound_target = Some(
+                            children
+                                .next()
+                                .ok_or(InstructionTreeError::ChildArity {
+                                    expected: child_count,
+                                    actual: child_count.saturating_sub(1),
+                                })
+                                .map(Box::new)?,
+                        );
                     }
                     results.push(transform.transform_wrapped(instruction));
                 }
@@ -158,7 +168,8 @@ impl InstructionTree {
             .map(|argument| Self::transform_arg(argument, transform))
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(target) = instruction.payload.compound_target.take() {
-            instruction.payload.compound_target = Some(Self::transform_arg(target, transform)?);
+            instruction.payload.compound_target =
+                Some(Self::transform_arg(*target, transform).map(Box::new)?);
         }
         Ok(())
     }

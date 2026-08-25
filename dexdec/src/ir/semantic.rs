@@ -1088,14 +1088,14 @@ mod branch_effect_tests {
         let mut instruction = InsnNode::new(InsnType::Invoke, 0);
         instruction.id = InstructionId::new(1);
         instruction.payload.invoke_type = Some(InvokeType::Virtual);
-        instruction.payload.reference = Some(MemberReference::Method(MethodReference {
+        instruction.payload.reference = Some(Box::new(MemberReference::Method(MethodReference {
             owner: ArgType::object("java/util/ArrayList"),
             name: "remove".into(),
             descriptor: MethodDescriptor {
                 parameters: vec![ArgType::object("java/lang/Object")],
                 return_type: ArgType::BOOLEAN,
             },
-        }));
+        })));
         instruction.result = Some(RegisterArg::new_ssa(0, 0, ArgType::BOOLEAN));
         let operation = SemanticOperation::from_instruction(instruction).expect("invoke");
         SemanticPredicate::Test(operation)

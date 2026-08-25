@@ -79,7 +79,7 @@ impl SourceEvaluation {
             }
             _ => {
                 let mut arguments = instruction.args.iter().collect::<Vec<_>>();
-                arguments.extend(instruction.payload.compound_target.iter());
+                arguments.extend(instruction.payload.compound_target.as_deref().iter());
                 arguments
             }
         })

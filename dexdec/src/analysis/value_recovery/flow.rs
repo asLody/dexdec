@@ -293,7 +293,7 @@ pub(super) struct ValueFlowGraph<'ir> {
     predicate_uses: BTreeMap<crate::ir::InstructionId, BTreeSet<PredicateUseFact>>,
     canonical: BTreeMap<SsaVar, InsnArg>,
     identity_statements: Vec<(crate::ir::SemanticSiteId, usize)>,
-    semantic_flow: Option<crate::ir::analysis::SemanticFlowGraph>,
+    semantic_flow: Option<Arc<crate::ir::analysis::SemanticFlowGraph>>,
 }
 
 impl<'ir> ValueFlowGraph<'ir> {
@@ -302,7 +302,16 @@ impl<'ir> ValueFlowGraph<'ir> {
         values: &SsaValueGraph,
         canonical: &BTreeMap<SsaVar, InsnArg>,
     ) -> Result<Self, ValueRecoveryError> {
-        Self::build_ssa(root, values, canonical, true)
+        Self::build_ssa(root, values, canonical, true, &mut None)
+    }
+
+    pub(super) fn build_with_flow_cache(
+        root: &'ir SemanticNode,
+        values: &SsaValueGraph,
+        canonical: &BTreeMap<SsaVar, InsnArg>,
+        cache: &mut Option<super::source::SourceFlowCache>,
+    ) -> Result<Self, ValueRecoveryError> {
+        Self::build_ssa(root, values, canonical, true, cache)
     }
 
     pub(super) fn build_gated(
@@ -310,7 +319,7 @@ impl<'ir> ValueFlowGraph<'ir> {
         values: &SsaValueGraph,
         canonical: &BTreeMap<SsaVar, InsnArg>,
     ) -> Result<Self, ValueRecoveryError> {
-        Self::build_ssa(root, values, canonical, false)
+        Self::build_ssa(root, values, canonical, false, &mut None)
     }
 
     fn build_ssa(
@@ -318,6 +327,7 @@ impl<'ir> ValueFlowGraph<'ir> {
         values: &SsaValueGraph,
         canonical: &BTreeMap<SsaVar, InsnArg>,
         semantic_flow: bool,
+        cache: &mut Option<super::source::SourceFlowCache>,
     ) -> Result<Self, ValueRecoveryError> {
         let symbols = crate::profile_scope!(
             "value.graph.control_symbols",
@@ -325,10 +335,8 @@ impl<'ir> ValueFlowGraph<'ir> {
         );
         let logic =
             crate::profile_scope!("value.graph.domain", DomainLogic::new(&symbols.variables));
-        let semantic_flow = crate::profile_scope!(
-            "value.graph.semantic_flow",
-            semantic_flow.then(|| crate::ir::analysis::SemanticFlowGraph::analyze(root))
-        );
+        let semantic_flow =
+            semantic_flow.then(|| super::source::SourceFlowCache::get_or_analyze(cache, root));
         let graph = Self {
             identity: ValueIdentity::Ssa,
             logic,
@@ -363,14 +371,16 @@ impl<'ir> ValueFlowGraph<'ir> {
     pub(super) fn build_source(
         root: &'ir SemanticNode,
         bindings: &BTreeSet<SsaVar>,
+        cache: &mut Option<super::source::SourceFlowCache>,
     ) -> Result<Self, ValueRecoveryError> {
-        Self::build_allocated(root, ValueIdentity::Source, bindings)
+        Self::build_allocated(root, ValueIdentity::Source, bindings, cache)
     }
 
     fn build_allocated(
         root: &'ir SemanticNode,
         identity: ValueIdentity,
         bindings: &BTreeSet<SsaVar>,
+        cache: &mut Option<super::source::SourceFlowCache>,
     ) -> Result<Self, ValueRecoveryError> {
         let symbols = crate::profile_scope!(
             "value.graph.control_symbols",
@@ -378,10 +388,7 @@ impl<'ir> ValueFlowGraph<'ir> {
         );
         let logic =
             crate::profile_scope!("value.graph.domain", DomainLogic::new(&symbols.variables));
-        let semantic_flow = crate::profile_scope!(
-            "value.graph.semantic_flow",
-            crate::ir::analysis::SemanticFlowGraph::analyze(root)
-        );
+        let semantic_flow = super::source::SourceFlowCache::get_or_analyze(cache, root);
         let graph = Self {
             identity,
             logic,
@@ -543,7 +550,7 @@ impl<'ir> ValueFlowGraph<'ir> {
     }
 
     fn semantic_flow(&self) -> Option<&crate::ir::analysis::SemanticFlowGraph> {
-        self.semantic_flow.as_ref()
+        self.semantic_flow.as_deref()
     }
 
     fn movement_points(&self) -> BTreeSet<crate::ir::analysis::SemanticFlowPoint> {
@@ -809,7 +816,7 @@ impl<'ir> ValueFlowGraph<'ir> {
                     })
                 }
                 InsnType::ConstStr => Some(CanonicalKey::String(
-                    instruction.payload.string_value.clone()?,
+                    instruction.payload.string_value.as_deref().cloned()?,
                 )),
                 _ => None,
             },
@@ -968,7 +975,7 @@ mod tests {
             finally: None,
         };
 
-        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new()).unwrap();
+        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new(), &mut None).unwrap();
 
         assert!(graph.is_bound(SsaVar::new(7, 0)));
     }
@@ -976,8 +983,12 @@ mod tests {
     #[test]
     fn method_inputs_are_lexical_value_bindings() {
         let binding = SsaVar::new(7, 0);
-        let graph =
-            ValueFlowGraph::build_source(&SemanticNode::Empty, &BTreeSet::from([binding])).unwrap();
+        let graph = ValueFlowGraph::build_source(
+            &SemanticNode::Empty,
+            &BTreeSet::from([binding]),
+            &mut None,
+        )
+        .unwrap();
 
         assert!(graph.is_bound(binding));
     }

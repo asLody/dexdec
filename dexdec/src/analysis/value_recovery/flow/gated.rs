@@ -944,7 +944,7 @@ impl<'a> GatedPhiAnalysis<'a> {
                 SelectedValue::Literal(instruction.args.first()?.as_literal()?.value)
             }
             InsnArg::Wrapped(instruction) if instruction.insn_type == InsnType::ConstStr => {
-                SelectedValue::String(instruction.payload.string_value.clone()?)
+                SelectedValue::String(instruction.payload.string_value.as_deref().cloned()?)
             }
             InsnArg::Wrapped(_) => return None,
         };

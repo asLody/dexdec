@@ -422,14 +422,14 @@ trait VariableNameSolver {
     ) -> BTreeMap<u32, KotlinIdentifier>;
 }
 
-struct ConstrainedNameSolver<Model> {
-    model: Model,
+struct ConstrainedNameSolver<'a, Model> {
+    model: &'a Model,
     minimum_score: u16,
     conflict_penalty: u16,
 }
 
-impl<Model> ConstrainedNameSolver<Model> {
-    fn new(model: Model, minimum_score: u16) -> Self {
+impl<'a, Model> ConstrainedNameSolver<'a, Model> {
+    fn new(model: &'a Model, minimum_score: u16) -> Self {
         Self {
             model,
             minimum_score,
@@ -438,7 +438,7 @@ impl<Model> ConstrainedNameSolver<Model> {
     }
 }
 
-impl<Model: VariableNameModel> VariableNameSolver for ConstrainedNameSolver<Model> {
+impl<Model: VariableNameModel> VariableNameSolver for ConstrainedNameSolver<'_, Model> {
     fn solve(
         &self,
         graph: &VariableSemanticGraph,
@@ -495,7 +495,7 @@ impl<Model: VariableNameModel> VariableNameSolver for ConstrainedNameSolver<Mode
     }
 }
 
-impl<Model> ConstrainedNameSolver<Model> {
+impl<Model> ConstrainedNameSolver<'_, Model> {
     fn claim_variant(
         preferred: &KotlinIdentifier,
         used: &mut BTreeSet<KotlinIdentifier>,
@@ -538,9 +538,12 @@ impl<'a> SemanticNameRecovery<'a> {
             .chain(intrinsic_names.keys().copied())
             .collect::<BTreeSet<_>>();
         let model = StructuralNameModel::for_graph(self.types, &graph);
-        let mut names =
-            ConstrainedNameSolver::new(StructuralNameModel::for_graph(self.types, &graph), 35)
-                .solve(&graph, &roles, parameter_names, &excluded);
+        let mut names = ConstrainedNameSolver::new(&model, 35).solve(
+            &graph,
+            &roles,
+            parameter_names,
+            &excluded,
+        );
         for (identity, name) in intrinsic_names {
             names
                 .entry(identity)

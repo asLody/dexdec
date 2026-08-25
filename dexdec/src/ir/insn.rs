@@ -515,16 +515,20 @@ pub struct InsnPayload {
     pub no_return: bool,
 
     /// For Invoke/Field: method or field reference
-    pub reference: Option<super::MemberReference>,
+    ///
+    /// Boxed because `MemberReference` is large (~112 bytes) while only a
+    /// small share of instructions carry one; every decoded archive holds
+    /// millions of these payloads.
+    pub reference: Option<Box<super::MemberReference>>,
 
     /// For ConstStr: string value
-    pub string_value: Option<super::Utf16String>,
+    pub string_value: Option<Box<super::Utf16String>>,
 
     /// For ConstStr: string index in DEX string pool
     pub string_index: Option<u32>,
 
     /// For ConstClass: class type
-    pub class_type: Option<ArgType>,
+    pub class_type: Option<Box<ArgType>>,
 
     /// For type-related ops: type index in DEX type pool
     pub type_index: Option<u32>,
@@ -548,7 +552,7 @@ pub struct InsnPayload {
     pub method_index: Option<u32>,
 
     /// For Switch: switch cases (value -> offset)
-    pub switch_cases: Option<Vec<(i32, i32)>>,
+    pub switch_cases: Option<Box<Vec<(i32, i32)>>>,
 
     /// For Switch: default target
     pub switch_default: Option<i32>,
@@ -557,16 +561,16 @@ pub struct InsnPayload {
     pub cmp_bias: Option<CmpBias>,
 
     /// For Cast: target type
-    pub cast_type: Option<ArgType>,
+    pub cast_type: Option<Box<ArgType>>,
 
     /// For FillArray: decoded fill-array-data payload.
-    pub fill_array_data: Option<FillArrayData>,
+    pub fill_array_data: Option<Box<FillArrayData>>,
 
     /// For structured expression nodes: recovered boolean condition.
     pub bool_expr: Option<BoolExpr>,
 
     /// For compound assignments: statement target expression.
-    pub compound_target: Option<InsnArg>,
+    pub compound_target: Option<Box<InsnArg>>,
 
     /// For Phi: incoming CFG edges corresponding one-to-one with `args`.
     ///
@@ -587,12 +591,12 @@ impl InsnNode {
     /// the decoder-level payload representation.
     pub fn conversion_type(&self) -> Option<&ArgType> {
         match self.insn_type {
-            InsnType::Cast => self.payload.cast_type.as_ref(),
+            InsnType::Cast => self.payload.cast_type.as_deref(),
             InsnType::CheckCast => self
                 .payload
                 .class_type
-                .as_ref()
-                .or(self.payload.cast_type.as_ref()),
+                .as_deref()
+                .or(self.payload.cast_type.as_deref()),
             _ => None,
         }
         .or_else(|| self.result.as_ref().map(|result| &result.ty))
@@ -970,7 +974,7 @@ impl InsnNode {
     pub fn switch(value: InsnArg, cases: Vec<(i32, i32)>) -> Self {
         let mut insn = Self::new(InsnType::Switch, 1);
         insn.add_arg(value);
-        insn.payload.switch_cases = Some(cases);
+        insn.payload.switch_cases = Some(Box::new(cases));
         insn
     }
 
@@ -993,7 +997,7 @@ impl InsnNode {
         };
         let mut insn = Self::new(insn_type, 1);
         if insn_type == InsnType::Cast {
-            insn.payload.cast_type = Some(dest.ty.clone());
+            insn.payload.cast_type = Some(Box::new(dest.ty.clone()));
         }
         insn.set_result(dest);
         insn.add_arg(src);
@@ -1029,7 +1033,7 @@ impl InsnNode {
         let mut insn = Self::new(InsnType::FillArray, 1);
         insn.add_arg(array);
         insn.payload.target = Some(data_offset as i32);
-        insn.payload.fill_array_data = data;
+        insn.payload.fill_array_data = data.map(Box::new);
         insn
     }
 
@@ -1055,7 +1059,7 @@ impl InsnNode {
 
     /// Get switch cases
     pub fn get_switch_cases(&self) -> Option<&Vec<(i32, i32)>> {
-        self.payload.switch_cases.as_ref()
+        self.payload.switch_cases.as_deref()
     }
 }
 
@@ -1230,7 +1234,7 @@ mod tests {
     fn check_cast_exposes_its_semantic_conversion_type() {
         let target = ArgType::array(ArgType::string());
         let mut instruction = InsnNode::check_cast(InsnArg::reg(0, ArgType::unknown_object()), 7);
-        instruction.payload.class_type = Some(target.clone());
+        instruction.payload.class_type = Some(Box::new(target.clone()));
 
         assert_eq!(instruction.conversion_type(), Some(&target));
     }

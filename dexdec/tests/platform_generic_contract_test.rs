@@ -57,3 +57,35 @@ fn resolves_list_add_all_contract() {
         GenericSignatures::method("(Ljava/util/Collection<+TE;>;)Z").expect("generic signature")
     );
 }
+
+#[test]
+fn frozen_platform_details_still_resolve_unseen_contracts() {
+    let warmed = "Ljava/util/Comparator;->compare(Ljava/lang/Object;Ljava/lang/Object;)I"
+        .parse()
+        .expect("method reference");
+    platform_generic_method_contract(&warmed)
+        .expect("platform hierarchy")
+        .expect("warm Comparator.compare before freeze");
+
+    dexdec::analysis::method_override::freeze_default_platform_class_details();
+    assert!(
+        dexdec::analysis::method_override::default_platform_class_details_are_frozen(),
+        "freeze hook must freeze the shared default PlatformClassSet"
+    );
+
+    let method = "Ljava/util/ArrayList;-><init>(Ljava/util/Collection;)V"
+        .parse()
+        .expect("method reference");
+    let contract = platform_generic_method_contract(&method)
+        .expect("platform hierarchy")
+        .expect("Frozen miss must still resolve ArrayList(Collection)");
+
+    assert_eq!(
+        contract.owner_type_parameters().collect::<Vec<_>>(),
+        vec!["E"]
+    );
+    assert_eq!(
+        contract.signature,
+        GenericSignatures::method("(Ljava/util/Collection<+TE;>;)V").expect("generic signature")
+    );
+}

@@ -153,6 +153,16 @@ impl DexReader {
         Ok(self.bytes.read_u8()?)
     }
 
+    pub fn read_bytes(&mut self, size: usize) -> Result<Vec<u8>, DexError> {
+        if self.bytes.position() + size as u64 > self.bytes_len {
+            return Err(DexError::NoDataLeftError);
+        }
+
+        let mut bytes = vec![0u8; size];
+        self.bytes.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Read an unsigned 16 bits integer from the reader
     pub fn read_u16(&mut self) -> Result<u16, DexError> {
         if self.bytes.position() > self.bytes_len - 2 {

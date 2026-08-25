@@ -38,7 +38,7 @@ impl StringBuilderProtocol {
     }
 
     pub fn method(operation: &SemanticOperation) -> Option<&MethodReference> {
-        let MemberReference::Method(method) = operation.payload.reference.as_ref()? else {
+        let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
             return None;
         };
         Some(method)

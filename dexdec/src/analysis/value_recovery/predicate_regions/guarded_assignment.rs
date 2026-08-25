@@ -23,6 +23,15 @@ pub(super) struct GuardedAssignment {
 }
 
 impl GuardedAssignment {
+    pub(super) fn is_self_selecting(statement: &SemanticStatement) -> bool {
+        let Some(variable) = statement.result().and_then(|result| result.code_var) else {
+            return false;
+        };
+        statement
+            .value()
+            .is_some_and(|value| Self::selects_variable(variable, value))
+    }
+
     /// Rewrites `statement` into the regions its selection describes.
     ///
     /// The lowering is exact rather than heuristic: every condition and every
@@ -172,6 +181,14 @@ impl GuardedAssignment {
     }
 
     fn selects_destination(&self, value: &SemanticExpression) -> bool {
+        Self::selects_variable(self.variable, value)
+    }
+
+    fn reads_destination(&self, value: &SemanticExpression) -> bool {
+        Self::reads_variable(self.variable, value)
+    }
+
+    fn selects_variable(variable: u32, value: &SemanticExpression) -> bool {
         let mut pending = vec![value];
         while let Some(value) = pending.pop() {
             let SemanticExpression::Select {
@@ -182,7 +199,9 @@ impl GuardedAssignment {
             else {
                 continue;
             };
-            if self.reads_destination(when_true) || self.reads_destination(when_false) {
+            if Self::reads_variable(variable, when_true)
+                || Self::reads_variable(variable, when_false)
+            {
                 return true;
             }
             pending.extend([when_true.as_ref(), when_false.as_ref()]);
@@ -190,10 +209,10 @@ impl GuardedAssignment {
         false
     }
 
-    fn reads_destination(&self, value: &SemanticExpression) -> bool {
+    fn reads_variable(variable: u32, value: &SemanticExpression) -> bool {
         matches!(
             value,
-            SemanticExpression::Register(register) if register.code_var == Some(self.variable)
+            SemanticExpression::Register(register) if register.code_var == Some(variable)
         )
     }
 }

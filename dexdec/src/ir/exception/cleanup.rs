@@ -2161,8 +2161,8 @@ impl<'a> CleanupProof<'a> {
                             .map(|(handler, normal)| EquivalenceTask::Argument(handler, normal)),
                     );
                     match (
-                        handler.payload.compound_target.as_ref(),
-                        normal.payload.compound_target.as_ref(),
+                        handler.payload.compound_target.as_deref(),
+                        normal.payload.compound_target.as_deref(),
                     ) {
                         (Some(handler), Some(normal)) => {
                             pending.push(EquivalenceTask::Argument(handler, normal));

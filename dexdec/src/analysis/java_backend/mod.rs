@@ -64,6 +64,7 @@ pub struct JavaDecompiler {
     type_hierarchy: Arc<ClassHierarchyIndex>,
     observer: Arc<dyn crate::ir::AnalysisObserver>,
     source_abi: Arc<JavaSourceAbi>,
+    parallel_methods: bool,
 }
 
 impl JavaDecompiler {
@@ -74,7 +75,17 @@ impl JavaDecompiler {
             type_hierarchy: Arc::new(ClassHierarchyIndex::default()),
             observer: Arc::new(crate::ir::NullAnalysisObserver),
             source_abi: Arc::new(JavaSourceAbi::default()),
+            parallel_methods: true,
         }
+    }
+
+    pub fn with_parallel_methods(mut self, parallel_methods: bool) -> Self {
+        self.parallel_methods = parallel_methods;
+        self
+    }
+
+    pub(crate) fn parallel_methods(&self) -> bool {
+        self.parallel_methods
     }
 
     pub fn with_shared_type_hierarchy(mut self, hierarchy: Arc<ClassHierarchyIndex>) -> Self {

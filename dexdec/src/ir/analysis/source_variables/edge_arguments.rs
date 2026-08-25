@@ -483,8 +483,8 @@ pub(super) fn same_value(left: &InsnArg, right: &InsnArg) -> bool {
                     return false;
                 }
                 match (
-                    left.payload.compound_target.as_ref(),
-                    right.payload.compound_target.as_ref(),
+                    left.payload.compound_target.as_deref(),
+                    right.payload.compound_target.as_deref(),
                 ) {
                     (Some(left), Some(right)) => pending.push((left, right)),
                     (None, None) => {}

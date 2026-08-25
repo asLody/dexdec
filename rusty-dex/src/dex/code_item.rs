@@ -7,10 +7,7 @@
 
 use std::io::{Seek, SeekFrom};
 
-use crate::dex::{
-    debug_info::DebugInfo, instructions, instructions::Instructions, reader::DexReader,
-    strings::DexStrings, types::DexTypes,
-};
+use crate::dex::{debug_info::DebugInfo, reader::DexReader, strings::DexStrings, types::DexTypes};
 use crate::error::DexError;
 
 /// A `try` statement with offset to the `catch` part
@@ -47,7 +44,7 @@ pub struct CodeItem {
     /// Decoded debug info (line numbers, local variable table, parameter
     /// names). `None` when the code item has no debug info (`debug_info_off == 0`).
     pub debug_info: Option<DebugInfo>,
-    pub insns: Option<Vec<Instructions>>,
+    pub insns: Option<Vec<u16>>,
     pub tries: Option<Vec<TryItem>>,
     pub handlers: Option<Vec<EncodedCatchHandler>>,
 }
@@ -78,16 +75,16 @@ impl CodeItem {
         // reads (bytecode, try/catch handlers) are unaffected.
         let debug_info = DebugInfo::build(dex_reader, debug_info_off, strings_list, types_list)?;
 
-        // Get the actual bytecode
+        // Copy the bytecode without decoding it. DexDec consumes raw code units;
+        // public bytecode helpers decode on demand.
+        let insns_size_bytes = (insns_size as usize)
+            .checked_mul(2)
+            .ok_or(DexError::NoDataLeftError)?;
+        let raw_insns = dex_reader.read_bytes(insns_size_bytes)?;
         let mut insns = Vec::with_capacity(insns_size as usize);
-        let end_offset = dex_reader.bytes.position() + (insns_size * 2) as u64;
-
-        // No need to update the stream's position manually: it is updated in
-        // `parse_instruction` when reading bytes from it
-        while dex_reader.bytes.position() < end_offset {
-            let _ = instructions::parse_instruction(dex_reader, &mut insns)?;
+        for chunk in raw_insns.chunks_exact(2) {
+            insns.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
-
         // Check if there is some padding
         if tries_size != 0 && insns_size % 2 == 1 {
             _ = dex_reader.read_u16()?;

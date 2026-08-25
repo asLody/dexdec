@@ -185,8 +185,8 @@ impl JavaMethodBody {
                 crate::ir::generic_types::GenericMethodContract,
             >,
         >,
-        source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
-        generic_type_projection: std::sync::Arc<dyn crate::language::java::GenericTypeProjection>,
+        source_object_types: std::sync::Arc<crate::language::java::SourceObjectTypes>,
+        generic_type_projection: std::rc::Rc<dyn crate::language::java::GenericTypeProjection>,
         source_current_type: Option<JavaType>,
         source_super_type: Option<JavaType>,
         source_parameter_types: &[Option<JavaType>],
@@ -351,6 +351,10 @@ impl JavaMethodBody {
         self.type_uses.iter()
     }
 
+    pub(in crate::analysis::java_backend) fn current_type(&self) -> Option<&ArgType> {
+        self.current_type.as_ref()
+    }
+
     pub fn is_empty(body: &crate::language::java::JavaMethodBody) -> bool {
         match &body.root {
             crate::language::java::JavaStmt::Empty => true,
@@ -378,7 +382,7 @@ struct MemberReferenceCollector {
 
 impl crate::ir::SemanticVisitor for MemberReferenceCollector {
     fn enter_operation(&mut self, operation: &crate::ir::SemanticOperation) {
-        match operation.payload.reference.as_ref() {
+        match operation.payload.reference.as_deref() {
             Some(crate::ir::MemberReference::Method(method)) => {
                 if operation.payload.invoke_type == Some(crate::ir::InvokeType::Static) {
                     self.static_owners.insert(method.owner.clone());

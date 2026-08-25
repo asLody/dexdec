@@ -146,7 +146,7 @@ impl SemanticExpression {
         pending.extend(
             operands
                 .into_iter()
-                .chain(compound_target)
+                .chain(compound_target.map(|target| *target))
                 .rev()
                 .map(ExpressionTask::Argument),
         );
@@ -262,7 +262,7 @@ impl SemanticExpression {
 impl SemanticOperation {
     pub(crate) fn string_literal(value: impl Into<crate::ir::Utf16String>) -> Self {
         let mut instruction = InsnNode::new(InsnType::ConstStr, 0);
-        instruction.payload.string_value = Some(value.into());
+        instruction.payload.string_value = Some(Box::new(value.into()));
         Self {
             id: instruction.id,
             insn_type: instruction.insn_type,
@@ -362,12 +362,12 @@ impl SemanticOperation {
 
     pub fn conversion_type(&self) -> Option<&ArgType> {
         match self.insn_type {
-            InsnType::Cast => self.payload.cast_type.as_ref(),
+            InsnType::Cast => self.payload.cast_type.as_deref(),
             InsnType::CheckCast => self
                 .payload
                 .class_type
-                .as_ref()
-                .or(self.payload.cast_type.as_ref()),
+                .as_deref()
+                .or(self.payload.cast_type.as_deref()),
             _ => None,
         }
         .or_else(|| self.result.as_ref().map(|result| &result.ty))
@@ -384,9 +384,9 @@ impl SemanticOperation {
         }
         self.payload
             .class_type
-            .as_ref()
+            .as_deref()
             .or_else(|| self.result.as_ref().map(|result| &result.ty))
-            .or_else(|| match self.payload.reference.as_ref() {
+            .or_else(|| match self.payload.reference.as_deref() {
                 Some(MemberReference::Method(method)) => Some(&method.owner),
                 _ => None,
             })

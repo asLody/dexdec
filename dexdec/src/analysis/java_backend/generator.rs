@@ -3,6 +3,7 @@ use crate::analysis::{
 };
 use crate::frontend::{ClassNode, MethodNode};
 use crate::ir::cfg::CFG;
+use rayon::prelude::*;
 
 use super::declaration_lowering::{JavaCompilationUnitLowering, JavaSingleMethodLowering};
 use super::java_model::method::collect_param_debug_names;
@@ -24,11 +25,12 @@ impl JavaDecompiler {
     /// 4. Construct semantic IR from SCC and reaching-condition facts
     /// 5. Recover values and lower the Java AST
     pub fn generate_method(&mut self, cfg: &mut CFG) -> Result<String, JavaDecompilerError> {
+        let current_type = cfg.method().owner().clone();
         let method = self.build_method_model(cfg)?;
         let declaration = JavaSingleMethodLowering::lower(
             &method,
             None,
-            None,
+            Some(&current_type),
             method_type_uses(&method),
             &self.source_abi,
             self.type_hierarchy.clone(),
@@ -101,33 +103,58 @@ impl JavaDecompiler {
         inner: Vec<NestedClassInput>,
     ) -> Result<String, JavaDecompilerError> {
         self.observer.checkpoint()?;
+        let signature_started = std::time::Instant::now();
         let source_signatures = super::signature_inference::SourceSignatureInference::analyze(
             self.type_hierarchy.as_ref(),
             methods,
             &inner,
         );
+        let signature_ms = signature_started.elapsed();
+        let methods_started = std::time::Instant::now();
         let (outer_methods, outer_instance) =
             crate::profile_scope!("java_backend.class.outer_methods", {
                 self.build_class_methods(class, methods, &source_signatures)
             })?;
+        let methods_ms = methods_started.elapsed();
         self.observer.checkpoint()?;
         self.class_stage(class.type_descriptor(), "build_outer_methods:done");
+        let nested_started = std::time::Instant::now();
         let nested_models = crate::profile_scope!("java_backend.class.nested_models", {
             self.build_nested_class_models(inner, &source_signatures)
         })?;
+        let nested_ms = nested_started.elapsed();
         self.observer.checkpoint()?;
         self.class_stage(class.type_descriptor(), "build_nested_models:done");
+        let model_started = std::time::Instant::now();
         let mut class_model = crate::profile_scope!("java_backend.class.model", {
             JavaClassModel::from_class_node(class, outer_methods, outer_instance)
                 .map(|model| model.with_nested(nested_models))
         })?;
         self.observer.checkpoint()?;
         class_model.assign_lexical_type_names(&self.source_abi);
+        let model_ms = model_started.elapsed();
         self.class_stage(class.type_descriptor(), "class_model:done");
-        crate::profile_scope!("java_backend.class.render", {
+        let render_started = std::time::Instant::now();
+        let source = crate::profile_scope!("java_backend.class.render", {
             self.observer.checkpoint()?;
             self.render_class_model(&class_model)
-        })
+        })?;
+        if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
+            let render_ms = render_started.elapsed();
+            let total = signature_ms + methods_ms + nested_ms + model_ms + render_ms;
+            if total.as_millis() >= 200 {
+                eprintln!(
+                    "dexdec class {}: signatures={:.0}ms methods={:.0}ms nested={:.0}ms model={:.0}ms render={:.0}ms",
+                    class.type_descriptor(),
+                    signature_ms.as_secs_f64() * 1000.0,
+                    methods_ms.as_secs_f64() * 1000.0,
+                    nested_ms.as_secs_f64() * 1000.0,
+                    model_ms.as_secs_f64() * 1000.0,
+                    render_ms.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        Ok(source)
     }
 
     fn build_nested_class_models(
@@ -135,61 +162,43 @@ impl JavaDecompiler {
         inputs: Vec<NestedClassInput>,
         source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
     ) -> Result<Vec<JavaClassModel>, JavaDecompilerError> {
-        let root_count = inputs.len();
-        let mut pending = inputs
-            .into_iter()
-            .rev()
-            .map(NestedModelTask::Build)
-            .collect::<Vec<_>>();
-        let mut results = Vec::new();
-        while let Some(task) = pending.pop() {
-            self.observer.checkpoint()?;
-            match task {
-                NestedModelTask::Build(mut input) => {
-                    self.class_stage(input.class.type_descriptor(), "build_nested_class:start");
-                    let (methods, outer_instance) = self.build_class_methods(
-                        &input.class,
-                        &mut input.methods,
-                        source_signatures,
-                    )?;
-                    let child_count = input.nested.len();
-                    pending.push(NestedModelTask::Finish {
-                        class: input.class,
-                        methods,
-                        outer_instance,
-                        child_count,
-                    });
-                    pending.extend(input.nested.into_iter().rev().map(NestedModelTask::Build));
-                }
-                NestedModelTask::Finish {
-                    class,
-                    methods,
-                    outer_instance,
-                    child_count,
-                } => {
-                    let start = results.len().checked_sub(child_count).ok_or(
-                        JavaDecompilerError::MalformedNestedClassStack {
-                            expected: child_count,
-                            actual: results.len(),
-                        },
-                    )?;
-                    let children = results.drain(start..).collect();
-                    self.class_stage(class.type_descriptor(), "build_nested_class:done");
-                    results.push(
-                        JavaClassModel::from_class_node(&class, methods, outer_instance)?
-                            .as_nested_source_member(&class)
-                            .with_nested(children),
-                    );
-                }
-            }
+        self.build_nested_class_forest(inputs, source_signatures)
+    }
+
+    fn build_nested_class_forest(
+        &self,
+        inputs: Vec<NestedClassInput>,
+        source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
+    ) -> Result<Vec<JavaClassModel>, JavaDecompilerError> {
+        if self.parallel_methods && inputs.len() > 1 {
+            inputs
+                .into_par_iter()
+                .map(|input| self.build_nested_class_tree(input, source_signatures))
+                .collect()
+        } else {
+            inputs
+                .into_iter()
+                .map(|input| self.build_nested_class_tree(input, source_signatures))
+                .collect()
         }
-        if results.len() != root_count {
-            return Err(JavaDecompilerError::MalformedNestedClassStack {
-                expected: root_count,
-                actual: results.len(),
-            });
-        }
-        Ok(results)
+    }
+
+    fn build_nested_class_tree(
+        &self,
+        mut input: NestedClassInput,
+        source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
+    ) -> Result<JavaClassModel, JavaDecompilerError> {
+        self.observer.checkpoint()?;
+        self.class_stage(input.class.type_descriptor(), "build_nested_class:start");
+        let (methods, outer_instance) =
+            self.build_class_methods(&input.class, &mut input.methods, source_signatures)?;
+        let children = self.build_nested_class_forest(input.nested, source_signatures)?;
+        self.class_stage(input.class.type_descriptor(), "build_nested_class:done");
+        Ok(
+            JavaClassModel::from_class_node(&input.class, methods, outer_instance)?
+                .as_nested_source_member(&input.class)
+                .with_nested(children),
+        )
     }
 
     fn build_class_methods(
@@ -223,6 +232,118 @@ impl JavaDecompiler {
                 ((method.info.name.clone(), method.info.descriptor()), index)
             })
             .collect::<std::collections::BTreeMap<_, _>>();
+        let recover = |input: &mut ClassMethodInput| {
+            let Some((decoded_method, cfg)) = input.decoded_mut() else {
+                return None;
+            };
+            let method_reference = crate::ir::MethodReference {
+                owner: class.class_type().clone(),
+                name: decoded_method.name().to_string(),
+                descriptor: crate::ir::MethodDescriptor {
+                    parameters: decoded_method.param_types().to_vec(),
+                    return_type: decoded_method.return_type().clone(),
+                },
+            };
+            let inferred_parameter_types = source_signatures.parameter_types(&method_reference);
+            let inferred_return_type = source_signatures.return_type(&method_reference);
+            let body_parameter_types = source_signatures.body_parameter_types(&method_reference);
+            let function_types = super::FunctionObjectClass::analyze(class)
+                .then(|| {
+                    super::function_object_types::FunctionObjectMethodInference::infer(
+                        decoded_method,
+                        &class.interfaces,
+                        &body_parameter_types,
+                        inferred_return_type.as_ref(),
+                        &self.source_abi,
+                    )
+                })
+                .flatten()
+                .filter(|types| {
+                    let interface = types.interface().erased();
+                    class
+                        .interfaces
+                        .iter()
+                        .any(|declared| declared == &interface)
+                });
+            let source_parameter_types = function_types
+                .as_ref()
+                .map(|types| types.parameters())
+                .unwrap_or(inferred_parameter_types.as_slice());
+            let descriptor = decoded_method.info.descriptor();
+            self.method_stage(
+                class.type_descriptor(),
+                &decoded_method.info.name,
+                &descriptor,
+                "start",
+            );
+            let recovered = self.build_method_model_from_node(
+                class,
+                decoded_method,
+                cfg,
+                exception_contracts
+                    .get(&method_reference)
+                    .map(Vec::as_slice),
+                (!source_parameter_types.is_empty()).then_some(source_parameter_types),
+                inferred_return_type.as_ref(),
+                function_types.as_ref().map(|types| types.interface()),
+                outer_instance.as_ref(),
+            );
+            Some(match recovered {
+                Ok(model) => {
+                    self.method_stage(
+                        class.type_descriptor(),
+                        &decoded_method.info.name,
+                        &descriptor,
+                        "done",
+                    );
+                    Ok(model)
+                }
+                Err(error) if error.is_cancelled() => Err(error),
+                Err(error) => {
+                    self.method_stage(
+                        class.type_descriptor(),
+                        &decoded_method.info.name,
+                        &descriptor,
+                        "failed",
+                    );
+                    let stage = if matches!(error, JavaDecompilerError::GenericSignature(_)) {
+                        MethodRecoveryStage::Metadata
+                    } else {
+                        MethodRecoveryStage::Semantics
+                    };
+                    let failure = MethodRecoveryFailure::new(stage, error);
+                    failure.observe(
+                        self.observer.as_ref(),
+                        class.type_descriptor(),
+                        &decoded_method.info.name,
+                        &descriptor,
+                    );
+                    Ok(JavaMethodModel::from_failure(
+                        class,
+                        decoded_method,
+                        failure,
+                    ))
+                }
+            })
+        };
+        let decoded_cfg_count = methods.iter().filter(|m| m.cfg().is_some()).count();
+        let recovered = if self.parallel_methods && decoded_cfg_count >= 8 {
+            methods
+                .par_iter_mut()
+                .enumerate()
+                .filter_map(|(index, input)| recover(input).map(|model| (index, model)))
+                .collect::<Vec<_>>()
+        } else {
+            methods
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, input)| recover(input).map(|model| (index, model)))
+                .collect::<Vec<_>>()
+        };
+        let mut recovered_models = std::collections::BTreeMap::new();
+        for (index, model) in recovered {
+            recovered_models.insert(index, model?);
+        }
         let mut built = Vec::new();
         for method in class
             .methods()
@@ -288,101 +409,34 @@ impl JavaDecompiler {
                 ));
                 continue;
             }
-            let (decoded_method, cfg) = methods[index]
-                .decoded_mut()
-                .expect("decoded method input changed state");
-            let method_reference = crate::ir::MethodReference {
-                owner: class.class_type().clone(),
-                name: method.name().to_string(),
-                descriptor: crate::ir::MethodDescriptor {
-                    parameters: method.param_types().to_vec(),
-                    return_type: method.return_type().clone(),
-                },
-            };
-            let inferred_parameter_types = source_signatures.parameter_types(&method_reference);
-            let inferred_return_type = source_signatures.return_type(&method_reference);
-            let body_parameter_types = source_signatures.body_parameter_types(&method_reference);
-            let function_types = super::FunctionObjectClass::analyze(class)
-                .then(|| {
-                    super::function_object_types::FunctionObjectMethodInference::infer(
-                        method,
-                        &class.interfaces,
-                        &body_parameter_types,
-                        inferred_return_type.as_ref(),
-                        &self.source_abi,
-                    )
-                })
-                .flatten()
-                .filter(|types| {
-                    let interface = types.interface().erased();
-                    class
-                        .interfaces
-                        .iter()
-                        .any(|declared| declared == &interface)
-                });
-            let source_parameter_types = function_types
-                .as_ref()
-                .map(|types| types.parameters())
-                .unwrap_or(inferred_parameter_types.as_slice());
-            let descriptor = method.info.descriptor();
-            self.method_stage(
-                class.type_descriptor(),
-                &method.info.name,
-                &descriptor,
-                "start",
-            );
-            let model = match self.build_method_model_from_node(
-                class,
-                decoded_method,
-                cfg,
-                exception_contracts
-                    .get(&method_reference)
-                    .map(Vec::as_slice),
-                (!source_parameter_types.is_empty()).then_some(source_parameter_types),
-                inferred_return_type.as_ref(),
-                function_types.as_ref().map(|types| types.interface()),
-                outer_instance.as_ref(),
-            ) {
-                Ok(model) => {
-                    self.method_stage(
-                        class.type_descriptor(),
-                        &method.info.name,
-                        &descriptor,
-                        "done",
-                    );
-                    model
-                }
-                Err(error) if error.is_cancelled() => return Err(error),
-                Err(error) => {
-                    self.method_stage(
-                        class.type_descriptor(),
-                        &method.info.name,
-                        &descriptor,
-                        "failed",
-                    );
-                    let stage = if matches!(error, JavaDecompilerError::GenericSignature(_)) {
-                        MethodRecoveryStage::Metadata
-                    } else {
-                        MethodRecoveryStage::Semantics
-                    };
-                    let failure = MethodRecoveryFailure::new(stage, error);
-                    failure.observe(
-                        self.observer.as_ref(),
-                        class.type_descriptor(),
-                        &method.info.name,
-                        &descriptor,
-                    );
-                    JavaMethodModel::from_failure(class, decoded_method, failure)
-                }
-            };
-            built.push(model);
+            if let Some(model) = recovered_models.remove(&index) {
+                built.push(model);
+            } else {
+                let decoded_method = methods[index].method();
+                let failure = MethodRecoveryFailure::new(
+                    MethodRecoveryStage::Decode,
+                    "decoded CFG is missing",
+                );
+                failure.observe(
+                    self.observer.as_ref(),
+                    class.type_descriptor(),
+                    &decoded_method.info.name,
+                    &decoded_method.info.descriptor(),
+                );
+                built.push(JavaMethodModel::from_failure(
+                    class,
+                    decoded_method,
+                    failure,
+                ));
+            }
         }
         Ok((built, outer_instance))
     }
 
     fn build_method_model(&self, cfg: &mut CFG) -> Result<JavaMethodModel, JavaDecompilerError> {
         let declaration = JavaMethodDeclaration::from_cfg(cfg);
-        let options = declaration.body_options(None);
+        let mut options = declaration.body_options(None);
+        options.current_type = Some(cfg.method().owner().clone());
         let body = MethodBodyPipeline::new(self.type_hierarchy.as_ref(), self.observer.as_ref())
             .analyze(cfg)?;
         method_model_from_body_analysis(declaration, body, options)
@@ -479,6 +533,7 @@ impl JavaDecompiler {
     }
 
     fn render_class_model(&self, class: &JavaClassModel) -> Result<String, JavaDecompilerError> {
+        let lower_started = std::time::Instant::now();
         let unit = crate::profile_scope!("java_backend.class.lower", {
             JavaCompilationUnitLowering::lower(
                 class,
@@ -487,9 +542,27 @@ impl JavaDecompiler {
                 self.observer.clone(),
             )
         })?;
-        crate::profile_scope!("java_backend.class.print", {
-            Ok(JavaPrinter::new(self.config.indent.clone()).print_compilation_unit(&unit)?)
-        })
+        let lower_ms = lower_started.elapsed();
+        let print_started = std::time::Instant::now();
+        let source = crate::profile_scope!("java_backend.class.print", {
+            JavaPrinter::new(self.config.indent.clone()).print_compilation_unit(&unit)
+        })?;
+        if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
+            let print_ms = print_started.elapsed();
+            if (lower_ms + print_ms).as_millis() >= 50 {
+                eprintln!(
+                    "dexdec render {}: lower={:.0}ms print={:.0}ms",
+                    class
+                        .declaration
+                        .current_type()
+                        .map(|ty| ty.to_string())
+                        .unwrap_or_else(|| class.declaration.name.to_string()),
+                    lower_ms.as_secs_f64() * 1000.0,
+                    print_ms.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        Ok(source)
     }
 
     fn class_stage(&self, class: &str, stage: &'static str) {
@@ -506,16 +579,6 @@ impl JavaDecompiler {
                 stage,
             });
     }
-}
-
-enum NestedModelTask {
-    Build(NestedClassInput),
-    Finish {
-        class: ClassNode,
-        methods: Vec<JavaMethodModel>,
-        outer_instance: Option<OuterInstanceField>,
-        child_count: usize,
-    },
 }
 
 fn method_model_from_body_analysis(

@@ -14,19 +14,23 @@ impl GuardDistribution {
     const MAX_COPIES: usize = 8;
     const MAX_TAIL_STATEMENTS: usize = 4;
 
+    /// Cheap filters shared with `form_sequence` so long if-chains do not
+    /// rebuild a prefix tree only to return it unchanged.
+    pub(super) fn should_try(guard: &SemanticPredicate, tail: &SemanticNode) -> bool {
+        super::PredicateRegionFormation::predicate_is_pure(guard)
+            && Self::linear_tail_size(tail).is_some()
+            && Self::predicate_cost(guard) >= 3
+    }
+
     pub(super) fn apply(
         prefix: SemanticNode,
         guard: &SemanticOperand<SemanticPredicate>,
         tail: &SemanticNode,
     ) -> Result<(SemanticNode, bool), SemanticFoldError> {
-        let guard_cost = Self::predicate_cost(guard);
-        if matches!(prefix, SemanticNode::Empty)
-            || !super::PredicateRegionFormation::predicate_is_pure(guard)
-            || Self::linear_tail_size(tail).is_none()
-            || guard_cost < 3
-        {
+        if matches!(prefix, SemanticNode::Empty) || !Self::should_try(guard, tail) {
             return Ok((prefix, false));
         }
+        let guard_cost = Self::predicate_cost(guard);
 
         let original = prefix;
         let domain = PredicateDomain::collect(&original, guard)?;

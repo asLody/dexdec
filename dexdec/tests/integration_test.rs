@@ -77,7 +77,7 @@ fn test_hello_world_main() {
         block.insns.iter().any(|insn| {
             insn.payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .is_some_and(|reference| {
                     matches!(reference, MemberReference::Method(method) if method.name == "println")
                 })

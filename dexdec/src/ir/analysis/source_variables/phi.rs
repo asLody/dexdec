@@ -42,9 +42,16 @@ impl CopySource {
                     .ok_or(SourceVariableError::MissingCodeVariable(value))
             }
             InsnArg::Lit(literal) => Ok(Self::Literal(literal.value, literal.ty.clone())),
-            InsnArg::Wrapped(instruction) if instruction.insn_type == InsnType::ConstStr => Ok(
-                Self::String(instruction.payload.string_value.clone().unwrap_or_default()),
-            ),
+            InsnArg::Wrapped(instruction) if instruction.insn_type == InsnType::ConstStr => {
+                Ok(Self::String(
+                    instruction
+                        .payload
+                        .string_value
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_default(),
+                ))
+            }
             InsnArg::Wrapped(_) => Err(SourceVariableError::MissingRegisterIdentity),
         }
     }
@@ -333,7 +340,12 @@ impl AvailableCopyAnalysis {
                 .map(|source| CopySource::from_arg(source, variables))
                 .transpose(),
             InsnType::ConstStr => Ok(Some(CopySource::String(
-                instruction.payload.string_value.clone().unwrap_or_default(),
+                instruction
+                    .payload
+                    .string_value
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default(),
             ))),
             _ => Ok(None),
         }

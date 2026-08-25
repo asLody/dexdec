@@ -444,7 +444,7 @@ impl AcyclicExitComposer {
         let SemanticNode::Label { label, body } = node else {
             return node;
         };
-        if LabelReferences::count(&body, label) == 0 {
+        if LabelReferences::absent(&body, label) {
             return *body;
         }
         let original = (*body).clone();
@@ -454,7 +454,7 @@ impl AcyclicExitComposer {
                 body: Box::new(original),
             };
         };
-        if LabelReferences::count(&composed, label) != 0 {
+        if !LabelReferences::absent(&composed, label) {
             SemanticNode::Label {
                 label,
                 body: Box::new(original),
@@ -479,7 +479,7 @@ impl AcyclicExitComposer {
                     continuation,
                     cleanups,
                 } => {
-                    if LabelReferences::count(&node, label) == 0 {
+                    if LabelReferences::absent(&node, label) {
                         results.push(if NormalCompletion::can_complete(&node) {
                             SemanticNode::sequence([node, continuation.into_node()])
                         } else {
@@ -554,7 +554,7 @@ impl AcyclicExitComposer {
                             finally,
                         } if continuation.is_boundary() => {
                             if finally.as_ref().is_some_and(|finally| {
-                                LabelReferences::count(&finally.body, label) != 0
+                                !LabelReferences::absent(&finally.body, label)
                             }) {
                                 return None;
                             }
@@ -736,10 +736,16 @@ impl SemanticFolder for SourceSemanticNormalizer {
             SemanticNode::BasicBlock(block) if block.statements.is_empty() => SemanticNode::Empty,
             node => node,
         };
-        let node = RedundantVacuousPredicate::rewrite(node);
-        let node = BranchLinearizer::rewrite(node);
-        let node = TryLexicalScope::extend(node);
-        SemanticNormalizer::new(ReachabilityMode::PruneUnreachable).finish_node(node)
+        let node = crate::profile_scope!(
+            "source_norm.vacuous",
+            RedundantVacuousPredicate::rewrite(node)
+        );
+        let node = crate::profile_scope!("source_norm.linearizer", BranchLinearizer::rewrite(node));
+        let node = crate::profile_scope!("source_norm.try_scope", TryLexicalScope::extend(node));
+        crate::profile_scope!(
+            "source_norm.normalizer",
+            SemanticNormalizer::new(ReachabilityMode::PruneUnreachable).finish_node(node)
+        )
     }
 }
 
@@ -771,7 +777,7 @@ impl SemanticExpressionTransform for OperationRegisterReplacement {
 
 impl RedundantVacuousPredicate {
     fn rewrite(node: SemanticNode) -> SemanticNode {
-        let SemanticNode::Sequence(nodes) = node else {
+        let SemanticNode::Sequence(mut nodes) = node else {
             return node;
         };
         let mut retained = Vec::with_capacity(nodes.len());
@@ -797,7 +803,7 @@ impl RedundantVacuousPredicate {
                     continue;
                 }
             }
-            retained.push(nodes[index].clone());
+            retained.push(std::mem::replace(&mut nodes[index], SemanticNode::Empty));
             index += 1;
         }
         SemanticNode::sequence(retained)
@@ -1315,7 +1321,7 @@ impl NaturalLoopCompletion {
                     *body,
                     TerminalCompletionTarget::BlockLabel(label),
                 )?;
-                if LabelReferences::count(&body, label) == 0 {
+                if LabelReferences::absent(&body, label) {
                     body
                 } else {
                     SemanticNode::Label {
@@ -1700,19 +1706,24 @@ impl TerminalLabelComposer {
                     continue;
                 }
             };
-            let references = LabelReferences::count(&body, label);
-            if references == 0 {
+            if LabelReferences::absent(&body, label) {
                 nodes[index] = *body;
                 self.changed = true;
                 continue;
             }
-            let suffix = SemanticNode::sequence(nodes[index + 1..].iter().cloned());
-            if matches!(suffix, SemanticNode::Empty) || NormalCompletion::can_complete(&suffix) {
+            let references = LabelReferences::count(&body, label);
+            let trailing = TrailingView::analyze(&nodes[index + 1..]);
+            if trailing.is_empty() || trailing.can_complete() {
                 nodes[index] = SemanticNode::Label { label, body };
                 continue;
             }
-            if let Some(exit) = Self::method_exit(&suffix) {
-                let mut binding = MethodExitBinding::new(label, exit, self.reachability);
+            // Extract everything the borrowed view answers up front so its
+            // borrow ends before the sequence is mutated below.
+            let expansion = references.saturating_mul(trailing.size_minus_one());
+            let exit_binding = trailing
+                .method_exit()
+                .map(|exit| MethodExitBinding::new(label, exit, self.reachability));
+            if let Some(mut binding) = exit_binding {
                 let composed =
                     binding.fold_node(std::mem::replace(body.as_mut(), SemanticNode::Empty))?;
                 nodes[index] = if binding.count == references {
@@ -1734,11 +1745,13 @@ impl TerminalLabelComposer {
                 };
                 body = restored;
             }
-            let expansion = references.saturating_mul(SemanticSize::of(&suffix).saturating_sub(1));
             if expansion > 1 {
                 nodes[index] = SemanticNode::Label { label, body };
                 continue;
             }
+            // Only substitution consumes the continuation as an owned tree, so
+            // the collapsed suffix is materialized here and only here.
+            let suffix = SemanticNode::sequence(nodes[index + 1..].iter().cloned());
             let mut substitution = TerminalLabelSubstitution::new(label, &suffix);
             let composed =
                 substitution.fold_node(std::mem::replace(body.as_mut(), SemanticNode::Empty))?;
@@ -1806,6 +1819,76 @@ impl SemanticFolder for TerminalLabelComposer {
         match node {
             SemanticNode::Sequence(nodes) => self.compose_sequence(nodes),
             node => Ok(node),
+        }
+    }
+}
+
+/// Read-only mirror of the node `SemanticNode::sequence` builds for the
+/// elements trailing a label: it drops top-level empties, splices one
+/// sequence level, and unwraps singletons exactly like the constructor, but
+/// borrows instead of cloning. Only label substitution still consumes the
+/// continuation as an owned tree, so the suffix is materialized there alone.
+enum TrailingView<'a> {
+    Empty,
+    One(&'a SemanticNode),
+    Many(Vec<&'a SemanticNode>),
+}
+
+impl<'a> TrailingView<'a> {
+    fn analyze(rest: &'a [SemanticNode]) -> Self {
+        let mut flattened = Vec::new();
+        for node in rest {
+            match node {
+                SemanticNode::Empty => {}
+                SemanticNode::Sequence(children) => flattened.extend(children.iter()),
+                other => flattened.push(other),
+            }
+        }
+        match flattened.len() {
+            0 => Self::Empty,
+            1 => Self::One(flattened[0]),
+            _ => Self::Many(flattened),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        // A lone collapsed Empty unwraps to the Empty variant.
+        matches!(self, Self::Empty | Self::One(SemanticNode::Empty))
+    }
+
+    fn can_complete(&self) -> bool {
+        match self {
+            Self::Empty | Self::One(SemanticNode::Empty) => true,
+            Self::One(node) => NormalCompletion::can_complete(node),
+            // Sequence completion short-circuits over its children.
+            Self::Many(nodes) => nodes
+                .iter()
+                .all(|node| NormalCompletion::can_complete(node)),
+        }
+    }
+
+    fn method_exit(&self) -> Option<&'a crate::ir::SemanticLeave> {
+        match self {
+            Self::Empty | Self::One(SemanticNode::Empty) => None,
+            Self::One(node) => TerminalLabelComposer::method_exit(node),
+            Self::Many(nodes) => {
+                let (last, leading) = nodes.split_last()?;
+                leading
+                    .iter()
+                    .all(|node| TerminalLabelComposer::is_empty(node))
+                    .then(|| TerminalLabelComposer::method_exit(last))
+                    .flatten()
+            }
+        }
+    }
+
+    /// `SemanticSize::of(suffix) - 1`: the sequence wrapper itself is not
+    /// counted.
+    fn size_minus_one(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(node) => SemanticSize::of(node).saturating_sub(1),
+            Self::Many(nodes) => nodes.iter().map(|node| SemanticSize::of(node)).sum(),
         }
     }
 }
@@ -1905,9 +1988,68 @@ struct LabelReferences {
 
 impl LabelReferences {
     fn count(root: &SemanticNode, label: SemanticLabel) -> usize {
-        let mut references = Self { label, count: 0 };
-        references.visit_node(root);
-        references.count
+        crate::profile_scope!("label_refs.count", {
+            let mut references = Self { label, count: 0 };
+            references.visit_node(root);
+            references.count
+        })
+    }
+
+    /// Zero-test with early exit: exactly `count(..) == 0`, but stops at the
+    /// first matching leave. Label leaves only occur as node variants, so the
+    /// descent mirrors `walk_node` without touching statements or expressions.
+    fn absent(root: &SemanticNode, label: SemanticLabel) -> bool {
+        crate::profile_scope!("label_refs.absent", !Self::present(root, label))
+    }
+
+    fn present(node: &SemanticNode, label: SemanticLabel) -> bool {
+        match node {
+            SemanticNode::Empty => false,
+            SemanticNode::BasicBlock(_) => false,
+            SemanticNode::Sequence(children) => {
+                children.iter().any(|child| Self::present(child, label))
+            }
+            SemanticNode::If {
+                then_node,
+                else_node,
+                ..
+            } => {
+                Self::present(then_node, label)
+                    || else_node
+                        .as_ref()
+                        .is_some_and(|node| Self::present(node.as_ref(), label))
+            }
+            SemanticNode::Loop { test, body, .. } => {
+                Self::present(&test.setup, label) || Self::present(body, label)
+            }
+            SemanticNode::For { body, .. } | SemanticNode::ForEach { body, .. } => {
+                Self::present(body, label)
+            }
+            SemanticNode::Switch { cases, .. } => {
+                cases.iter().any(|case| Self::present(&case.body, label))
+            }
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                Self::present(body, label)
+                    || catches
+                        .iter()
+                        .any(|catch| Self::present(&catch.body, label))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|finally| Self::present(&finally.body, label))
+            }
+            SemanticNode::Synchronized { body, .. } => Self::present(body, label),
+            SemanticNode::Label { body, .. } => Self::present(body, label),
+            SemanticNode::Leave(leave) => matches!(
+                leave.kind,
+                SemanticLeaveKind::BreakLabel(found) | SemanticLeaveKind::ContinueLabel(found)
+                    if found == label
+            ),
+        }
     }
 }
 

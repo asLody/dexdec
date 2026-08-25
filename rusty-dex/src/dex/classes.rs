@@ -9,7 +9,8 @@ use std::io::{Seek, SeekFrom};
 use crate::dex::access_flags::{AccessFlag, AccessFlagType};
 use crate::dex::code_item::CodeItem;
 use crate::dex::encoded_value::{
-    AnnotationElement, EncodedAnnotation, EncodedValue, read_encoded_annotation, read_encoded_array,
+    AnnotationElement, EncodedAnnotation, EncodedValue, read_encoded_annotation,
+    read_encoded_array, skip_encoded_annotation,
 };
 use crate::dex::reader::DexReader;
 
@@ -252,8 +253,8 @@ impl DexClasses {
                     read_class_annotations_directory(
                         dex_reader,
                         annotations_off,
-                        strings_list,
                         types_list,
+                        strings_list,
                         protos_list,
                         fields_list,
                         methods_list,
@@ -704,8 +705,8 @@ fn read_annotations_directory(
 fn read_class_annotations_directory(
     dex_reader: &mut DexReader,
     annotations_off: u32,
-    strings: &DexStrings,
     types: &DexTypes,
+    strings: &DexStrings,
     protos: &DexProtos,
     fields: &DexFields,
     methods: &DexMethods,
@@ -715,17 +716,57 @@ fn read_class_annotations_directory(
         .bytes
         .seek(SeekFrom::Start(annotations_off.into()))?;
     let class_annotations_off = dex_reader.read_u32()?;
-    let class_annotations = read_annotation_set(
-        dex_reader,
-        class_annotations_off,
-        strings,
-        types,
-        protos,
-        fields,
-        methods,
-    )?;
-    dex_reader.bytes.seek(SeekFrom::Start(current_offset))?;
+    let class_annotations = if class_annotations_off == 0 {
+        Vec::new()
+    } else {
+        let annotation_set_offset = dex_reader.bytes.position();
+        dex_reader
+            .bytes
+            .seek(SeekFrom::Start(class_annotations_off.into()))?;
+        let size = dex_reader.read_u32()?;
+        let mut class_annotations = Vec::with_capacity(size as usize);
+        for _ in 0..size {
+            let annotation_off = dex_reader.read_u32()?;
+            let current_offset = dex_reader.bytes.position();
+            dex_reader
+                .bytes
+                .seek(SeekFrom::Start(annotation_off.into()))?;
+            let visibility = AnnotationVisibility::from_raw(dex_reader.read_u8()?);
+            let annotation_type = skip_encoded_annotation(dex_reader, types)?;
+            dex_reader.bytes.seek(SeekFrom::Start(current_offset))?;
+            let needs_elements = metadata_annotation_type(&annotation_type).is_some();
+            let annotation = if needs_elements {
+                dex_reader
+                    .bytes
+                    .seek(SeekFrom::Start(annotation_off.into()))?;
+                let _visibility = AnnotationVisibility::from_raw(dex_reader.read_u8()?);
+                read_encoded_annotation(
+                    dex_reader,
+                    strings,
+                    types,
+                    Some(protos),
+                    Some(fields),
+                    Some(methods),
+                )?
+            } else {
+                EncodedAnnotation {
+                    annotation_type,
+                    elements: Vec::new(),
+                }
+            };
+            dex_reader.bytes.seek(SeekFrom::Start(current_offset))?;
+            class_annotations.push(DexAnnotation {
+                visibility,
+                annotation,
+            });
+        }
+        dex_reader
+            .bytes
+            .seek(SeekFrom::Start(annotation_set_offset))?;
+        class_annotations
+    };
     let metadata = ClassAnnotationMetadata::from_annotations(&class_annotations);
+    dex_reader.bytes.seek(SeekFrom::Start(current_offset))?;
     Ok(AnnotationsDirectory {
         class_annotations,
         class_signature: metadata.signature,
@@ -735,6 +776,21 @@ fn read_class_annotations_directory(
         enclosing_method: metadata.enclosing_method,
         ..AnnotationsDirectory::default()
     })
+}
+
+fn metadata_annotation_type(annotation_type: &str) -> Option<&'static str> {
+    const METADATA_ANNOTATIONS: [&str; 5] = [
+        "Ldalvik/annotation/Signature;",
+        "Ldalvik/annotation/InnerClass;",
+        "Ldalvik/annotation/MemberClasses;",
+        "Ldalvik/annotation/EnclosingClass;",
+        "Ldalvik/annotation/EnclosingMethod;",
+    ];
+
+    METADATA_ANNOTATIONS
+        .iter()
+        .find(|candidate| **candidate == annotation_type)
+        .copied()
 }
 
 fn read_annotation_set(

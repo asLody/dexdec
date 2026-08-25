@@ -25,7 +25,7 @@ pub fn format_insn(insn: &InsnNode) -> String {
     let ref_str = insn
         .payload
         .reference
-        .as_ref()
+        .as_deref()
         .map(ToString::to_string)
         .unwrap_or_else(|| "?".to_string());
 
@@ -45,7 +45,7 @@ pub fn format_insn(insn: &InsnNode) -> String {
             let s = insn
                 .payload
                 .string_value
-                .as_ref()
+                .as_deref()
                 .map(Utf16String::to_string_lossy)
                 .unwrap_or_else(|| "?".to_string());
             format!("{}const-string \"{}\"", result_str, s)
@@ -65,7 +65,7 @@ pub fn format_insn(insn: &InsnNode) -> String {
                 .payload
                 .compound_target
                 .as_ref()
-                .map(|arg| match arg {
+                .map(|arg| match &**arg {
                     InsnArg::Reg(r) => format!("v{}", r.reg_num),
                     InsnArg::Lit(lit) => lit.value.to_string(),
                     InsnArg::Wrapped(inner) => format!("<wrapped:{:?}>", inner.insn_type),

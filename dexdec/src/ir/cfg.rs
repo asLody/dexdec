@@ -239,16 +239,12 @@ impl CFG {
 
     /// Get all block IDs in sorted order.
     pub fn block_ids(&self) -> Vec<BlockId> {
-        let mut ids: Vec<_> = self.blocks.keys().copied().collect();
-        ids.sort();
-        ids
+        self.blocks.keys().copied().collect()
     }
 
     /// Iterate over blocks in sorted order.
     pub fn blocks_iter(&self) -> impl Iterator<Item = &Block> {
-        let mut ids: Vec<_> = self.blocks.keys().copied().collect();
-        ids.sort();
-        ids.into_iter().filter_map(|id| self.blocks.get(&id))
+        self.blocks.values()
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -268,9 +264,7 @@ impl CFG {
     ///
     /// Returns only blocks that have entries in the successors map.
     pub fn graph_node_ids(&self) -> Vec<BlockId> {
-        let mut ids: Vec<_> = self.successors.keys().copied().collect();
-        ids.sort();
-        ids
+        self.successors.keys().copied().collect()
     }
 
     /// Remove graph-topology entries that are no longer reachable from the entry.

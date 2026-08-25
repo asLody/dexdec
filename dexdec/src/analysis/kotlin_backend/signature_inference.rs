@@ -152,7 +152,7 @@ impl<'a> SourceSignatureInference<'a> {
 
                 if instruction.insn_type == InsnType::Invoke {
                     if let Some(MemberReference::Method(method)) =
-                        instruction.payload.reference.as_ref()
+                        instruction.payload.reference.as_deref()
                     {
                         let skip_receiver = usize::from(
                             instruction.payload.invoke_type != Some(InvokeType::Static),
@@ -284,7 +284,7 @@ impl ReachingCastTypes {
         pending_result: &mut Option<ArgType>,
     ) {
         if instruction.insn_type == InsnType::Invoke {
-            *pending_result = match instruction.payload.reference.as_ref() {
+            *pending_result = match instruction.payload.reference.as_deref() {
                 Some(MemberReference::Method(method))
                     if method.descriptor.return_type != ArgType::VOID =>
                 {
@@ -295,7 +295,7 @@ impl ReachingCastTypes {
             return;
         }
         if instruction.insn_type == InsnType::FilledNewArray {
-            *pending_result = instruction.payload.class_type.clone();
+            *pending_result = instruction.payload.class_type.as_deref().cloned();
             return;
         }
         if instruction.insn_type == InsnType::MoveResult {
